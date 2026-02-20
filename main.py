@@ -20,7 +20,7 @@ if "last_ai_report" not in st.session_state: st.session_state.last_ai_report = "
 
 # --- APIキー取得 ---
 try: default_key = st.secrets.get("GEMINI_API_KEY", "")
-except: default_key = ""
+except: default_key = "models/gemini-1.5-flash"
 api_key = st.sidebar.text_input("Gemini API Key", value=default_key, type="password")
 
 # ==========================================
@@ -176,3 +176,4 @@ with tab3:
                 st.markdown(logic.get_ai_portfolio(api_key, ctx))
 
         else: st.warning("API Keyを入力してください。")
+
