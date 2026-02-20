@@ -5,7 +5,7 @@ import pandas as pd
 import math
 from datetime import datetime
 import pytz
-import logic_stock as logic  # 日本株用のロジックファイルをインポート
+import logic  # 日本株用のロジックファイルをインポート
 
 # --- ページ設定 ---
 st.set_page_config(layout="wide", page_title="AI日本株アナライザー 2026")
@@ -170,3 +170,4 @@ with tab3:
             with st.spinner("ホールド可否を判定中..."):
                 st.markdown(logic.get_ai_portfolio(api_key, ctx))
         else: st.warning("API Keyを入力してください。")
+
