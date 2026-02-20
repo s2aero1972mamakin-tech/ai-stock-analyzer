@@ -94,6 +94,54 @@ if st.sidebar.button("📈 AI予想ライン反映"):
             st.session_state.ai_range = logic.get_ai_range(api_key, ctx_temp)
     else: st.sidebar.warning("API Keyが必要です")
 
+
+# --- サイドバー設定 --- の直下あたりに追加してください
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🤖 全自動ロボット起動")
+
+if st.sidebar.button("🚀 全自動スキャン＆AI分析を実行"):
+    if not api_key:
+        st.sidebar.error("API Keyが必要です。")
+        st.stop()
+        
+    with st.spinner("プログラムが市場をスキャン中... (約10〜20秒)"):
+        # 1. プログラムによる数学的スクリーニング（全自動発掘）
+        top_candidates = logic.auto_scan_value_stocks()
+        
+    if not top_candidates:
+        st.error("現在、システムが買いと判断した銘柄はありません。（相場環境が悪いため待機します）")
+        st.stop()
+        
+    st.success(f"🔥 スキャン完了！ 有力候補 {len(top_candidates)} 銘柄を発見しました。AIによる最終診断を開始します。")
+    
+    # 2. 発掘された銘柄をAIに連続で診断させる
+    for cand in top_candidates:
+        t_code = cand["ticker"]
+        st.markdown(f"### 🎯 発掘銘柄: {t_code} (現在値: {cand['price']:.1f}円 / RSI: {cand['rsi']:.1f})")
+        
+        # 分析用コンテキストの作成
+        ctx_auto = {
+            "pair_label": f"証券コード: {t_code}",
+            "price": cand['price'],
+            "rsi": cand['rsi'],
+            "atr": 0.0, # 簡易スキャンのため省略
+            "sma_diff": 0.0,
+            "us10y": benchmark_raw["Close"].iloc[-1] if not benchmark_raw.empty else 0.0
+        }
+        
+        with st.spinner(f"{t_code} をAIが分析中..."):
+            # AIのレポートと注文戦略を直接画面に出力
+            report = logic.get_ai_analysis(api_key, ctx_auto)
+            strategy = logic.get_ai_order_strategy(api_key, ctx_auto)
+            
+            with st.expander(f"📝 {t_code} のAI決済判断（クリックして展開）", expanded=True):
+                st.markdown("**【ファンドマネージャー分析】**")
+                st.write(report)
+                st.markdown("---")
+                st.markdown("**【執行責任者の注文戦略】**")
+                st.write(strategy)
+
 # --- メイン処理 ---
 benchmark_raw = logic.get_market_data("^N225", rng="1y", interval="1d")
 df = logic.get_market_data(target_ticker, rng="1y", interval="1d")
@@ -170,4 +218,5 @@ with tab3:
             with st.spinner("ホールド可否を判定中..."):
                 st.markdown(logic.get_ai_portfolio(api_key, ctx))
         else: st.warning("API Keyを入力してください。")
+
 
