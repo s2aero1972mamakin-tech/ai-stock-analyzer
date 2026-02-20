@@ -7,25 +7,19 @@ from datetime import datetime
 import pytz
 import logic  # 日本株用のロジックファイルをインポート
 
-# --- ページ設定 ---
 st.set_page_config(layout="wide", page_title="AI日本株アナライザー 2026")
-st.title("🤖 AI連携型 日本株 戦略分析ツール (S株対応版・全自動スキャン搭載)")
+st.title("🤖 AI連携型 日本株 戦略分析ツール (トップダウン選定・S株対応版)")
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
-# --- セッションステート初期化 ---
 if "ai_range" not in st.session_state: st.session_state.ai_range = None
 if "quote" not in st.session_state: st.session_state.quote = (None, None)
 if "last_ai_report" not in st.session_state: st.session_state.last_ai_report = "" 
 
-# --- APIキー取得 ---
 try: default_key = st.secrets.get("GEMINI_API_KEY", "")
 except: default_key = ""
 api_key = st.sidebar.text_input("Gemini API Key", value=default_key, type="password")
 
-# ==========================================
-# --- サイドバー設定: 📈 分析対象の銘柄設定 ---
-# ==========================================
 st.sidebar.markdown("---")
 st.sidebar.subheader("📈 分析対象の銘柄設定")
 
@@ -33,14 +27,10 @@ input_mode = st.sidebar.radio("銘柄の指定方法", ["リストから選ぶ (
 
 if input_mode == "リストから選ぶ (代表銘柄)":
     predefined_stocks = {
-        "三菱UFJ FG (8306)": "8306.T",
-        "トヨタ自動車 (7203)": "7203.T",
-        "三菱重工業 (7011)": "7011.T",
-        "ソフトバンクG (9984)": "9984.T",
-        "NTT (9432)": "9432.T",
-        "日本製鉄 (5401)": "5401.T",
-        "ホンダ (7267)": "7267.T",
-        "JT 日本たばこ産業 (2914)": "2914.T"
+        "三菱UFJ FG (8306)": "8306.T", "トヨタ自動車 (7203)": "7203.T",
+        "三菱重工業 (7011)": "7011.T", "ソフトバンクG (9984)": "9984.T",
+        "NTT (9432)": "9432.T", "日本製鉄 (5401)": "5401.T",
+        "ホンダ (7267)": "7267.T", "JT 日本たばこ産業 (2914)": "2914.T"
     }
     pair_label = st.sidebar.selectbox("対象銘柄を選択", list(predefined_stocks.keys()))
     target_ticker = predefined_stocks[pair_label]
@@ -57,32 +47,32 @@ else:
         st.stop()
 
 # ==========================================
-# --- サイドバー設定: 🤖 全自動ロボット起動 ---
+# 🤖 全自動トップダウン・ロボット起動
 # ==========================================
 st.sidebar.markdown("---")
 st.sidebar.subheader("🤖 全自動ロボット起動")
 
-if st.sidebar.button("🚀 全自動スキャン＆AI分析を実行"):
+if st.sidebar.button("🚀 マクロ分析＆全自動スキャン実行"):
     if not api_key:
         st.sidebar.error("API Keyが必要です。")
         st.stop()
         
-    with st.spinner("プログラムが市場をスキャン中... (約10〜20秒)"):
-        # 1. プログラムによる数学的スクリーニング（全自動発掘）
-        top_candidates = logic.auto_scan_value_stocks()
+    with st.spinner("AIが現在の地政学・金利から有望セクターを選定し、銘柄をスキャン中..."):
+        # AI連携によるスマート・スクリーニング
+        target_sectors, top_candidates = logic.auto_scan_value_stocks(api_key)
+        
+    st.info(f"💡 AIが選定した本日の有望セクター: **{' / '.join(target_sectors)}**")
         
     if not top_candidates:
-        st.error("現在、システムが買いと判断した銘柄はありません。（相場環境が悪いため待機します）")
+        st.error("現在、AIの厳格な基準（勝率80%）をクリアした銘柄はありません。無理なエントリーは控えます。")
         st.stop()
         
-    st.success(f"🔥 スキャン完了！ 有力候補 {len(top_candidates)} 銘柄を発見しました。AIによる最終診断を開始します。")
+    st.success(f"🔥 スキャン完了！ 厳選された {len(top_candidates)} 銘柄を発見しました。最終診断を開始します。")
     
-    # 2. 発掘された銘柄をAIに連続で診断させる
     for cand in top_candidates:
         t_code = cand["ticker"]
         st.markdown(f"### 🎯 発掘銘柄: {t_code} (現在値: {cand['price']:.1f}円 / RSI: {cand['rsi']:.1f})")
         
-        # エラーを完全に回避したコンテキスト生成
         ctx_auto = {
             "pair_label": f"証券コード: {t_code}",
             "price": cand['price'],
@@ -100,36 +90,33 @@ if st.sidebar.button("🚀 全自動スキャン＆AI分析を実行"):
                 st.markdown("**【ファンドマネージャー分析】**")
                 st.write(report)
                 st.markdown("---")
-                st.markdown("**【執行責任者の注文戦略】**")
+                st.markdown("**【執行責任者の注文戦略 (勝率80%基準)】**")
                 st.write(strategy)
     
-    # 全自動スキャン終了後は、下の個別銘柄チャートを描画せずにここで処理を止める
     st.stop()
 
 # ==========================================
-# --- サイドバー設定: 💰 SBI証券 資金管理 ---
+# 💰 SBI証券 資金管理
 # ==========================================
 st.sidebar.markdown("---")
 st.sidebar.subheader("💰 SBI証券 資金管理 (日本株版)")
-
 capital = st.sidebar.number_input("軍資金 (JPY)", value=300000, step=10000)
 risk_percent = st.sidebar.slider("1トレード許容損失 (%)", 1.0, 10.0, 2.0, step=0.1)
 
 risk_amount = capital * (risk_percent / 100.0)
 st.sidebar.markdown(f"**1回の許容損失額（最大）**: {risk_amount:,.0f} 円")
 
-stop_loss_width = st.sidebar.number_input("想定損切幅 (円/株)", value=20.0, step=1.0, help="現値からいくら下がったら損切りするか")
+stop_loss_width = st.sidebar.number_input("想定損切幅 (円/株)", value=20.0, step=1.0)
 
 if stop_loss_width > 0:
     recommended_shares = math.floor(risk_amount / stop_loss_width)
     recommended_100_units = math.floor(recommended_shares / 100) * 100
-    
     st.sidebar.markdown("### 📊 発注推奨株数")
     st.sidebar.info(f"💡 S株(1株単位)での推奨: **{recommended_shares} 株**")
     if recommended_100_units > 0:
         st.sidebar.success(f"💡 単元(100株単位)での推奨: **{recommended_100_units} 株**")
     else:
-        st.sidebar.warning("⚠️ 100株単位で買うには許容リスク枠が足りません。SBI証券の「S株（1株単位）」での購入を推奨します。")
+        st.sidebar.warning("⚠️ 100株単位で買うには枠が足りません。S株での購入を推奨します。")
 
 st.sidebar.markdown("---")
 entry_price = st.sidebar.number_input("保有価格 (保有時のみ)", value=0.0, step=10.0)
@@ -147,13 +134,13 @@ if st.sidebar.button("📈 AI予想ライン反映"):
     else: st.sidebar.warning("API Keyが必要です")
 
 # ==========================================
-# --- メイン処理 (個別チャート・分析) ---
+# メイン処理 (個別チャート・分析)
 # ==========================================
 benchmark_raw = logic.get_market_data("^N225", rng="1y", interval="1d")
 df = logic.get_market_data(target_ticker, rng="1y", interval="1d")
 
 if df is None or df.empty:
-    st.error(f"データが取得できませんでした。証券コードが正しいか確認してください: {target_ticker}")
+    st.error(f"データが取得できませんでした: {target_ticker}")
     st.stop()
 
 df = logic.calculate_indicators(df, benchmark_raw)
