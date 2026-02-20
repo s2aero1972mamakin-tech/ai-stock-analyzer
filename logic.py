@@ -180,3 +180,61 @@ def get_ai_portfolio(api_key: str, ctx: dict):
         return model.generate_content(prompt).text
     except Exception as e:
         return f"⚠️ 【AI通信エラー】モデル({model_name})の呼び出しに失敗しました。\n詳細: {str(e)}"
+
+# ==========================================
+# 全自動スクリーニング・エンジン（解決策B）
+# ==========================================
+def auto_scan_value_stocks():
+    """
+    プログラムが自動で複数銘柄をスキャンし、テクニカル的に「買い」のトップ銘柄を抽出する。
+    ※API制限を避けるため、代表的な高配当・低位・大型株をターゲットとする。
+    """
+    # スキャン対象のユニバース（ここに監視させたい証券コードをいくらでも追加可能）
+    scan_list = [
+        "8306.T", "8411.T", "7182.T", "8410.T", # 銀行
+        "7203.T", "7201.T", "7267.T", "7011.T", # 自動車・重工
+        "9432.T", "9984.T", "9433.T", "9434.T", # 通信・IT
+        "5020.T", "5401.T", "3407.T", "6178.T", # 素材・郵政
+        "2914.T", "8593.T", "8058.T", "8002.T"  # 高配当・商社
+    ]
+    
+    candidates = []
+    
+    for ticker in scan_list:
+        try:
+            # 過去3ヶ月のデータを取得（スキャン用なので軽量化）
+            df = _yahoo_chart(ticker, rng="3mo", interval="1d")
+            if df is None or df.empty or len(df) < 30:
+                continue
+                
+            # テクニカル指標の計算
+            df["SMA_25"] = df["Close"].rolling(window=25).mean()
+            delta = df["Close"].diff()
+            up = delta.clip(lower=0)
+            down = -1 * delta.clip(upper=0)
+            rs = up.ewm(com=13, adjust=False).mean() / down.ewm(com=13, adjust=False).mean()
+            df["RSI"] = 100 - (100 / (1 + rs))
+            
+            latest = df.iloc[-1]
+            price = latest["Close"]
+            sma25 = latest["SMA_25"]
+            rsi = latest["RSI"]
+            
+            # 【絶対条件】ロボットが「買い候補」とする条件
+            # 1. 株価が25日線より上にある（上昇トレンド）または、RSIが40以下（売られすぎの反発狙い）
+            # 2. 株価が3000円以下（資金効率を考慮）
+            if price <= 3000 and (price > sma25 or rsi <= 40):
+                # スコアリング（RSIが低く、かつトレンドが上向きのものを高く評価）
+                score = (50 - rsi) + ((price - sma25) / sma25 * 100)
+                candidates.append({
+                    "ticker": ticker,
+                    "price": price,
+                    "rsi": rsi,
+                    "score": score
+                })
+        except Exception:
+            continue
+            
+    # スコアが高い順に並び替え、トップ3銘柄だけを返す
+    candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
+    return candidates[:3]
