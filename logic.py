@@ -11,7 +11,7 @@ TOKYO = pytz.timezone("Asia/Tokyo")
 # AIモデル取得ヘルパー
 def get_active_model(api_key: str):
     genai.configure(api_key=api_key)
-    return "gemini-1.5-pro" 
+    return "gemini-1.5-pro-latest" 
 
 def _yahoo_chart(ticker="8306.T", rng="1y", interval="1d"):
     try:
@@ -151,4 +151,5 @@ def get_ai_portfolio(api_key: str, ctx: dict):
 現在の銘柄({ctx.get('pair_label', '不明')})について、週末や月末を跨いで保有（ホールド）すべきか、
 それとも金曜日に一旦手仕舞いすべきか、現在の相場環境（株価 {ctx.get('price', 0.0):.1f}円）を元に判断してください。
 """
+
     return model.generate_content(prompt).text
