@@ -39,13 +39,10 @@ if st.sidebar.button("🔥 マクロ分析＆全自動スキャンを実行", ty
         st.stop()
         
     with st.spinner("AIがマクロ環境(地政学/金利)から最適セクターを絞り込み中..."):
-        # AI連携によるスマート・スクリーニング
         target_sectors, top_candidates = logic.auto_scan_value_stocks(api_key)
-        
         st.session_state.auto_candidates = top_candidates
         
         if top_candidates:
-            # 見つかった第1位の銘柄を、そのままメイン画面に強制セット！
             best = top_candidates[0]
             st.session_state.target_ticker = best["ticker"]
             st.session_state.pair_label = f"🤖 AI発掘 第1位: {best['ticker']} (有望セクター: {'/'.join(target_sectors)})"
@@ -54,14 +51,13 @@ if st.sidebar.button("🔥 マクロ分析＆全自動スキャンを実行", ty
             st.session_state.target_ticker = None
             st.sidebar.error("現在、勝率80%の基準をクリアした銘柄はありません。本日のエントリーは見送ります。")
 
-# 次点候補の表示（スキャン成功時のみ）
 if st.session_state.auto_candidates and len(st.session_state.auto_candidates) > 1:
     with st.sidebar.expander("📌 その他の発掘候補 (クリック)"):
         for cand in st.session_state.auto_candidates[1:]:
             st.write(f"- {cand['ticker']} (RSI: {cand['rsi']:.1f})")
 
 # ==========================================
-# ⚙️ 手動オーバーライド (ピンポイントで調べたい時用)
+# ⚙️ 手動オーバーライド
 # ==========================================
 st.sidebar.markdown("---")
 st.sidebar.subheader("⚙️ 手動分析 (マニュアル指定)")
@@ -74,7 +70,7 @@ if st.sidebar.button("手動でセット"):
         st.sidebar.error("4桁の数字を入力してください")
 
 # ==========================================
-# 💰 SBI証券 資金管理 (リスクコントロール)
+# 💰 SBI証券 資金管理
 # ==========================================
 st.sidebar.markdown("---")
 st.sidebar.subheader("💰 SBI証券 資金管理")
@@ -92,13 +88,12 @@ if stop_loss_width > 0:
 # ==========================================
 # 🛑 メイン画面（待機状態コントロール）
 # ==========================================
-# まだ何も銘柄がセットされていない（起動直後）の画面表示
 if not st.session_state.target_ticker:
     st.info("👈 左側のメニューから「🔥 マクロ分析＆全自動スキャンを実行」ボタンを押して、ロボットを起動してください。")
     st.stop()
 
 # ==========================================
-# 📈 描画とAI分析 (AIがセットした銘柄の処理)
+# 📈 描画とAI分析 (AI連携への完全なデータ引き渡し)
 # ==========================================
 target_ticker = st.session_state.target_ticker
 pair_label = st.session_state.pair_label
@@ -116,14 +111,12 @@ curr_price = st.session_state.quote[0] or latest["Close"]
 
 diag = logic.judge_condition(curr_price, latest["SMA_5"], latest["SMA_25"], latest["SMA_75"], latest["RSI"])
 
-# チャート上部のステータスパネル
 col1, col2 = st.columns(2)
 with col1:
     st.markdown(f"<div style='padding:10px; border-radius:5px; background-color:{diag['short']['color']}; color:white;'><b>短期診断 (5日線):</b> {diag['short']['status']}</div>", unsafe_allow_html=True)
 with col2:
     st.markdown(f"<div style='padding:10px; border-radius:5px; background-color:{diag['mid']['color']}; color:white;'><b>中期トレンド (RSI/MA):</b> {diag['mid']['status']}</div>", unsafe_allow_html=True)
 
-# Plotlyチャート描画
 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
 fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="株価"), row=1, col=1)
 fig.add_trace(go.Scatter(x=df.index, y=df['SMA_5'], name="SMA 5", line=dict(color='green', width=1)), row=1, col=1)
@@ -136,17 +129,19 @@ if "BENCHMARK" in df.columns:
 fig.update_layout(title=f"{pair_label} - テクニカル分析", xaxis_rangeslider_visible=False, height=700)
 st.plotly_chart(fig, use_container_width=True)
 
-# AI用コンテキスト作成
+# 🚀 修正ポイント: 全てのテクニカルデータをAIに引き渡す
 ctx = {
     "pair_label": pair_label,
     "price": curr_price,
     "atr": latest["ATR"],
     "rsi": latest["RSI"],
     "sma_diff": latest["SMA_DIFF"],
+    "sma5": latest["SMA_5"],
+    "sma25": latest["SMA_25"],
+    "sma75": latest["SMA_75"],
     "us10y": latest.get("BENCHMARK", 0.0)
 }
 
-# アクションタブ
 tab1, tab2, tab3 = st.tabs(["📝 注文戦略を作成 (EXECUTE)", "📊 株価詳細レポート", "💰 ポートフォリオ判断"])
 
 with tab1:
