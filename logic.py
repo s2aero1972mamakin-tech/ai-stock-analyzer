@@ -11,7 +11,7 @@ TOKYO = pytz.timezone("Asia/Tokyo")
 # AIモデル取得ヘルパー
 def get_active_model(api_key: str):
     genai.configure(api_key=api_key)
-    return "gemini-1.5-flash" 
+    return "gmodels/gemini-1.5-pro-latest" 
 
 def _yahoo_chart(ticker="8306.T", rng="1y", interval="1d"):
     try:
@@ -153,4 +153,5 @@ def get_ai_portfolio(api_key: str, ctx: dict):
 """
 
     return model.generate_content(prompt).text
+
 
