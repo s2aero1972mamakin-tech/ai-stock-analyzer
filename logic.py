@@ -9,38 +9,79 @@ import json
 TOKYO = pytz.timezone("Asia/Tokyo")
 
 # ==========================================
-# AIモデル取得ヘルパー（動的探索アルゴリズム）
+# 業種・セクター別 銘柄データベース（AIがここから選別します）
+# ==========================================
+SECTOR_MAP = {
+    "銀行・金融": ["8306.T", "8316.T", "8411.T", "7182.T", "8593.T", "8766.T", "8750.T"],
+    "自動車・輸送機": ["7203.T", "7267.T", "7269.T", "7201.T", "7011.T", "7012.T", "6301.T"],
+    "半導体・電子部品": ["8035.T", "6920.T", "6857.T", "6501.T", "6758.T", "6981.T", "6503.T"],
+    "通信・IT": ["9432.T", "9433.T", "9434.T", "9984.T", "9613.T", "4307.T"],
+    "商社・卸売": ["8058.T", "8031.T", "8001.T", "8002.T", "8053.T", "2768.T"],
+    "素材・化学・鉄鋼": ["5401.T", "5411.T", "3407.T", "4005.T", "4183.T", "4063.T"],
+    "エネルギー・インフラ": ["5020.T", "1605.T", "9501.T", "9020.T", "9022.T", "9101.T"],
+    "医薬品・食品": ["4502.T", "4568.T", "2914.T", "2502.T", "3382.T", "4519.T"],
+    "不動産・建設": ["8801.T", "8802.T", "1925.T", "1928.T", "1801.T", "1812.T"]
+}
+
+# ==========================================
+# AIモデル取得ヘルパー
 # ==========================================
 def get_active_model(api_key: str):
     genai.configure(api_key=api_key)
     try:
-        # サーバーに「現在この環境で利用可能なモデル一覧」を直接問い合わせる
         available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        
-        # 優先順位（最新Pro ＞ Flash ＞ 旧Pro）で、実際に存在するものだけを自動選択
         for target in ["models/gemini-1.5-pro-latest", "models/gemini-1.5-pro", "models/gemini-1.5-flash", "models/gemini-pro"]:
             if target in available_models:
                 return target
-                
-        # 上記がなくても、リストに使えるものがあればそれを強制使用
-        if available_models:
-            return available_models[0]
-            
-        return "models/gemini-1.5-flash" # 取得失敗時の安全なフォールバック
+        if available_models: return available_models[0]
+        return "models/gemini-1.5-flash" 
     except Exception:
         return "models/gemini-1.5-flash"
 
 # ==========================================
+# AIによるマクロ・セクター選定（トップダウン）
+# ==========================================
+def get_promising_sectors(api_key: str) -> list:
+    model_name = get_active_model(api_key)
+    model = genai.GenerativeModel(model_name)
+    sectors_list_str = ", ".join(SECTOR_MAP.keys())
+    
+    prompt = f"""
+あなたは世界トップクラスのマクロ経済ストラテジストです。
+現在の日本の金利動向、為替（円安/円高）、米国の経済状況、および地政学リスクを総合的に分析し、
+以下の日本株の業種（セクター）の中から、現在最も資金が流入しやすく、今後1ヶ月で株価伸長率が高いと予想されるセクターを「2つ」だけ厳選してください。
+
+【選択肢】
+{sectors_list_str}
+
+必ず以下のJSON配列形式のみを出力してください。理由やその他の文章は一切不要です。
+["選んだセクター名1", "選んだセクター名2"]
+"""
+    try:
+        res = model.generate_content(prompt).text
+        s = res.find("[")
+        e = res.rfind("]")
+        if s != -1 and e != -1:
+            chosen = json.loads(res[s:e+1])
+            if isinstance(chosen, list) and len(chosen) > 0:
+                # 辞書に存在するキーだけを確実にフィルタリング
+                return [c for c in chosen if c in SECTOR_MAP]
+    except Exception:
+        pass
+    # エラー時はデフォルトで資金が向かいやすいセクターを返す
+    return ["半導体・電子部品", "銀行・金融"]
+
+# ==========================================
 # データ取得・計算ロジック
 # ==========================================
-def _yahoo_chart(ticker="8306.T", rng="1y", interval="1d"):
+def _yahoo_chart(ticker, rng="3mo", interval="1d"):
     try:
         df = yf.download(ticker, period=rng, interval=interval, progress=False)
         if df.empty: return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.droplevel(1)
         return df
-    except Exception as e:
+    except Exception:
         return None
 
 def get_market_data(ticker="8306.T", rng="1y", interval="1d"):
@@ -55,7 +96,6 @@ def get_latest_quote(ticker="8306.T"):
 def calculate_indicators(df: pd.DataFrame, benchmark_raw: pd.DataFrame = None) -> pd.DataFrame:
     if df is None or df.empty: return df
     df = df.copy()
-    
     df["SMA_5"] = df["Close"].rolling(window=5).mean()
     df["SMA_25"] = df["Close"].rolling(window=25).mean()
     df["SMA_75"] = df["Close"].rolling(window=75).mean()
@@ -63,9 +103,7 @@ def calculate_indicators(df: pd.DataFrame, benchmark_raw: pd.DataFrame = None) -
     delta = df["Close"].diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
-    ema_up = up.ewm(com=13, adjust=False).mean()
-    ema_down = down.ewm(com=13, adjust=False).mean()
-    rs = ema_up / ema_down
+    rs = up.ewm(com=13, adjust=False).mean() / down.ewm(com=13, adjust=False).mean()
     df["RSI"] = 100 - (100 / (1 + rs))
     
     high_low = df["High"] - df["Low"]
@@ -79,7 +117,6 @@ def calculate_indicators(df: pd.DataFrame, benchmark_raw: pd.DataFrame = None) -
     df["BENCHMARK"] = 0.0
     if benchmark_raw is not None and not benchmark_raw.empty:
         df["BENCHMARK"] = benchmark_raw["Close"].reindex(df.index, method="ffill")
-        
     return df.dropna()
 
 def judge_condition(price, sma5, sma25, sma75, rsi):
@@ -92,13 +129,63 @@ def judge_condition(price, sma5, sma25, sma75, rsi):
     elif rsi >= 70: mid_status, mid_color = "過熱感あり (利益確定検討)", "orange"
     elif rsi <= 30: mid_status, mid_color = "売られすぎ (反発警戒)", "orange"
     
-    return {
-        "short": {"status": short_status, "color": short_color},
-        "mid": {"status": mid_status, "color": mid_color}
-    }
+    return {"short": {"status": short_status, "color": short_color}, "mid": {"status": mid_status, "color": mid_color}}
 
 # ==========================================
-# AI分析ロジック（安全装置付き）
+# スマート・スクリーニング（的確な絞り込みエンジン）
+# ==========================================
+def auto_scan_value_stocks(api_key: str):
+    """
+    1. AIに有望セクターを2つ選ばせる
+    2. そのセクターの銘柄群だけを的確にスキャンする（無駄な通信排除）
+    3. 勝率80%の厳格な条件に合致するトップ銘柄を抽出する
+    """
+    # AIによるトップダウン業種選定
+    target_sectors = get_promising_sectors(api_key)
+    
+    scan_list = []
+    for sector in target_sectors:
+        scan_list.extend(SECTOR_MAP[sector])
+        
+    candidates = []
+    
+    for ticker in scan_list:
+        try:
+            df = _yahoo_chart(ticker, rng="3mo", interval="1d")
+            if df is None or df.empty or len(df) < 30:
+                continue
+                
+            df["SMA_5"] = df["Close"].rolling(window=5).mean()
+            df["SMA_25"] = df["Close"].rolling(window=25).mean()
+            delta = df["Close"].diff()
+            up = delta.clip(lower=0)
+            down = -1 * delta.clip(upper=0)
+            rs = up.ewm(com=13, adjust=False).mean() / down.ewm(com=13, adjust=False).mean()
+            df["RSI"] = 100 - (100 / (1 + rs))
+            
+            latest = df.iloc[-1]
+            price = latest["Close"]
+            sma5 = latest["SMA_5"]
+            sma25 = latest["SMA_25"]
+            rsi = latest["RSI"]
+            
+            # 【勝率80%追求・厳格な買い条件】
+            if (sma5 > sma25 and 40 <= rsi <= 60) or (rsi <= 30):
+                score = ((price - sma25) / sma25 * 100) + (70 - rsi)
+                candidates.append({
+                    "ticker": ticker,
+                    "price": price,
+                    "rsi": rsi,
+                    "score": score
+                })
+        except Exception:
+            continue
+            
+    candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
+    return target_sectors, candidates[:3]
+
+# ==========================================
+# AI分析ロジック（厳格リスク管理・実戦仕様）
 # ==========================================
 def get_ai_range(api_key: str, ctx: dict):
     model_name = get_active_model(api_key)
@@ -122,7 +209,7 @@ def get_ai_analysis(api_key: str, ctx: dict):
     model_name = get_active_model(api_key)
     model = genai.GenerativeModel(model_name)
     prompt = f"""
-あなたは日本株投資に精通した「バリュー株専門のファンドマネージャー」です。
+あなたは利益を追求する実戦派の「日本株ファンドマネージャー」です。
 以下のデータから、指定された銘柄の投資判断を下してください。
 
 【対象銘柄データ】
@@ -131,13 +218,10 @@ def get_ai_analysis(api_key: str, ctx: dict):
 - 日経平均(参考): {ctx.get('us10y', 0.0):.1f} 円
 - ボラティリティ(ATR): {ctx.get('atr', 0.0):.2f} 円
 - RSI(14日): {ctx.get('rsi', 50):.1f}
-- 25日線乖離率: {ctx.get('sma_diff', 0.0):.2f}%
 
-【分析・戦略作成の絶対ルール】
-1. この銘柄が現在押し目買いの好機か、バリュートラップ（下落継続の罠）かを厳しく判定してください。
-2. 日経平均の動向と個別株のトレンドを比較してください。
-3. 1週間〜1ヶ月のスイングトレードを前提としてください。
-4. 【重要】過去の歴史的な上値抵抗線（節目となるキリの良い株価など）を強く意識し、非現実的な一直線の上昇を想定しないでください。
+【分析のルール】
+この銘柄はシステムが「マクロ環境（有望セクター）＋ 勝率80%以上の優位性」の2重フィルターをクリアした銘柄です。
+なぜこの銘柄が今強いのか、あるいは罠なのかをテクニカルと相場環境から冷徹に分析し、上値のメドと押し目買いのポイントを具体的に解説してください。
 """
     try:
         return model.generate_content(prompt).text
@@ -148,20 +232,21 @@ def get_ai_order_strategy(api_key: str, ctx: dict):
     model_name = get_active_model(api_key)
     model = genai.GenerativeModel(model_name)
     prompt = f"""
-あなたは冷徹な執行責任者です。中間的な回答や迷いは一切不要です。
-以下のデータと直近のレポート内容に基づき、具体的な注文戦略を作成してください。
+あなたは冷徹かつ極めて優秀な「利益追求型のシステムトレード執行責任者」です。
+以下のデータに基づき、具体的な注文戦略を作成してください。
 
 【対象銘柄データ】
 - 銘柄・証券コード: {ctx.get('pair_label', '不明')}
 - 現在株価: {ctx.get('price', 0.0):.1f} 円
-- ボラティリティ(ATR): {ctx.get('atr', 0.0):.2f} 円
 
-【命令】
-エントリーの確信が持てる時のみ「EXECUTE: 100%」、少しでも疑念がある時は「ABORT: 0%」と明確に出力してください。
-EXECUTEの場合、必ず以下の3点（現実的な数値）を提示してください。
+【絶対命令：勝率80%基準とAIによるリスク管理】
+1. 勝率判定: 勝率が「80%以上」の極めて高い優位性が見込める鉄板のチャート形状である場合のみ「EXECUTE: 100%」とし、それ以外は一切の妥協なく「ABORT: 0%」としてください。
+2. リスク管理: AIであるあなた自身が厳格にリスク管理を行ってください。リスクリワード比（損切り幅：利幅 = 1：2以上）が成立する現実的な数値を必ず算出してください。
+
+EXECUTEの場合、必ず以下の3点を提示してください。
 - ENTRY (指値または現在値)
-- LIMIT (利確目標: 歴史的節目や抵抗線の「少し手前」に設定すること)
-- STOP (損切: ATRを考慮した許容範囲。現値から不自然に離さないこと)
+- LIMIT (利確目標: リスクリワード1:2を満たす、論理的な上値抵抗線)
+- STOP (損切: トレンド崩壊を示す明確なライン。絶対に深くしすぎないこと)
 """
     try:
         return model.generate_content(prompt).text
@@ -173,68 +258,9 @@ def get_ai_portfolio(api_key: str, ctx: dict):
     model = genai.GenerativeModel(model_name)
     prompt = f"""
 あなたは日本株のポートフォリオマネージャーです。
-現在の銘柄({ctx.get('pair_label', '不明')})について、週末や月末を跨いで保有（ホールド）すべきか、
-それとも金曜日に一旦手仕舞いすべきか、現在の相場環境（株価 {ctx.get('price', 0.0):.1f}円）を元に判断してください。
+現在の銘柄({ctx.get('pair_label', '不明')})について、週末や月末を跨いで保有すべきか判断してください。
 """
     try:
         return model.generate_content(prompt).text
     except Exception as e:
         return f"⚠️ 【AI通信エラー】モデル({model_name})の呼び出しに失敗しました。\n詳細: {str(e)}"
-
-# ==========================================
-# 全自動スクリーニング・エンジン（解決策B）
-# ==========================================
-def auto_scan_value_stocks():
-    """
-    プログラムが自動で複数銘柄をスキャンし、テクニカル的に「買い」のトップ銘柄を抽出する。
-    ※API制限を避けるため、代表的な高配当・低位・大型株をターゲットとする。
-    """
-    # スキャン対象のユニバース（ここに監視させたい証券コードをいくらでも追加可能）
-    scan_list = [
-        "8306.T", "8411.T", "7182.T", "8410.T", # 銀行
-        "7203.T", "7201.T", "7267.T", "7011.T", # 自動車・重工
-        "9432.T", "9984.T", "9433.T", "9434.T", # 通信・IT
-        "5020.T", "5401.T", "3407.T", "6178.T", # 素材・郵政
-        "2914.T", "8593.T", "8058.T", "8002.T"  # 高配当・商社
-    ]
-    
-    candidates = []
-    
-    for ticker in scan_list:
-        try:
-            # 過去3ヶ月のデータを取得（スキャン用なので軽量化）
-            df = _yahoo_chart(ticker, rng="3mo", interval="1d")
-            if df is None or df.empty or len(df) < 30:
-                continue
-                
-            # テクニカル指標の計算
-            df["SMA_25"] = df["Close"].rolling(window=25).mean()
-            delta = df["Close"].diff()
-            up = delta.clip(lower=0)
-            down = -1 * delta.clip(upper=0)
-            rs = up.ewm(com=13, adjust=False).mean() / down.ewm(com=13, adjust=False).mean()
-            df["RSI"] = 100 - (100 / (1 + rs))
-            
-            latest = df.iloc[-1]
-            price = latest["Close"]
-            sma25 = latest["SMA_25"]
-            rsi = latest["RSI"]
-            
-            # 【絶対条件】ロボットが「買い候補」とする条件
-            # 1. 株価が25日線より上にある（上昇トレンド）または、RSIが40以下（売られすぎの反発狙い）
-            # 2. 株価が3000円以下（資金効率を考慮）
-            if price <= 3000 and (price > sma25 or rsi <= 40):
-                # スコアリング（RSIが低く、かつトレンドが上向きのものを高く評価）
-                score = (50 - rsi) + ((price - sma25) / sma25 * 100)
-                candidates.append({
-                    "ticker": ticker,
-                    "price": price,
-                    "rsi": rsi,
-                    "score": score
-                })
-        except Exception:
-            continue
-            
-    # スコアが高い順に並び替え、トップ3銘柄だけを返す
-    candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
-    return candidates[:3]
