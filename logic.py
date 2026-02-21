@@ -1,11 +1,10 @@
 import yfinance as yf
 import pandas as pd
-import google.generativeai as genai
+from openai import OpenAI  # GeminiからOpenAIに変更
 import pytz
 import time
 from datetime import datetime
 import json
-import streamlit as st  # キャッシュ機能を使用するために追加
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
@@ -63,50 +62,33 @@ def get_company_name(ticker: str) -> str:
         return ticker
 
 # ==========================================
-# 🛑 キャッシュ型・自動探索アルゴリズム
-# （通信は最初の1回のみ。404エラーとAPI制限を同時に防ぐ）
+# 🛑 OpenAI (ChatGPT) 呼び出しヘルパー関数
 # ==========================================
-@st.cache_data(show_spinner=False, ttl=3600)
-def get_active_model(api_key: str) -> str:
-    genai.configure(api_key=api_key)
+def call_openai(api_key: str, system_prompt: str, user_prompt: str) -> str:
     try:
-        # API環境に実際に存在するモデルのリストを取得
-        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        
-        # 優先順位: 最も安定して無料枠が多いものを上から探す
-        priority_targets = [
-            "models/gemini-1.5-flash-latest",
-            "models/gemini-1.5-flash",
-            "models/gemini-1.5-pro",
-            "models/gemini-pro",
-            "models/gemini-2.0-flash",
-            "models/gemini-2.5-flash"
-        ]
-        
-        for target in priority_targets:
-            if target in models:
-                return target
-                
-        # 優先リストになくても、使えるものが存在すれば最初のものを返す
-        if models:
-            return models[0]
-    except Exception:
-        pass
-        
-    return "models/gemini-1.5-flash"
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # 最速・最安の優秀なモデルに固定
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.7
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"⚠️ OpenAI API エラー: {str(e)}"
 
 def get_promising_sectors(api_key: str) -> list:
-    model_name = get_active_model(api_key)
-    model = genai.GenerativeModel(model_name)
     sectors_list_str = ", ".join(MEGA_SECTOR_MAP.keys())
-    prompt = f"""
-あなたはマクロ経済ストラテジストです。現在の金利、為替、地政学リスクを分析し、
-以下の中から、現在最も資金が流入しやすく株価伸長率が高い業種を「2つ」厳選してください。
+    system_prompt = "あなたはマクロ経済ストラテジストです。必ずJSONの配列形式のみで回答してください。"
+    user_prompt = f"""
+現在の金利、為替、地政学リスクを分析し、以下の中から、現在最も資金が流入しやすく株価伸長率が高い業種を「2つ」厳選してください。
 【選択肢】{sectors_list_str}
-必ず以下のJSON配列形式のみを出力してください。["セクター1", "セクター2"]
+必ず以下のJSON配列形式のみを出力してください。例: ["セクター1", "セクター2"]
 """
     try:
-        res = model.generate_content(prompt).text
+        res = call_openai(api_key, system_prompt, user_prompt)
         s = res.find("[")
         e = res.rfind("]")
         if s != -1 and e != -1:
@@ -211,30 +193,26 @@ def auto_scan_value_stocks(api_key: str, progress_callback=None):
     return target_sectors, candidates[:3]
 
 # ==========================================
-# 🧠 AI分析ロジック
+# 🧠 AI分析ロジック (OpenAI APIへ変更)
 # ==========================================
 def get_ai_range(api_key: str, ctx: dict):
-    model_name = get_active_model(api_key)
-    model = genai.GenerativeModel(model_name)
     p = ctx.get('price', 0.0)
-    prompt = f"""
-あなたは日本株のテクニカルアナリストです。
+    system_prompt = "あなたは日本株のテクニカルアナリストです。必ずJSON形式で出力してください。"
+    user_prompt = f"""
 現在株価 {p:.1f} 円、ATR {ctx.get('atr',0.0):.2f}、RSI {ctx.get('rsi',50):.1f} です。
 今後1週間の想定最高値(high)と最安値(low)をJSONで出力。
 フォーマット: {{"high": 0000.0, "low": 0000.0, "why": "理由"}}
 """
     try:
-        res = model.generate_content(prompt).text
+        res = call_openai(api_key, system_prompt, user_prompt)
         s = res.find("{")
         e = res.rfind("}")
         return json.loads(res[s:e+1]) if s!=-1 else {"high": p*1.05, "low": p*0.95, "why": "JSONパース失敗"}
     except: return {"high": p*1.05, "low": p*0.95, "why": "エラー"}
 
 def get_ai_analysis(api_key: str, ctx: dict):
-    model_name = get_active_model(api_key)
-    model = genai.GenerativeModel(model_name)
-    prompt = f"""
-あなたは利益を追求する実戦派の「日本株ファンドマネージャー」です。
+    system_prompt = "あなたは利益を追求する実戦派の「日本株ファンドマネージャー」です。"
+    user_prompt = f"""
 【対象銘柄データ】
 - 銘柄: {ctx.get('pair_label', '不明')}
 - 現在株価: {ctx.get('price', 0.0):.1f} 円
@@ -244,14 +222,11 @@ def get_ai_analysis(api_key: str, ctx: dict):
 この銘柄はシステムが「有望セクター ＋ 勝率80%のテクニカル優位性」の2重フィルターをクリアした鉄板銘柄です。
 豊富なテクニカルデータを根拠に、上値のメドと押し目買いのポイントを解説してください。
 """
-    try: return model.generate_content(prompt).text
-    except Exception as e: return f"⚠️ エラー: {str(e)}"
+    return call_openai(api_key, system_prompt, user_prompt)
 
 def get_ai_order_strategy(api_key: str, ctx: dict):
-    model_name = get_active_model(api_key)
-    model = genai.GenerativeModel(model_name)
-    prompt = f"""
-あなたは冷徹な「システムトレード執行責任者」です。
+    system_prompt = "あなたは冷徹なシステムトレード執行責任者です。"
+    user_prompt = f"""
 【データ】
 - 銘柄: {ctx.get('pair_label', '不明')}
 - 現在株価: {ctx.get('price', 0.0):.1f} 円
@@ -266,12 +241,9 @@ def get_ai_order_strategy(api_key: str, ctx: dict):
 - LIMIT (利確目標)
 - STOP (損切: 25日線割れ等を考慮)
 """
-    try: return model.generate_content(prompt).text
-    except Exception as e: return f"⚠️ エラー: {str(e)}"
+    return call_openai(api_key, system_prompt, user_prompt)
 
 def get_ai_portfolio(api_key: str, ctx: dict):
-    model_name = get_active_model(api_key)
-    model = genai.GenerativeModel(model_name)
-    prompt = f"あなたはポートフォリオマネージャーです。現在の銘柄({ctx.get('pair_label', '不明')})について、週末跨ぎの保有判断をしてください。"
-    try: return model.generate_content(prompt).text
-    except: return "エラー"
+    system_prompt = "あなたは日本株のポートフォリオマネージャーです。"
+    user_prompt = f"現在の銘柄({ctx.get('pair_label', '不明')})について、週末跨ぎの保有判断をしてください。"
+    return call_openai(api_key, system_prompt, user_prompt)
