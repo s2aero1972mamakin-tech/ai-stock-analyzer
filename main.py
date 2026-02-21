@@ -5,17 +5,17 @@ import pandas as pd
 import math
 from datetime import datetime
 import pytz
-import logic  # 日本株用のロジックファイルをインポート
+import logic
 
 # ==========================================
 # ページ設定と初期化
 # ==========================================
 st.set_page_config(layout="wide", page_title="AI日本株 全自動ロボット", page_icon="🤖")
 st.title("🤖 AI連携型 日本株 全自動システムトレード (勝率80%基準)")
+st.markdown("※四季報や手動リサーチ不要。AIがマクロ経済から有望業種を選定し、その業種の全優良株を自動スキャンします。")
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
-# セッションステート（状態保持）の初期化
 if "target_ticker" not in st.session_state: st.session_state.target_ticker = None
 if "pair_label" not in st.session_state: st.session_state.pair_label = None
 if "auto_candidates" not in st.session_state: st.session_state.auto_candidates = []
@@ -38,23 +38,45 @@ if st.sidebar.button("🔥 マクロ分析＆全自動スキャンを実行", ty
         st.sidebar.error("API Keyが必要です。")
         st.stop()
         
-    with st.spinner("AIがマクロ環境(地政学/金利)から最適セクターを絞り込み中..."):
-        target_sectors, top_candidates = logic.auto_scan_value_stocks(api_key)
-        st.session_state.auto_candidates = top_candidates
+    st.info("🤖 AIが現在の地政学・金利から有望セクターを選定しています...")
+    
+    # プログレスバー（進行状況）の表示用コンポーネント
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    def update_progress(current, total, ticker):
+        percent = int((current / total) * 100)
+        progress_bar.progress(percent)
+        status_text.text(f"🔍 スキャン実行中... {current} / {total} 銘柄完了 ({ticker})")
+
+    # ロジック呼び出し（コールバック関数を渡してプログレスバーを動かす）
+    target_sectors, top_candidates = logic.auto_scan_value_stocks(api_key, progress_callback=update_progress)
+    
+    # スキャン完了後にプログレスバーを消去
+    progress_bar.empty()
+    status_text.empty()
+    
+    st.session_state.auto_candidates = top_candidates
+    
+    if top_candidates:
+        best = top_candidates[0]
+        st.session_state.target_ticker = best["ticker"]
         
-        if top_candidates:
-            best = top_candidates[0]
-            st.session_state.target_ticker = best["ticker"]
-            st.session_state.pair_label = f"🤖 AI発掘 第1位: {best['ticker']} (有望セクター: {'/'.join(target_sectors)})"
-            st.sidebar.success(f"トップ銘柄 {best['ticker']} をメイン画面にセットしました！")
-        else:
-            st.session_state.target_ticker = None
-            st.sidebar.error("現在、勝率80%の基準をクリアした銘柄はありません。本日のエントリーは見送ります。")
+        comp_name = best.get("name", "")
+        name_disp = f" {comp_name}" if comp_name else ""
+        
+        st.session_state.pair_label = f"🤖 AI発掘 第1位: {best['ticker']}{name_disp} (有望セクター: {'/'.join(target_sectors)})"
+        st.sidebar.success(f"トップ銘柄 {best['ticker']}{name_disp} をメイン画面にセットしました！")
+    else:
+        st.session_state.target_ticker = None
+        st.sidebar.error("現在、勝率80%の基準をクリアした銘柄はありません。本日のエントリーは見送ります。")
 
 if st.session_state.auto_candidates and len(st.session_state.auto_candidates) > 1:
     with st.sidebar.expander("📌 その他の発掘候補 (クリック)"):
         for cand in st.session_state.auto_candidates[1:]:
-            st.write(f"- {cand['ticker']} (RSI: {cand['rsi']:.1f})")
+            c_name = cand.get("name", "")
+            c_disp = f" {c_name}" if c_name else ""
+            st.write(f"- {cand['ticker']}{c_disp} (RSI: {cand['rsi']:.1f})")
 
 # ==========================================
 # ⚙️ 手動オーバーライド
@@ -64,8 +86,11 @@ st.sidebar.subheader("⚙️ 手動分析 (マニュアル指定)")
 custom_code = st.sidebar.text_input("日本の証券コード", value="", placeholder="例: 8306")
 if st.sidebar.button("手動でセット"):
     if custom_code.isdigit() and len(custom_code) == 4:
-        st.session_state.target_ticker = f"{custom_code}.T"
-        st.session_state.pair_label = f"手動指定: {custom_code}"
+        ticker_str = f"{custom_code}.T"
+        st.session_state.target_ticker = ticker_str
+        comp_name = logic.get_company_name(ticker_str)
+        name_disp = f" {comp_name}" if comp_name else ""
+        st.session_state.pair_label = f"手動指定: {custom_code}{name_disp}"
     else:
         st.sidebar.error("4桁の数字を入力してください")
 
@@ -93,7 +118,7 @@ if not st.session_state.target_ticker:
     st.stop()
 
 # ==========================================
-# 📈 描画とAI分析 (AI連携への完全なデータ引き渡し)
+# 📈 描画とAI分析
 # ==========================================
 target_ticker = st.session_state.target_ticker
 pair_label = st.session_state.pair_label
@@ -129,7 +154,6 @@ if "BENCHMARK" in df.columns:
 fig.update_layout(title=f"{pair_label} - テクニカル分析", xaxis_rangeslider_visible=False, height=700)
 st.plotly_chart(fig, use_container_width=True)
 
-# 🚀 修正ポイント: 全てのテクニカルデータをAIに引き渡す
 ctx = {
     "pair_label": pair_label,
     "price": curr_price,
