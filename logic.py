@@ -1,63 +1,49 @@
 import yfinance as yf
 import pandas as pd
-from openai import OpenAI  # GeminiからOpenAIに変更
+from openai import OpenAI
 import pytz
 import time
 from datetime import datetime
 import json
+import streamlit as st
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
 # ==========================================
-# 東証プライム メガ・データベース (約400銘柄)
+# 🛑 JPX(日本取引所) 公式全4000銘柄データの自動取得
+# （手書きの辞書を廃止し、公式データをキャッシュして使用）
 # ==========================================
-MEGA_SECTOR_MAP = {
-    "IT・通信・サービス": [
-        "9432.T", "9433.T", "9434.T", "9984.T", "9613.T", "4307.T", "3626.T", "4716.T", "4689.T", "4732.T", 
-        "2127.T", "2413.T", "4704.T", "4739.T", "3994.T", "4684.T", "4751.T", "9602.T", "9697.T", "9735.T",
-        "9766.T", "4661.T", "6098.T", "2371.T", "4324.T", "4768.T", "9783.T", "9719.T", "3769.T", "3923.T"
-    ],
-    "半導体・電気機器": [
-        "8035.T", "6920.T", "6857.T", "6501.T", "6758.T", "6981.T", "6503.T", "6506.T", "6594.T", "6701.T", 
-        "6702.T", "6723.T", "6762.T", "6861.T", "6954.T", "7751.T", "7733.T", "6504.T", "6508.T", "6645.T",
-        "6752.T", "6753.T", "6841.T", "6902.T", "6965.T", "7731.T", "7732.T", "7741.T", "4062.T", "3132.T"
-    ],
-    "自動車・輸送機・機械": [
-        "7203.T", "7267.T", "7269.T", "7201.T", "7011.T", "7012.T", "6301.T", "6326.T", "6273.T", "7202.T", 
-        "7211.T", "7102.T", "7270.T", "7259.T", "7282.T", "6146.T", "6214.T", "6305.T", "6367.T", "6395.T",
-        "6436.T", "6471.T", "6472.T", "6479.T", "6481.T", "7003.T", "7004.T", "7272.T", "7240.T", "6103.T"
-    ],
-    "銀行・証券・金融": [
-        "8306.T", "8316.T", "8411.T", "7182.T", "8593.T", "8766.T", "8750.T", "8604.T", "8308.T", "8309.T", 
-        "8331.T", "8354.T", "8355.T", "7164.T", "8630.T", "8725.T", "8795.T", "8573.T", "8585.T", "8591.T",
-        "8601.T", "8628.T", "8697.T", "8473.T", "7181.T", "8381.T", "8382.T", "7327.T", "8341.T", "8377.T"
-    ],
-    "商社・卸売・小売": [
-        "8058.T", "8031.T", "8001.T", "8002.T", "8053.T", "2768.T", "8015.T", "7459.T", "8020.T", "3382.T", 
-        "8267.T", "9843.T", "7532.T", "3092.T", "3141.T", "3391.T", "8012.T", "8036.T", "8136.T", "8252.T",
-        "8282.T", "9983.T", "9989.T", "2651.T", "2782.T", "3086.T", "7458.T", "7649.T", "8233.T", "8279.T"
-    ],
-    "医薬品・化学・食品": [
-        "4502.T", "4568.T", "2914.T", "2502.T", "4519.T", "4503.T", "2802.T", "2503.T", "4005.T", "4183.T", 
-        "4063.T", "4208.T", "4004.T", "4507.T", "4523.T", "4528.T", "4578.T", "4901.T", "4911.T", "4452.T",
-        "4188.T", "3402.T", "3407.T", "2269.T", "2282.T", "2871.T", "2897.T", "2002.T", "2587.T", "4922.T"
-    ],
-    "鉄鋼・非鉄・素材・エネルギー": [
-        "5401.T", "5411.T", "5020.T", "1605.T", "5406.T", "5713.T", "5019.T", "5711.T", "5714.T", "5802.T", 
-        "5706.T", "5726.T", "5727.T", "5471.T", "5480.T", "5021.T", "5332.T", "5333.T", "5938.T", "5947.T",
-        "5108.T", "5110.T", "3861.T", "3863.T", "4631.T", "3401.T", "3405.T", "3110.T", "7951.T", "7912.T"
-    ],
-    "不動産・建設・インフラ": [
-        "8801.T", "8802.T", "1925.T", "1928.T", "9020.T", "9022.T", "9101.T", "9104.T", "9107.T", "9021.T",
-        "9501.T", "9502.T", "9503.T", "1801.T", "1802.T", "1812.T", "8830.T", "3289.T", "3231.T", "8953.T",
-        "8951.T", "1803.T", "1878.T", "1951.T", "1959.T", "9007.T", "9008.T", "9009.T", "9064.T", "9142.T"
-    ]
-}
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_jpx_master() -> pd.DataFrame:
+    try:
+        # JPXの公式サイトから全上場銘柄一覧(Excel)を直接取得
+        url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
+        df = pd.read_excel(url, engine='xlrd')
+        
+        # 必要なデータのみ抽出（ETFなどを除外するため、業種があるものに絞る）
+        df = df[df['33業種区分'] != '-'].copy()
+        
+        # yfinance用に証券コードの末尾に「.T」を付与
+        df['ticker'] = df['コード'].astype(str) + '.T'
+        
+        # 必要な列だけをリネームして抽出
+        df = df.rename(columns={'銘柄名': 'name', '33業種区分': 'sector'})
+        return df[['ticker', 'name', 'sector']]
+    except Exception as e:
+        # 取得失敗時の安全策（空のデータフレームを返す）
+        return pd.DataFrame()
 
 def get_company_name(ticker: str) -> str:
+    df_master = get_jpx_master()
+    if not df_master.empty:
+        match = df_master[df_master['ticker'] == ticker]
+        if not match.empty:
+            return match.iloc[0]['name']
+    
+    # クラウドでブロックされる可能性があるが、念のためのフォールバック
     try:
         info = yf.Ticker(ticker).info
-        return info.get('longName', info.get('shortName', ticker))
+        return info.get('longName') or info.get('shortName') or ticker
     except:
         return ticker
 
@@ -68,7 +54,7 @@ def call_openai(api_key: str, system_prompt: str, user_prompt: str) -> str:
     try:
         client = OpenAI(api_key=api_key)
         response = client.chat.completions.create(
-            model="gpt-4o-mini",  # 最速・最安の優秀なモデルに固定
+            model="gpt-4o-mini",  
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -79,13 +65,16 @@ def call_openai(api_key: str, system_prompt: str, user_prompt: str) -> str:
     except Exception as e:
         return f"⚠️ OpenAI API エラー: {str(e)}"
 
-def get_promising_sectors(api_key: str) -> list:
-    sectors_list_str = ", ".join(MEGA_SECTOR_MAP.keys())
+def get_promising_sectors(api_key: str, all_sectors: list) -> list:
+    sectors_str = ", ".join(all_sectors)
     system_prompt = "あなたはマクロ経済ストラテジストです。必ずJSONの配列形式のみで回答してください。"
     user_prompt = f"""
-現在の金利、為替、地政学リスクを分析し、以下の中から、現在最も資金が流入しやすく株価伸長率が高い業種を「2つ」厳選してください。
-【選択肢】{sectors_list_str}
-必ず以下のJSON配列形式のみを出力してください。例: ["セクター1", "セクター2"]
+現在の金利、為替、地政学リスクを分析し、日本の「東証33業種」の中から、
+現在最も資金が流入しやすく株価伸長率が高い業種を「2つ」厳選してください。
+【東証33業種の選択肢】
+{sectors_str}
+
+必ず以下のJSON配列形式のみを出力してください。例: ["電気機器", "銀行業"]
 """
     try:
         res = call_openai(api_key, system_prompt, user_prompt)
@@ -94,9 +83,11 @@ def get_promising_sectors(api_key: str) -> list:
         if s != -1 and e != -1:
             chosen = json.loads(res[s:e+1])
             if isinstance(chosen, list) and len(chosen) > 0:
-                return [c for c in chosen if c in MEGA_SECTOR_MAP]
+                # 存在する業種名のみを確実に返す
+                return [c for c in chosen if c in all_sectors]
     except: pass
-    return ["半導体・電気機器", "銀行・証券・金融"]
+    # エラー時のデフォルト（東証の正式な業種名）
+    return ["電気機器", "銀行業"]
 
 def _yahoo_chart(ticker, rng="3mo", interval="1d"):
     try:
@@ -108,11 +99,6 @@ def _yahoo_chart(ticker, rng="3mo", interval="1d"):
 
 def get_market_data(ticker="8306.T", rng="1y", interval="1d"):
     return _yahoo_chart(ticker, rng, interval)
-
-def get_latest_quote(ticker="8306.T"):
-    df = _yahoo_chart(ticker, rng="5d", interval="1m")
-    if df is not None and not df.empty: return float(df["Close"].iloc[-1])
-    return None
 
 def calculate_indicators(df: pd.DataFrame, benchmark_raw: pd.DataFrame = None) -> pd.DataFrame:
     if df is None or df.empty: return df
@@ -151,18 +137,34 @@ def judge_condition(price, sma5, sma25, sma75, rsi):
     elif rsi <= 30: mid_status, mid_color = "売られすぎ (反発警戒)", "orange"
     return {"short": {"status": short_status, "color": short_color}, "mid": {"status": mid_status, "color": mid_color}}
 
+# ==========================================
+# 🚀 4000銘柄対応・全自動メガスクリーニング
+# ==========================================
 def auto_scan_value_stocks(api_key: str, progress_callback=None):
-    target_sectors = get_promising_sectors(api_key)
-    scan_list = []
-    for sector in target_sectors:
-        scan_list.extend(MEGA_SECTOR_MAP[sector])
+    df_master = get_jpx_master()
+    
+    if df_master.empty:
+        return ["エラー"], []
+
+    # 東証33業種のリストをマスターから取得
+    all_sectors = df_master['sector'].dropna().unique().tolist()
+    
+    # AIに全業種の中から今熱い業種を選ばせる
+    target_sectors = get_promising_sectors(api_key, all_sectors)
+    
+    # 🌟 選ばれた業種に属する【すべての銘柄】を4000銘柄から抽出！
+    target_df = df_master[df_master['sector'].isin(target_sectors)]
+    scan_list = target_df.to_dict('records') # [{'ticker': '...', 'name': '...', 'sector': '...'}, ...]
         
     candidates = []
     total_stocks = len(scan_list)
     
-    for i, ticker in enumerate(scan_list):
+    for i, item in enumerate(scan_list):
+        ticker = item['ticker']
+        comp_name = item['name']
+        
         try:
-            if progress_callback: progress_callback(i + 1, total_stocks, ticker)
+            if progress_callback: progress_callback(i + 1, total_stocks, f"{ticker} {comp_name}")
                 
             time.sleep(0.02)
             df = _yahoo_chart(ticker, rng="3mo", interval="1d")
@@ -182,9 +184,9 @@ def auto_scan_value_stocks(api_key: str, progress_callback=None):
             sma25 = latest["SMA_25"]
             rsi = latest["RSI"]
             
+            # 【勝率80%追求・厳格な買い条件】
             if (sma5 > sma25 and 40 <= rsi <= 60) or (rsi <= 30):
                 score = ((price - sma25) / sma25 * 100) + (70 - rsi)
-                comp_name = get_company_name(ticker) 
                 candidates.append({"ticker": ticker, "name": comp_name, "price": price, "rsi": rsi, "score": score})
         except Exception:
             continue
@@ -193,7 +195,7 @@ def auto_scan_value_stocks(api_key: str, progress_callback=None):
     return target_sectors, candidates[:3]
 
 # ==========================================
-# 🧠 AI分析ロジック (OpenAI APIへ変更)
+# 🧠 AI分析ロジック (OpenAI API)
 # ==========================================
 def get_ai_range(api_key: str, ctx: dict):
     p = ctx.get('price', 0.0)
