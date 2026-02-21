@@ -10,7 +10,6 @@ TOKYO = pytz.timezone("Asia/Tokyo")
 
 # ==========================================
 # 東証プライム メガ・データベース (約400銘柄)
-# ※AIが選んだセクターに含まれる全銘柄を自動展開します
 # ==========================================
 MEGA_SECTOR_MAP = {
     "IT・通信・サービス": [
@@ -62,16 +61,14 @@ def get_company_name(ticker: str) -> str:
     except:
         return ticker
 
+# ==========================================
+# 🛑 超重要：API超節約モデル設定
+# ==========================================
 def get_active_model(api_key: str):
+    # 余計なモデルリスト取得API（無駄打ち）を完全に排除し、
+    # 高速かつ最新の gemini-2.5-flash に直接固定します。
     genai.configure(api_key=api_key)
-    try:
-        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        for target in ["models/gemini-1.5-pro-latest", "models/gemini-1.5-pro", "models/gemini-1.5-flash", "models/gemini-pro"]:
-            if target in available_models: return target
-        if available_models: return available_models[0]
-        return "models/gemini-1.5-flash" 
-    except:
-        return "models/gemini-1.5-flash"
+    return "gemini-2.5-flash"
 
 def get_promising_sectors(api_key: str) -> list:
     model_name = get_active_model(api_key)
@@ -147,10 +144,6 @@ def judge_condition(price, sma5, sma25, sma75, rsi):
     elif rsi <= 30: mid_status, mid_color = "売られすぎ (反発警戒)", "orange"
     return {"short": {"status": short_status, "color": short_color}, "mid": {"status": mid_status, "color": mid_color}}
 
-# ==========================================
-# 🚀 超高速・全自動メガスクリーニング
-# プログレスバー対応（フロントエンドに状況を返す）
-# ==========================================
 def auto_scan_value_stocks(api_key: str, progress_callback=None):
     target_sectors = get_promising_sectors(api_key)
     scan_list = []
@@ -162,11 +155,9 @@ def auto_scan_value_stocks(api_key: str, progress_callback=None):
     
     for i, ticker in enumerate(scan_list):
         try:
-            # 画面のプログレスバーを更新
-            if progress_callback:
-                progress_callback(i + 1, total_stocks, ticker)
+            if progress_callback: progress_callback(i + 1, total_stocks, ticker)
                 
-            time.sleep(0.02) # APIブロック回避
+            time.sleep(0.02)
             df = _yahoo_chart(ticker, rng="3mo", interval="1d")
             if df is None or df.empty or len(df) < 30: continue
                 
@@ -184,7 +175,6 @@ def auto_scan_value_stocks(api_key: str, progress_callback=None):
             sma25 = latest["SMA_25"]
             rsi = latest["RSI"]
             
-            # 【勝率80%追求・厳格な買い条件】
             if (sma5 > sma25 and 40 <= rsi <= 60) or (rsi <= 30):
                 score = ((price - sma25) / sma25 * 100) + (70 - rsi)
                 comp_name = get_company_name(ticker) 
@@ -196,7 +186,7 @@ def auto_scan_value_stocks(api_key: str, progress_callback=None):
     return target_sectors, candidates[:3]
 
 # ==========================================
-# 🧠 AI分析ロジック（データ引き渡し完全版）
+# 🧠 AI分析ロジック
 # ==========================================
 def get_ai_range(api_key: str, ctx: dict):
     model_name = get_active_model(api_key)
