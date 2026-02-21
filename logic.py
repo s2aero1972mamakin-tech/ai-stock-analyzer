@@ -5,6 +5,7 @@ import pytz
 import time
 from datetime import datetime
 import json
+import streamlit as st  # キャッシュ機能を使用するために追加
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
@@ -62,12 +63,37 @@ def get_company_name(ticker: str) -> str:
         return ticker
 
 # ==========================================
-# 🛑 超重要：1日1,500回制限の安定モデルに完全固定
+# 🛑 キャッシュ型・自動探索アルゴリズム
+# （通信は最初の1回のみ。404エラーとAPI制限を同時に防ぐ）
 # ==========================================
-def get_active_model(api_key: str):
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_active_model(api_key: str) -> str:
     genai.configure(api_key=api_key)
-    # 無料枠が極端に少ない2.5-flashを避け、大容量の1.5-flashを使用します。
-    return "gemini-1.5-flash"
+    try:
+        # API環境に実際に存在するモデルのリストを取得
+        models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        
+        # 優先順位: 最も安定して無料枠が多いものを上から探す
+        priority_targets = [
+            "models/gemini-1.5-flash-latest",
+            "models/gemini-1.5-flash",
+            "models/gemini-1.5-pro",
+            "models/gemini-pro",
+            "models/gemini-2.0-flash",
+            "models/gemini-2.5-flash"
+        ]
+        
+        for target in priority_targets:
+            if target in models:
+                return target
+                
+        # 優先リストになくても、使えるものが存在すれば最初のものを返す
+        if models:
+            return models[0]
+    except Exception:
+        pass
+        
+    return "models/gemini-1.5-flash"
 
 def get_promising_sectors(api_key: str) -> list:
     model_name = get_active_model(api_key)
