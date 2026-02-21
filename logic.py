@@ -62,13 +62,12 @@ def get_company_name(ticker: str) -> str:
         return ticker
 
 # ==========================================
-# 🛑 超重要：API超節約モデル設定
+# 🛑 超重要：1日1,500回制限の安定モデルに完全固定
 # ==========================================
 def get_active_model(api_key: str):
-    # 余計なモデルリスト取得API（無駄打ち）を完全に排除し、
-    # 高速かつ最新の gemini-2.5-flash に直接固定します。
     genai.configure(api_key=api_key)
-    return "gemini-2.5-flash"
+    # 無料枠が極端に少ない2.5-flashを避け、大容量の1.5-flashを使用します。
+    return "gemini-1.5-flash"
 
 def get_promising_sectors(api_key: str) -> list:
     model_name = get_active_model(api_key)
