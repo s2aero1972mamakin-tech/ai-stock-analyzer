@@ -10,9 +10,9 @@ import logic
 # ==========================================
 # ページ設定と初期化
 # ==========================================
-st.set_page_config(layout="wide", page_title="AI日本株 全自動ロボット", page_icon="🤖")
-st.title("🤖 AI連携型 日本株 全自動システムトレード (勝率80%基準)")
-st.markdown("※API超節約モード稼働中：AIが業種を選定し、最も勝率の高い第1位の銘柄のみを自動分析します。")
+st.set_page_config(layout="wide", page_title="AI日本株 全自動ロボット (ChatGPT版)", page_icon="🤖")
+st.title("🤖 ChatGPT連携型 日本株 全自動システムトレード")
+st.markdown("※バックエンドAIを OpenAI (gpt-4o-mini) に切り替えて稼働しています。")
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
@@ -23,9 +23,10 @@ if "ai_range" not in st.session_state: st.session_state.ai_range = None
 if "quote" not in st.session_state: st.session_state.quote = (None, None)
 if "last_ai_report" not in st.session_state: st.session_state.last_ai_report = "" 
 
-try: default_key = st.secrets.get("GEMINI_API_KEY", "")
+# OpenAI用のAPIキー取得に変更
+try: default_key = st.secrets.get("OPENAI_API_KEY", "")
 except: default_key = ""
-api_key = st.sidebar.text_input("Gemini API Key", value=default_key, type="password")
+api_key = st.sidebar.text_input("OpenAI API Key (sk-...)", value=default_key, type="password")
 
 # ==========================================
 # 🤖 メイン・エンジン：全自動ロボット起動
@@ -35,10 +36,10 @@ st.sidebar.subheader("🚀 ロボットの起動")
 
 if st.sidebar.button("🔥 マクロ分析＆全自動スキャンを実行", type="primary"):
     if not api_key:
-        st.sidebar.error("API Keyが必要です。")
+        st.sidebar.error("OpenAIのAPI Keyが必要です。")
         st.stop()
         
-    st.info("🤖 AIが現在の地政学・金利から有望セクターを選定しています...")
+    st.info("🤖 ChatGPTが現在の地政学・金利から有望セクターを選定しています...")
     
     progress_bar = st.progress(0)
     status_text = st.empty()
