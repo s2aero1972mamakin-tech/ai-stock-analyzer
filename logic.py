@@ -93,29 +93,78 @@ def judge_condition(price, sma5, sma25, sma75, rsi):
 
 def auto_scan_value_stocks(api_key: str, progress_callback=None):
     df_master = get_jpx_master()
-    if df_master.empty: return ["エラー"], []
-    all_sectors = df_master['sector'].dropna().unique().tolist()
+    if df_master.empty:
+        return ["エラー"], []
+
+    # （任意）東証1部は既に市場再編で「プライム」等になっているので、可能ならプライムに寄せる
+    # JPXマスターの列名は将来変わる可能性があるため、存在チェックしながらフィルタ
+    market_cols = [c for c in df_master.columns if "市場" in c or "商品" in c]
+    if market_cols:
+        col = market_cols[0]
+        # "プライム" を含むものに寄せる（Prime表記の可能性も考慮）
+        df_master = df_master[df_master[col].astype(str).str.contains("プライム|Prime", regex=True, na=False)].copy()
+
+    all_sectors = df_master["sector"].dropna().unique().tolist()
     target_sectors = get_promising_sectors(api_key, all_sectors)
-    target_df = df_master[df_master['sector'].isin(target_sectors)]
-    scan_list = target_df.to_dict('records')
+    target_df = df_master[df_master["sector"].isin(target_sectors)]
+    scan_list = target_df.to_dict("records")
+
     candidates = []
     for i, item in enumerate(scan_list):
-        ticker, comp_name = item['ticker'], item['name']
+        ticker, comp_name = item["ticker"], item["name"]
         try:
-            if progress_callback: progress_callback(i + 1, len(scan_list), f"{ticker} {comp_name}")
+            if progress_callback:
+                progress_callback(i + 1, len(scan_list), f"{ticker} {comp_name}")
+
             df = _yahoo_chart(ticker, rng="3mo", interval="1d")
-            if df is None or len(df) < 30: continue
-            df["SMA_5"], df["SMA_25"] = df["Close"].rolling(window=5).mean(), df["Close"].rolling(window=25).mean()
-            delta = df["Close"].diff()
-            up, down = delta.clip(lower=0), -1 * delta.clip(upper=0)
+            if df is None or len(df) < 30:
+                continue
+
+            # 指標計算
+            close = df["Close"]
+            sma5 = close.rolling(window=5).mean()
+            sma25 = close.rolling(window=25).mean()
+
+            delta = close.diff()
+            up = delta.clip(lower=0)
+            down = (-delta.clip(upper=0)).replace(0, pd.NA)
+
             rs = up.ewm(com=13, adjust=False).mean() / down.ewm(com=13, adjust=False).mean()
-            rsi = 100 - (100 / (1 + (rs)))
+            rsi_series = 100 - (100 / (1 + rs))
+
             latest = df.iloc[-1]
-            if (latest["SMA_5"] > latest["SMA_25"] and 40 <= rsi <= 60) or (rsi <= 30):
-                score = ((latest["Close"] - latest["SMA_25"]) / latest["SMA_25"] * 100) + (70 - rsi)
-                candidates.append({"ticker": ticker, "name": comp_name, "price": latest["Close"], "rsi": rsi, "score": score})
-        except: continue
+            latest_rsi = float(rsi_series.iloc[-1])
+            latest_sma5 = float(sma5.iloc[-1])
+            latest_sma25 = float(sma25.iloc[-1])
+            latest_close = float(latest["Close"])
+
+            # （任意）流動性フィルタ：出来高が薄い銘柄を避ける（※値は調整）
+            if "Volume" in df.columns:
+                vol20 = float(df["Volume"].tail(20).mean())
+                if vol20 < 100000:   # 目安：日次平均10万株未満は除外（必要なら変更）
+                    continue
+
+            # 条件（ここがバグっていた）
+            cond_trend = (latest_sma5 > latest_sma25) and (40 <= latest_rsi <= 60)
+            cond_oversold = (latest_rsi <= 30)
+
+            if cond_trend or cond_oversold:
+                sma_diff_pct = (latest_close - latest_sma25) / latest_sma25 * 100
+                score = float(sma_diff_pct) + (70.0 - latest_rsi)
+                candidates.append({
+                    "ticker": ticker,
+                    "name": comp_name,
+                    "price": latest_close,
+                    "rsi": latest_rsi,
+                    "score": score
+                })
+
+        except:
+            continue
+
     return target_sectors, sorted(candidates, key=lambda x: x["score"], reverse=True)[:3]
+
+# --- ここまで差し替え推奨 ---
 
 def get_ai_analysis(api_key: str, ctx: dict):
     return call_openai(api_key, "あなたは実戦派ファンドマネージャーです。", f"銘柄:{ctx['pair_label']}のデータを分析してください。株価:{ctx['price']}円, RSI:{ctx['rsi']:.1f}, ATR:{ctx['atr']:.2f}")
@@ -125,3 +174,4 @@ def get_ai_order_strategy(api_key: str, ctx: dict):
 
 def get_ai_portfolio(api_key: str, ctx: dict):
     return call_openai(api_key, "あなたはポートフォリオマネージャーです。", f"銘柄:{ctx['pair_label']}の週末跨ぎの是非を判断してください。")
+
