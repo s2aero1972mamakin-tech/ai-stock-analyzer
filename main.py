@@ -10,9 +10,9 @@ import logic
 # ==========================================
 # ページ設定と初期化
 # ==========================================
-st.set_page_config(layout="wide", page_title="AI日本株 全自動ロボット (ChatGPT版)", page_icon="🤖")
+st.set_page_config(layout="wide", page_title="AI日本株 全自動ロボット", page_icon="🤖")
 st.title("🤖 ChatGPT連携型 日本株 全自動システムトレード")
-st.markdown("※バックエンドAIを OpenAI (gpt-4o-mini) に切り替えて稼働しています。")
+st.markdown("※JPX(東京証券取引所)の全4000銘柄公式データを直結し、AIが完全スキャンを実行します。")
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
@@ -23,7 +23,6 @@ if "ai_range" not in st.session_state: st.session_state.ai_range = None
 if "quote" not in st.session_state: st.session_state.quote = (None, None)
 if "last_ai_report" not in st.session_state: st.session_state.last_ai_report = "" 
 
-# OpenAI用のAPIキー取得に変更
 try: default_key = st.secrets.get("OPENAI_API_KEY", "")
 except: default_key = ""
 api_key = st.sidebar.text_input("OpenAI API Key (sk-...)", value=default_key, type="password")
@@ -34,20 +33,20 @@ api_key = st.sidebar.text_input("OpenAI API Key (sk-...)", value=default_key, ty
 st.sidebar.markdown("---")
 st.sidebar.subheader("🚀 ロボットの起動")
 
-if st.sidebar.button("🔥 マクロ分析＆全自動スキャンを実行", type="primary"):
+if st.sidebar.button("🔥 全4000銘柄 マクロ分析＆スキャンを実行", type="primary"):
     if not api_key:
         st.sidebar.error("OpenAIのAPI Keyが必要です。")
         st.stop()
         
-    st.info("🤖 ChatGPTが現在の地政学・金利から有望セクターを選定しています...")
+    st.info("🤖 ChatGPTが東証33業種から今熱いセクターを選定し、対象全銘柄をスキャンしています...")
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    def update_progress(current, total, ticker):
+    def update_progress(current, total, info_str):
         percent = int((current / total) * 100)
         progress_bar.progress(percent)
-        status_text.text(f"🔍 スキャン実行中... {current} / {total} 銘柄完了 ({ticker})")
+        status_text.text(f"🔍 スキャン実行中... {current} / {total} 銘柄完了 ({info_str})")
 
     target_sectors, top_candidates = logic.auto_scan_value_stocks(api_key, progress_callback=update_progress)
     
@@ -112,7 +111,7 @@ if stop_loss_width > 0:
 # 🛑 メイン画面（待機状態コントロール）
 # ==========================================
 if not st.session_state.target_ticker:
-    st.info("👈 左側のメニューから「🔥 マクロ分析＆全自動スキャンを実行」ボタンを押して、ロボットを起動してください。")
+    st.info("👈 左側のメニューから「🔥 全4000銘柄 マクロ分析＆スキャンを実行」ボタンを押して、ロボットを起動してください。")
     st.stop()
 
 # ==========================================
