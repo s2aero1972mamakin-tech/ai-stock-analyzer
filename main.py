@@ -12,7 +12,7 @@ import logic
 # ==========================================
 st.set_page_config(layout="wide", page_title="AI日本株 全自動ロボット", page_icon="🤖")
 st.title("🤖 AI連携型 日本株 全自動システムトレード (勝率80%基準)")
-st.markdown("※四季報や手動リサーチ不要。AIがマクロ経済から有望業種を選定し、その業種の全優良株を自動スキャンします。")
+st.markdown("※API大容量無料枠（1.5-flash）稼働中：AIが業種を選定し、最も勝率の高い第1位の銘柄のみを自動分析します。")
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
@@ -40,7 +40,6 @@ if st.sidebar.button("🔥 マクロ分析＆全自動スキャンを実行", ty
         
     st.info("🤖 AIが現在の地政学・金利から有望セクターを選定しています...")
     
-    # プログレスバー（進行状況）の表示用コンポーネント
     progress_bar = st.progress(0)
     status_text = st.empty()
     
@@ -49,10 +48,8 @@ if st.sidebar.button("🔥 マクロ分析＆全自動スキャンを実行", ty
         progress_bar.progress(percent)
         status_text.text(f"🔍 スキャン実行中... {current} / {total} 銘柄完了 ({ticker})")
 
-    # ロジック呼び出し（コールバック関数を渡してプログレスバーを動かす）
     target_sectors, top_candidates = logic.auto_scan_value_stocks(api_key, progress_callback=update_progress)
     
-    # スキャン完了後にプログレスバーを消去
     progress_bar.empty()
     status_text.empty()
     
@@ -72,11 +69,11 @@ if st.sidebar.button("🔥 マクロ分析＆全自動スキャンを実行", ty
         st.sidebar.error("現在、勝率80%の基準をクリアした銘柄はありません。本日のエントリーは見送ります。")
 
 if st.session_state.auto_candidates and len(st.session_state.auto_candidates) > 1:
-    with st.sidebar.expander("📌 その他の発掘候補 (クリック)"):
+    with st.sidebar.expander("📌 その他の発掘候補 (手動でコード入力して確認)"):
         for cand in st.session_state.auto_candidates[1:]:
             c_name = cand.get("name", "")
             c_disp = f" {c_name}" if c_name else ""
-            st.write(f"- {cand['ticker']}{c_disp} (RSI: {cand['rsi']:.1f})")
+            st.write(f"- **{cand['ticker']}** {c_disp} (RSI: {cand['rsi']:.1f})")
 
 # ==========================================
 # ⚙️ 手動オーバーライド
