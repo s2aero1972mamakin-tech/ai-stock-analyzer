@@ -12,7 +12,7 @@ import logic
 # ==========================================
 st.set_page_config(layout="wide", page_title="AI日本株 全自動ロボット", page_icon="🤖")
 st.title("🤖 AI連携型 日本株 全自動システムトレード (勝率80%基準)")
-st.markdown("※API大容量無料枠（1.5-flash）稼働中：AIが業種を選定し、最も勝率の高い第1位の銘柄のみを自動分析します。")
+st.markdown("※API超節約モード稼働中：AIが業種を選定し、最も勝率の高い第1位の銘柄のみを自動分析します。")
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
