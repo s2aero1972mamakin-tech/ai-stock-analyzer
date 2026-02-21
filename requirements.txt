@@ -6,3 +6,4 @@ google-generativeai
 pytz
 openai
 requests
+xlrd
