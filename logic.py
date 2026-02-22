@@ -1,29 +1,26 @@
-# -*- coding: utf-8 -*-
-"""
-logic.py  (Buffett-Style Value + Timing, bug-fixed, backward-compatible)
-
-このファイルは main.py から呼ばれる「ロジック層」です。
-- 既存の関数シグネチャ（main.py依存）を維持
-- RSI比較のSeriesバグを修正（全銘柄スキップ問題の根本原因）
-- 「バフェット型（割安×質×安全性）」のスコアリングを追加
-- スキャン結果が0になり続けるのを避けるため、厳格ヒットが0でも「上位候補TOP3」を返す設計
-  ※候補dictに hit=True/False を付与（main.pyは無視しても動く）
-
-注意:
-- yfinanceの財務指標は銘柄により欠損が多いです（特に日本株）。
-  欠損は「除外」ではなく「中立スコア」扱いにして、候補が消えないようにしています。
-"""
+# logic.py
+# ============================================================
+# 日本株スイング（〜1ヶ月）向け：スキャン＋バックテスト＋注文書生成
+# 目的：勝率だけでなく「期待値（Expectancy）= 勝率×平均利益 - 負け率×平均損失」を最大化する設計
+#
+# - スキャンはJPXマスター（全銘柄）をユニバースにし、流動性/トレンド/押し目 or ブレイクで候補抽出
+# - 上位候補に対して簡易バックテスト（2年推奨）を走らせ、PF・平均R・最大DDを算出して再ランキング
+# - 注文書はRベース（SL/TP1/TP2/時間切れ/建値移動）で数値化
+#
+# 注：データは yfinance 取得（無料APIのため遅延/欠損が起きる場合があります）
+# ============================================================
 
 from __future__ import annotations
 
-import json
 import math
-import os
-import time
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import re
+import json
+from dataclasses import dataclass
+from datetime import datetime
+from io import BytesIO
+from typing import Callable, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import pytz
 import streamlit as st
@@ -31,256 +28,196 @@ import yfinance as yf
 from openai import OpenAI
 
 TOKYO = pytz.timezone("Asia/Tokyo")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# -------------- ユーティリティ --------------
 
-def _now_tokyo() -> datetime:
-    return datetime.now(TOKYO)
-
-def _safe_float(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        if isinstance(x, (int, float)):
-            if math.isnan(x):
-                return None
-            return float(x)
-        xf = float(x)
-        if math.isnan(xf):
-            return None
-        return xf
-    except Exception:
-        return None
-
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-def _chunked(lst: List[str], n: int) -> List[List[str]]:
-    return [lst[i:i+n] for i in range(0, len(lst), n)]
-
-# -------------- JPXマスター --------------
-
+# -------------------------
+# 0) JPXマスター
+# -------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_jpx_master() -> pd.DataFrame:
     """
-    JPX公式XLSから「ticker/name/sector/market」を作る。
-    失敗したら空DataFrame。
+    JPXが公開している「東証上場銘柄一覧（33業種）」に依存。
+    取得失敗時は空DataFrameを返す（UI側でエラーハンドリング）。
     """
     url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
     try:
+        # pandasが適切なengineを選ぶこともあるので、まずは素直に読む
+        df = pd.read_excel(url)
+    except Exception:
+        # 環境差でengine問題が出ることがあるので、BytesIO経由で再試行
         try:
-            df = pd.read_excel(url, engine="xlrd")
+            import requests  # type: ignore
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            df = pd.read_excel(BytesIO(r.content), engine="xlrd")
         except Exception:
-            df = pd.read_excel(url)
-
-        if "33業種区分" not in df.columns or "コード" not in df.columns or "銘柄名" not in df.columns:
             return pd.DataFrame()
 
-        df = df[df["33業種区分"] != "-"].copy()
-
-        market_col_candidates = ["市場・商品区分", "市場区分", "市場"]
-        market_col = next((c for c in market_col_candidates if c in df.columns), None)
-        if market_col is None:
-            df["market"] = ""
-        else:
-            df["market"] = df[market_col].astype(str)
-
-        df["ticker"] = df["コード"].astype(str) + ".T"
-        df = df.rename(columns={"銘柄名": "name", "33業種区分": "sector"})
-
-        out = df[["ticker", "name", "sector", "market"]].copy()
-        out["sector"] = out["sector"].astype(str)
-        out["name"] = out["name"].astype(str)
-        out["ticker"] = out["ticker"].astype(str)
-        return out
-
-    except Exception:
+    # 想定列がない場合は空を返す
+    needed = {"コード", "銘柄名", "33業種区分"}
+    if not needed.issubset(set(df.columns)):
         return pd.DataFrame()
 
+    df = df.copy()
+    df = df[df["33業種区分"].notna()]
+    df = df[df["33業種区分"] != "-"]
+    df["ticker"] = df["コード"].astype(str).str.zfill(4) + ".T"
+    df = df.rename(columns={"銘柄名": "name", "33業種区分": "sector"})
+    return df[["ticker", "name", "sector"]].drop_duplicates().reset_index(drop=True)
+
+
 def get_company_name(ticker: str) -> str:
-    df_master = get_jpx_master()
-    if not df_master.empty:
-        match = df_master[df_master["ticker"] == ticker]
-        if not match.empty:
-            return str(match.iloc[0]["name"])
-    return ticker
+    m = get_jpx_master()
+    if m.empty:
+        return ticker
+    row = m[m["ticker"] == ticker]
+    if row.empty:
+        return ticker
+    return str(row.iloc[0]["name"])
 
-# -------------- OpenAI --------------
 
-def call_openai(api_key: str, system_prompt: str, user_prompt: str, temperature: float = 0.3) -> str:
+# -------------------------
+# 1) OpenAI 呼び出し（任意）
+# -------------------------
+def _call_openai(api_key: str, system_prompt: str, user_prompt: str) -> str:
     try:
         client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
-            model=OPENAI_MODEL,
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=float(temperature),
+            temperature=0.4,
         )
-        return response.choices[0].message.content
+        return res.choices[0].message.content or ""
     except Exception as e:
-        return f"⚠️ OpenAI API エラー: {str(e)}"
+        return f"⚠️ OpenAI API エラー: {e}"
 
-def get_promising_sectors(api_key: str, all_sectors: List[str], n: int = 6) -> List[str]:
-    """
-    マクロ観点で有望業種を選ぶ（ブレ抑制: temperature=0）。
-    OpenAIが不調でも、必ずフォールバックで動作。
-    """
-    fallback = ["電気機器", "情報・通信業", "機械", "医薬品", "銀行業", "小売業"]
-    fallback = [s for s in fallback if s in all_sectors] or all_sectors[: min(len(all_sectors), n)]
 
-    if not api_key:
-        return fallback[:n]
-
-    sectors_str = ", ".join(all_sectors)
-    system_prompt = (
-        "あなたはマクロ経済ストラテジストです。"
-        "必ず JSON 配列のみで回答してください。余計な文章は禁止。"
-    )
-    user_prompt = (
-        f"金利・為替・景気循環の観点で、現在の日本株で相対的に有望と思われる業種を{n}個選んでください。"
-        f"候補（33業種区分）: {sectors_str}\n"
-        f"出力例: [\"電気機器\", \"銀行業\", ...]"
+def get_ai_analysis(api_key: str, ctx: dict) -> str:
+    return _call_openai(
+        api_key,
+        "あなたは実戦派の株式ストラテジストです。曖昧な表現を避け、箇条書き中心で要点とリスクを短く提示してください。",
+        f"""対象:{ctx.get('pair_label')}
+現在値:{ctx.get('price'):.2f}円
+RSI:{ctx.get('rsi'):.1f}
+ATR:{ctx.get('atr'):.2f}
+SMA5:{ctx.get('sma5'):.2f}
+SMA25:{ctx.get('sma25'):.2f}
+バックテスト: PF={ctx.get('pf')}, AvgR={ctx.get('avg_r')}, WinRate={ctx.get('win_rate')}
+この銘柄を「1週間〜1ヶ月のスイング」で取引する前提で、優位性が出る局面・避けたい局面・注意点を提案してください。
+""",
     )
 
-    try:
-        res = call_openai(api_key, system_prompt, user_prompt, temperature=0.0)
-        s, e = res.find("["), res.rfind("]")
-        if s != -1 and e != -1:
-            chosen = json.loads(res[s : e + 1])
-            chosen = [c for c in chosen if isinstance(c, str)]
-            chosen = [c for c in chosen if c in all_sectors]
-            if chosen:
-                for f in fallback:
-                    if len(chosen) >= n:
-                        break
-                    if f not in chosen:
-                        chosen.append(f)
-                return chosen[:n]
-    except Exception:
-        pass
 
-    return fallback[:n]
+def get_ai_order_strategy(api_key: str, ctx: dict) -> str:
+    return _call_openai(
+        api_key,
+        "あなたは冷徹な執行責任者です。必ず数値を含め、注文実行の手順（何をいつ置くか）を明確に書いてください。",
+        f"""対象:{ctx.get('pair_label')}
+現在値:{ctx.get('price'):.2f}円
+想定エントリー:{ctx.get('entry_price'):.2f}円
+損切:{ctx.get('stop_price'):.2f}円
+利確1:{ctx.get('tp1_price'):.2f}円
+利確2:{ctx.get('tp2_price'):.2f}円
+時間切れ:{ctx.get('time_stop_days')}営業日
+推奨株数:{ctx.get('shares')}
+PF={ctx.get('pf')}, AvgR={ctx.get('avg_r')}, WinRate={ctx.get('win_rate')}
+この条件で、単元株（100株単位）を前提に、OCO/逆指値が使える一般的な国内株注文として命令書を作成してください。
+""",
+    )
 
-# -------------- Market Data / Indicators --------------
 
-def _normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    yfinanceの返り値は環境で列形式が違うことがあるので正規化。
-    """
+def get_ai_portfolio(api_key: str, ctx: dict) -> str:
+    return _call_openai(
+        api_key,
+        "あなたはポートフォリオマネージャーです。短期スイングにおける『保有継続/撤退/追加』判断をロジック優先で提案してください。",
+        f"""対象:{ctx.get('pair_label')}
+PF={ctx.get('pf')}, AvgR={ctx.get('avg_r')}, WinRate={ctx.get('win_rate')}, MaxDD={ctx.get('max_dd')}
+現状の含み益/含み損が無い前提で、週末跨ぎやイベント前後での方針（持つ/持たない）を提案してください。
+""",
+    )
+
+
+# -------------------------
+# 2) 価格データ取得
+# -------------------------
+def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
-        return df
+        return pd.DataFrame()
     df = df.copy()
+    # multiindex columns -> flatten
     if isinstance(df.columns, pd.MultiIndex):
-        # 念のため
-        df.columns = df.columns.droplevel(-1)
+        # yfinance multi-index: (Field, Ticker)
+        # we'll handle per-ticker extraction elsewhere
+        return df
+    # timezone fix
+    if df.index.tz is not None:
+        df.index = df.index.tz_convert(None)
     return df
 
-def _yahoo_chart(ticker: str, rng: str = "1y", interval: str = "1d") -> Optional[pd.DataFrame]:
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_market_data(ticker: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
     try:
-        df = yf.download(ticker, period=rng, interval=interval, progress=False, auto_adjust=False, threads=True)
-        if df is None or df.empty:
-            return None
-        return _normalize_ohlcv_columns(df)
+        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False, threads=True)
+        df = _normalize_yf_df(df)
+        if isinstance(df.columns, pd.MultiIndex):
+            # sometimes single ticker still returns multi-index
+            df.columns = df.columns.droplevel(1)
+        return df.dropna()
     except Exception:
-        return None
+        return pd.DataFrame()
 
-def _bulk_yahoo_chart(tickers: List[str], rng: str = "1y", interval: str = "1d") -> Dict[str, pd.DataFrame]:
-    """
-    まとめてダウンロードしてリクエスト数を削減。
-    失敗しやすいので、失敗時は空dictを返し、呼び出し側で個別取得にフォールバック。
-    """
-    out: Dict[str, pd.DataFrame] = {}
-    if not tickers:
-        return out
 
-    try:
-        df = yf.download(
-            tickers,
-            period=rng,
-            interval=interval,
-            group_by="ticker",
-            progress=False,
-            auto_adjust=False,
-            threads=True,
-        )
-        if df is None or df.empty:
-            return out
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_benchmark_data(symbol: str = "^N225", period: str = "5y") -> pd.DataFrame:
+    return get_market_data(symbol, period=period, interval="1d")
 
-        # 単一tickerだと通常形になる
-        if not isinstance(df.columns, pd.MultiIndex):
-            out[tickers[0]] = _normalize_ohlcv_columns(df)
-            return out
 
-        # MultiIndex: (ticker, field) or (field, ticker)
-        lv0 = set(df.columns.get_level_values(0).astype(str))
-        lv1 = set(df.columns.get_level_values(1).astype(str))
-
-        for t in tickers:
-            try:
-                if t in lv0:
-                    sub = df[t].copy()
-                elif t in lv1:
-                    sub = df.xs(t, level=1, axis=1).copy()
-                else:
-                    continue
-                # 欠損列があると後続が死ぬので必須列チェック
-                need = {"Open", "High", "Low", "Close", "Volume"}
-                if not need.issubset(set(map(str, sub.columns))):
-                    continue
-                out[t] = sub
-            except Exception:
-                continue
-
-        return out
-
-    except Exception:
-        return {}
-
-def get_market_data(ticker: str = "8306.T", rng: str = "1y", interval: str = "1d") -> Optional[pd.DataFrame]:
-    return _yahoo_chart(ticker, rng, interval)
-
-def calculate_indicators(df: pd.DataFrame, benchmark_raw: pd.DataFrame = None) -> pd.DataFrame:
+# -------------------------
+# 3) 指標計算
+# -------------------------
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
-        return df
-    df = df.copy()
+        return pd.DataFrame()
 
-    df["SMA_5"] = df["Close"].rolling(window=5).mean()
-    df["SMA_25"] = df["Close"].rolling(window=25).mean()
-    df["SMA_75"] = df["Close"].rolling(window=75).mean()
-    df["SMA_200"] = df["Close"].rolling(window=200).mean()
+    d = df.copy()
 
-    delta = df["Close"].diff()
+    for w in (5, 10, 25, 75, 200):
+        d[f"SMA_{w}"] = d["Close"].rolling(window=w).mean()
+
+    # RSI(14)
+    delta = d["Close"].diff()
     up = delta.clip(lower=0)
-    down = (-delta.clip(upper=0)).abs()
+    down = -delta.clip(upper=0)
+    rs = up.ewm(com=13, adjust=False).mean() / down.ewm(com=13, adjust=False).mean()
+    d["RSI"] = 100 - (100 / (1 + rs))
 
-    roll_up = up.ewm(com=13, adjust=False).mean()
-    roll_down = down.ewm(com=13, adjust=False).mean() + 1e-9
-    rs = roll_up / roll_down
-    df["RSI"] = 100 - (100 / (1 + rs))
-
+    # ATR(14)
     tr = pd.concat(
         [
-            (df["High"] - df["Low"]),
-            (df["High"] - df["Close"].shift()).abs(),
-            (df["Low"] - df["Close"].shift()).abs(),
+            (d["High"] - d["Low"]),
+            (d["High"] - d["Close"].shift()).abs(),
+            (d["Low"] - d["Close"].shift()).abs(),
         ],
         axis=1,
     ).max(axis=1)
-    df["ATR"] = tr.rolling(window=14).mean()
+    d["ATR"] = tr.rolling(window=14).mean()
+    d["ATR_PCT"] = (d["ATR"] / d["Close"]) * 100
 
-    df["SMA_DIFF"] = (df["Close"] - df["SMA_25"]) / df["SMA_25"] * 100
+    d["SMA_DIFF"] = (d["Close"] - d["SMA_25"]) / d["SMA_25"] * 100
+    d["VOL_AVG_20"] = d["Volume"].rolling(window=20).mean()
+    d["VOL_RATIO"] = d["Volume"] / d["VOL_AVG_20"]
 
-    if benchmark_raw is not None and isinstance(benchmark_raw, pd.DataFrame) and not benchmark_raw.empty:
-        df["BENCHMARK"] = benchmark_raw["Close"].reindex(df.index, method="ffill")
-    else:
-        df["BENCHMARK"] = 0.0
+    d["HIGH_20"] = d["High"].rolling(20).max()
+    d["LOW_20"] = d["Low"].rolling(20).min()
 
-    return df.dropna()
+    return d.dropna().copy()
 
-def judge_condition(price, sma5, sma25, sma75, rsi):
+
+def judge_condition(price: float, sma5: float, sma25: float, sma75: float, rsi: float) -> dict:
     short = {"status": "上昇継続 (SMA5上)", "color": "blue"} if price > sma5 else {"status": "勢い鈍化 (SMA5下)", "color": "red"}
     mid = {"status": "静観", "color": "gray"}
     if sma25 > sma75 and rsi < 70:
@@ -289,398 +226,891 @@ def judge_condition(price, sma5, sma25, sma75, rsi):
         mid = {"status": "売られすぎ (反発警戒)", "color": "orange"}
     return {"short": short, "mid": mid}
 
-# -------------- Fundamentals (Buffett-ish) --------------
 
-_CACHE_DIR = Path(__file__).resolve().parent / ".cache"
-_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-_FUND_CACHE_PATH = _CACHE_DIR / "fundamentals_cache.json"
+# -------------------------
+# 4) 戦略パラメータ
+# -------------------------
+@dataclass(frozen=True)
+class SwingParams:
+    # entry filters
+    rsi_low: float = 40.0
+    rsi_high: float = 65.0
+    pullback_low: float = -6.0     # SMA25乖離の下限（より下げ過ぎは避ける）
+    pullback_high: float = -1.0    # SMA25乖離の上限
+    atr_pct_min: float = 1.0
+    atr_pct_max: float = 6.0
+    vol_avg20_min: float = 100_000.0
 
-def _load_fund_cache() -> Dict[str, Any]:
+    # trend filters
+    require_sma25_over_sma75: bool = True
+
+    # entry trigger type: "pullback" or "breakout"
+    entry_mode: str = "pullback"
+
+    # exit rules
+    atr_mult_stop: float = 1.5
+    tp1_r: float = 1.0
+    tp2_r: float = 3.0
+    time_stop_days: int = 10
+
+    # breakout config
+    breakout_lookback: int = 20
+    breakout_vol_ratio: float = 1.5
+
+    # risk sizing
+    risk_pct: float = 2.0  # for position sizing (UI can override)
+
+
+# -------------------------
+# 5) 簡易バックテスト（Rベース）
+# -------------------------
+@dataclass
+class BacktestResult:
+    n_trades: int
+    win_rate: float
+    profit_factor: float
+    expectancy_r: float
+    avg_win_r: float
+    avg_loss_r: float
+    max_drawdown: float
+    equity_curve_r: pd.Series
+    trades: pd.DataFrame
+
+
+def _max_drawdown(equity: pd.Series) -> float:
+    if equity is None or equity.empty:
+        return 0.0
+    peak = equity.cummax()
+    dd = (equity - peak) / peak.replace(0, np.nan)
+    return float(dd.min()) if not dd.empty else 0.0
+
+
+def backtest_swing(df_ind: pd.DataFrame, params: SwingParams) -> BacktestResult:
+    """
+    日足での簡易バックテスト。
+    - エントリーは「条件成立日の翌日Open」で約定したと仮定（実務に近い）
+    - SL=ATR*mult、TP1=+1Rで半分利確→残りは建値へ、TP2=+3R or トレーリング（SMA10割れ）
+    - time_stop_days でTP1未達なら撤退
+    """
+    if df_ind is None or df_ind.empty:
+        return BacktestResult(0, 0, 0, 0, 0, 0, 0, pd.Series(dtype=float), pd.DataFrame())
+
+    d = df_ind.copy()
+
+    # signals
+    trend_ok = d["Close"] > d["SMA_25"]
+    if params.require_sma25_over_sma75:
+        trend_ok &= d["SMA_25"] > d["SMA_75"]
+
+    rsi_ok = (d["RSI"] >= params.rsi_low) & (d["RSI"] <= params.rsi_high)
+    atr_ok = (d["ATR_PCT"] >= params.atr_pct_min) & (d["ATR_PCT"] <= params.atr_pct_max)
+    vol_ok = d["VOL_AVG_20"] >= params.vol_avg20_min
+
+    if params.entry_mode == "pullback":
+        pull_ok = (d["SMA_DIFF"] >= params.pullback_low) & (d["SMA_DIFF"] <= params.pullback_high)
+        # 反発確認：終値が前日高値を上抜け
+        trigger = d["Close"] > d["High"].shift(1)
+        signal = trend_ok & rsi_ok & atr_ok & vol_ok & pull_ok & trigger
+    else:
+        lb = params.breakout_lookback
+        # ブレイク：終値が過去lb日高値更新（当日を含めない）
+        prev_high = d["High"].rolling(lb).max().shift(1)
+        breakout = d["Close"] > prev_high
+        vr_ok = d["VOL_RATIO"] >= params.breakout_vol_ratio
+        signal = trend_ok & rsi_ok & atr_ok & vol_ok & breakout & vr_ok
+
+    # entry on next day open
+    entries = signal.shift(1).fillna(False)
+
+    trades = []
+    equity = [1.0]  # start at 1.0R equity baseline
+    equity_dates = [d.index[0]]
+
+    in_pos = False
+    entry_price = stop_price = tp1 = tp2 = np.nan
+    entry_idx = None
+    hit_tp1 = False
+    remaining = 1.0  # position fraction
+
+    for i in range(1, len(d)):
+        date = d.index[i]
+        row = d.iloc[i]
+
+        # update equity curve daily (mark-to-market not needed; we keep step on trade exits)
+        # We'll append last equity with current date for chart continuity.
+        equity.append(equity[-1])
+        equity_dates.append(date)
+
+        if not in_pos:
+            if bool(entries.iloc[i]):
+                # enter
+                ep = float(row["Open"])
+                atr = float(row["ATR"])
+                if not np.isfinite(ep) or not np.isfinite(atr) or atr <= 0:
+                    continue
+                r = atr * params.atr_mult_stop
+                sp = ep - r
+                tp1_ = ep + params.tp1_r * r
+                tp2_ = ep + params.tp2_r * r
+
+                in_pos = True
+                entry_price = ep
+                stop_price = sp
+                tp1 = tp1_
+                tp2 = tp2_
+                entry_idx = i
+                hit_tp1 = False
+                remaining = 1.0
+            continue
+
+        # if in position: evaluate exit within day (low/high)
+        low = float(row["Low"])
+        high = float(row["High"])
+        close = float(row["Close"])
+
+        r_unit = (entry_price - stop_price)
+        if r_unit <= 0:
+            # abnormal, exit
+            in_pos = False
+            continue
+
+        # time stop check (TP1未達)
+        days_in = i - (entry_idx or i)
+        time_stop = (days_in >= params.time_stop_days) and (not hit_tp1)
+
+        # 1) stop hit
+        stop_hit = low <= stop_price
+
+        # 2) TP1/TP2 hit
+        tp1_hit = (not hit_tp1) and (high >= tp1)
+        tp2_hit = high >= tp2
+
+        # 3) trailing for remaining after TP1 (close < SMA10)
+        trail_hit = hit_tp1 and (close < float(row["SMA_10"]))
+
+        # Execution priority within a day is ambiguous.
+        # Conservative assumption:
+        # - If stop and TP are both touched same day, assume stop first (worse).
+        if stop_hit:
+            # full size stop if TP1 not hit yet; else remaining stopped at breakeven? (stop moved)
+            # We move stop to breakeven after TP1, so stop_price should be entry_price in that state.
+            exit_price = stop_price
+            pnl_r = (exit_price - entry_price) / r_unit  # negative or 0
+            # realized pnl in R for remaining fraction
+            total_r = pnl_r * remaining
+            # if TP1 already realized, that part is stored separately in trade record
+            # We'll finalize trade now.
+            tr = {
+                "entry_date": d.index[entry_idx] if entry_idx is not None else date,
+                "exit_date": date,
+                "entry": entry_price,
+                "exit": exit_price,
+                "mode": params.entry_mode,
+                "tp1_hit": hit_tp1,
+                "tp2_hit": False,
+                "days": days_in,
+                "r": total_r + (0.5 * params.tp1_r if hit_tp1 else 0.0),
+            }
+            trades.append(tr)
+            equity[-1] = equity[-2] + tr["r"]
+            in_pos = False
+            continue
+
+        if tp1_hit:
+            # take half profit at TP1
+            hit_tp1 = True
+            remaining = 0.5
+            # move stop to breakeven
+            stop_price = entry_price
+
+        if tp2_hit:
+            # exit remaining at TP2
+            exit_price = tp2
+            pnl_r = (exit_price - entry_price) / r_unit
+            total_r = pnl_r * remaining
+            tr = {
+                "entry_date": d.index[entry_idx] if entry_idx is not None else date,
+                "exit_date": date,
+                "entry": entry_price,
+                "exit": exit_price,
+                "mode": params.entry_mode,
+                "tp1_hit": hit_tp1,
+                "tp2_hit": True,
+                "days": days_in,
+                "r": total_r + (0.5 * params.tp1_r if hit_tp1 else 0.0),
+            }
+            trades.append(tr)
+            equity[-1] = equity[-2] + tr["r"]
+            in_pos = False
+            continue
+
+        if trail_hit:
+            # exit remaining at close
+            exit_price = close
+            pnl_r = (exit_price - entry_price) / r_unit
+            total_r = pnl_r * remaining
+            tr = {
+                "entry_date": d.index[entry_idx] if entry_idx is not None else date,
+                "exit_date": date,
+                "entry": entry_price,
+                "exit": exit_price,
+                "mode": params.entry_mode,
+                "tp1_hit": hit_tp1,
+                "tp2_hit": False,
+                "days": days_in,
+                "r": total_r + (0.5 * params.tp1_r if hit_tp1 else 0.0),
+            }
+            trades.append(tr)
+            equity[-1] = equity[-2] + tr["r"]
+            in_pos = False
+            continue
+
+        if time_stop:
+            # exit full at close
+            exit_price = close
+            pnl_r = (exit_price - entry_price) / r_unit
+            tr = {
+                "entry_date": d.index[entry_idx] if entry_idx is not None else date,
+                "exit_date": date,
+                "entry": entry_price,
+                "exit": exit_price,
+                "mode": params.entry_mode,
+                "tp1_hit": False,
+                "tp2_hit": False,
+                "days": days_in,
+                "r": pnl_r,  # full size (TP1未達)
+            }
+            trades.append(tr)
+            equity[-1] = equity[-2] + tr["r"]
+            in_pos = False
+            continue
+
+    trades_df = pd.DataFrame(trades)
+    equity_curve = pd.Series(equity, index=pd.to_datetime(equity_dates)).astype(float)
+    equity_curve = equity_curve[~equity_curve.index.duplicated(keep="last")]
+
+    if trades_df.empty:
+        return BacktestResult(0, 0, 0, 0, 0, 0, _max_drawdown(equity_curve), equity_curve, trades_df)
+
+    wins = trades_df[trades_df["r"] > 0]
+    losses = trades_df[trades_df["r"] < 0]
+    win_rate = float(len(wins) / len(trades_df)) if len(trades_df) else 0.0
+    gross_profit = float(wins["r"].sum()) if not wins.empty else 0.0
+    gross_loss = float(-losses["r"].sum()) if not losses.empty else 0.0
+    profit_factor = float(gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+    expectancy = float(trades_df["r"].mean())
+    avg_win = float(wins["r"].mean()) if not wins.empty else 0.0
+    avg_loss = float(losses["r"].mean()) if not losses.empty else 0.0  # negative
+    max_dd = _max_drawdown(equity_curve)
+
+    return BacktestResult(
+        n_trades=int(len(trades_df)),
+        win_rate=win_rate,
+        profit_factor=profit_factor,
+        expectancy_r=expectancy,
+        avg_win_r=avg_win,
+        avg_loss_r=avg_loss,
+        max_drawdown=max_dd,
+        equity_curve_r=equity_curve,
+        trades=trades_df,
+    )
+
+
+# -------------------------
+# 6) パラメータ簡易検証（単一銘柄）
+# -------------------------
+def grid_search_params(df_ind: pd.DataFrame, base: SwingParams) -> pd.DataFrame:
+    """
+    1銘柄に対して、軽量なグリッドでパラメータ感度を見る。
+    PFとExpectancyを見て、"勝率＋利確"が両立するレンジを見つける用途。
+    """
+    if df_ind is None or df_ind.empty:
+        return pd.DataFrame()
+
+    rsi_lows = [35, 40, 45]
+    rsi_highs = [60, 65, 70]
+    pb_lows = [-8, -6, -4]
+    pb_highs = [-3, -2, -1]
+    modes = ["pullback", "breakout"]
+
+    rows = []
+    for mode in modes:
+        for rl in rsi_lows:
+            for rh in rsi_highs:
+                if rl >= rh:
+                    continue
+                for pl in pb_lows:
+                    for ph in pb_highs:
+                        if pl >= ph:
+                            continue
+                        params = SwingParams(
+                            rsi_low=float(rl),
+                            rsi_high=float(rh),
+                            pullback_low=float(pl),
+                            pullback_high=float(ph),
+                            atr_pct_min=base.atr_pct_min,
+                            atr_pct_max=base.atr_pct_max,
+                            vol_avg20_min=base.vol_avg20_min,
+                            require_sma25_over_sma75=base.require_sma25_over_sma75,
+                            entry_mode=mode,
+                            atr_mult_stop=base.atr_mult_stop,
+                            tp1_r=base.tp1_r,
+                            tp2_r=base.tp2_r,
+                            time_stop_days=base.time_stop_days,
+                            breakout_lookback=base.breakout_lookback,
+                            breakout_vol_ratio=base.breakout_vol_ratio,
+                            risk_pct=base.risk_pct,
+                        )
+                        bt = backtest_swing(df_ind, params)
+                        if bt.n_trades < 8:  # サンプルが少なすぎる組は除外
+                            continue
+                        rows.append(
+                            {
+                                "mode": mode,
+                                "rsi": f"{rl}-{rh}",
+                                "pullback": f"{pl}〜{ph}",
+                                "trades": bt.n_trades,
+                                "win_rate": bt.win_rate,
+                                "pf": bt.profit_factor,
+                                "avg_r": bt.expectancy_r,
+                                "max_dd": bt.max_drawdown,
+                            }
+                        )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    # 期待値優先 + PFで二次選別
+    out = out.sort_values(["avg_r", "pf", "win_rate"], ascending=[False, False, False]).reset_index(drop=True)
+    return out
+
+
+# -------------------------
+# 7) スキャン（全銘柄→候補→上位バックテスト→TOP3）
+# -------------------------
+def _chunk(lst: List[str], n: int) -> List[List[str]]:
+    return [lst[i : i + n] for i in range(0, len(lst), n)]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _download_chunk_ohlcv(tickers: Tuple[str, ...], period: str = "6mo") -> pd.DataFrame:
+    # yfinance multi ticker download
     try:
-        if _FUND_CACHE_PATH.exists():
-            return json.loads(_FUND_CACHE_PATH.read_text(encoding="utf-8"))
+        df = yf.download(
+            tickers=list(tickers),
+            period=period,
+            interval="1d",
+            progress=False,
+            group_by="ticker",
+            auto_adjust=False,
+            threads=True,
+        )
+        return _normalize_yf_df(df)
     except Exception:
-        pass
-    return {}
+        return pd.DataFrame()
 
-def _save_fund_cache(cache: Dict[str, Any]) -> None:
-    try:
-        _FUND_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
 
-@st.cache_data(ttl=3600 * 6, show_spinner=False)
-def _fetch_fundamentals_yf(ticker: str) -> Dict[str, Any]:
+def _extract_one(df_multi: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    if df_multi is None or df_multi.empty:
+        return pd.DataFrame()
+    if isinstance(df_multi.columns, pd.MultiIndex):
+        # columns: (Field, Ticker) or (Ticker, Field) depending on yfinance; handle both
+        lvl0 = df_multi.columns.get_level_values(0)
+        lvl1 = df_multi.columns.get_level_values(1)
+        if ticker in set(lvl0):
+            sub = df_multi[ticker].copy()
+            sub.columns.name = None
+            return sub.dropna()
+        if ticker in set(lvl1):
+            sub = df_multi.xs(ticker, axis=1, level=1).copy()
+            sub.columns.name = None
+            return sub.dropna()
+    # single ticker
+    return df_multi.copy().dropna()
+
+
+def _regime_is_ok() -> bool:
+    bench = calculate_indicators(get_benchmark_data("^N225", period="5y"))
+    if bench.empty:
+        return True  # ベンチが取れないならスキャンは継続（保守的に止めない）
+    last = bench.iloc[-1]
+    return bool(last["Close"] > last["SMA_200"])
+
+
+
+# -------------------------
+# 6.5) セクター事前絞り込み（高速化 & 勝ちやすい地合い寄せ）
+# -------------------------
+def _parse_sector_list(text: str, allowed: List[str]) -> List[str]:
     """
-    yfinanceから財務指標を取得（欠損多い前提）。
-    失敗しても例外にせず空dictを返す。
+    AIの出力テキストからセクター名を抽出（許可リストにあるものだけ返す）
+    期待フォーマット: 改行区切り or 箇条書き
     """
-    try:
-        t = yf.Ticker(ticker)
-        info = t.info or {}
+    if not text:
+        return []
+    allowed_set = set(allowed)
+    out: List[str] = []
+    for line in text.splitlines():
+        s = line.strip().lstrip("-").lstrip("・").strip()
+        if not s:
+            continue
+        # "○○（理由）" のような括弧を削る
+        s = re.sub(r"[（(].*?[）)]", "", s).strip()
+        if s in allowed_set and s not in out:
+            out.append(s)
+    return out
 
-        data = {
-            "trailingPE": _safe_float(info.get("trailingPE")),
-            "forwardPE": _safe_float(info.get("forwardPE")),
-            "priceToBook": _safe_float(info.get("priceToBook")),
-            "returnOnEquity": _safe_float(info.get("returnOnEquity")),
-            "debtToEquity": _safe_float(info.get("debtToEquity")),
-            "currentRatio": _safe_float(info.get("currentRatio")),
-            "operatingMargins": _safe_float(info.get("operatingMargins")),
-            "profitMargins": _safe_float(info.get("profitMargins")),
-            "freeCashflow": _safe_float(info.get("freeCashflow")),
-            "operatingCashflow": _safe_float(info.get("operatingCashflow")),
-            "marketCap": _safe_float(info.get("marketCap")),
-            "dividendYield": _safe_float(info.get("dividendYield")),
-        }
 
-        # 10や12が入ってくるケース（%）対策
-        roe = data.get("returnOnEquity")
-        if roe is not None and roe > 1.0:
-            data["returnOnEquity"] = roe / 100.0
-
-        # 倍率で返るケースを%寄りに補正
-        dte = data.get("debtToEquity")
-        if dte is not None and 0 < dte < 10:
-            data["debtToEquity"] = dte * 100.0
-
-        return {k: v for k, v in data.items() if v is not None}
-    except Exception:
-        return {}
-
-def get_fundamentals_cached(ticker: str, max_age_days: int = 14) -> Dict[str, Any]:
-    cache = _load_fund_cache()
-    rec = cache.get(ticker)
-    now = _now_tokyo()
-
-    if isinstance(rec, dict):
-        ts = rec.get("ts")
-        data = rec.get("data")
-        try:
-            if ts and data:
-                ts_dt = datetime.fromisoformat(ts)
-                if now - ts_dt < timedelta(days=max_age_days):
-                    if isinstance(data, dict):
-                        return data
-        except Exception:
-            pass
-
-    data = _fetch_fundamentals_yf(ticker)
-    cache[ticker] = {"ts": now.isoformat(), "data": data}
-    _save_fund_cache(cache)
-    return data
-
-def _value_quality_score(f: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
+@st.cache_data(ttl=3600, show_spinner=False)
+def rank_sectors_quant(
+    budget_yen: int,
+    vol_avg20_min: float,
+    period: str = "6mo",
+    lookback_days: int = 63,      # 約3ヶ月
+    reps_per_sector: int = 30,     # 各セクター代表銘柄数（多いほど精度↑・重さ↑）
+    min_reps: int = 8,             # セクター評価に必要な最小サンプル
+) -> pd.DataFrame:
     """
-    Buffett-ish: 割安 + 質 + 安全性 を 0..100 に正規化して合成。
-    欠損は中立（50付近）に寄せる。
+    「AIで未来を当てる」ではなく、まずは数値で“強いセクター（相対強度）”を作る。
+    - 各セクターから代表銘柄(reps)を抽出
+    - 3ヶ月リターン（中央値）とボラ（標準偏差）でスコア化
+    - 予算（100株）と出来高下限も反映（あなたが実際に買える範囲に寄せる）
     """
-    TARGET_PE = 18.0
-    TARGET_PB = 1.5
-    TARGET_ROE = 0.10
-    MAX_D2E = 200.0
-    MIN_MARGIN = 0.05
-    MIN_DIV = 0.01
+    master = get_jpx_master()
+    if master.empty:
+        return pd.DataFrame()
 
-    pe = f.get("trailingPE") or f.get("forwardPE")
-    pb = f.get("priceToBook")
-    roe = f.get("returnOnEquity")
-    d2e = f.get("debtToEquity")
-    opm = f.get("operatingMargins")
-    pm = f.get("profitMargins")
-    fcf = f.get("freeCashflow")
-    divy = f.get("dividendYield")
+    reps = master.sort_values("ticker").groupby("sector", as_index=False).head(reps_per_sector).copy()
+    rep_tickers = reps["ticker"].tolist()
+    if not rep_tickers:
+        return pd.DataFrame()
 
-    if pe is None:
-        pe_score = 50.0
-    else:
-        pe_score = 100.0 * _clamp((TARGET_PE / max(pe, 1e-9)), 0.0, 2.0) / 2.0
-        pe_score = _clamp(pe_score, 0.0, 100.0)
+    # benchmark（相対強度用）
+    bench = get_benchmark_data("^N225", period=period)
+    bench_close = bench.get("Close", pd.Series(dtype=float)).dropna()
+    bench_ret = np.nan
+    if len(bench_close) > lookback_days:
+        bench_ret = float(bench_close.iloc[-1] / bench_close.iloc[-lookback_days - 1] - 1)
 
-    if pb is None:
-        pb_score = 50.0
-    else:
-        pb_score = 100.0 * _clamp((TARGET_PB / max(pb, 1e-9)), 0.0, 2.0) / 2.0
-        pb_score = _clamp(pb_score, 0.0, 100.0)
+    # sector -> list of (ret, vol, vol_avg20)
+    bucket: Dict[str, List[Tuple[float, float, float]]] = {}
 
-    if roe is None:
-        roe_score = 50.0
-    else:
-        roe_score = 100.0 * _clamp(roe / TARGET_ROE, 0.0, 2.0) / 2.0
-        roe_score = _clamp(roe_score, 0.0, 100.0)
+    # download reps in chunks
+    for c in _chunk(rep_tickers, 50):
+        df_multi = _download_chunk_ohlcv(tuple(c), period=period)
+        if df_multi is None or df_multi.empty:
+            continue
 
-    margin = opm if opm is not None else pm
-    if margin is None:
-        margin_score = 50.0
-    else:
-        margin_score = 100.0 * _clamp(margin / MIN_MARGIN, 0.0, 2.0) / 2.0
-        margin_score = _clamp(margin_score, 0.0, 100.0)
+        for t in c:
+            df_t = _extract_one(df_multi, t)
+            if df_t is None or df_t.empty:
+                continue
 
-    if d2e is None:
-        d2e_score = 50.0
-    else:
-        d2e_score = 100.0 * _clamp((MAX_D2E - d2e) / MAX_D2E, -1.0, 1.0)
-        d2e_score = _clamp(d2e_score, 0.0, 100.0)
+            # need enough bars for vol + lookback + vol_avg20
+            if len(df_t) < max(lookback_days + 5, 25):
+                continue
 
-    if fcf is None:
-        fcf_score = 50.0
-    else:
-        fcf_score = 80.0 if fcf > 0 else 20.0
+            close = df_t["Close"].dropna()
+            if len(close) <= lookback_days:
+                continue
 
-    if divy is None:
-        div_score = 50.0
-    else:
-        div_score = 100.0 * _clamp(divy / MIN_DIV, 0.0, 2.0) / 2.0
-        div_score = _clamp(div_score, 0.0, 100.0)
+            price = float(close.iloc[-1])
+            if not np.isfinite(price) or price <= 0:
+                continue
 
-    value = 0.5 * pe_score + 0.5 * pb_score
-    quality = 0.6 * roe_score + 0.4 * margin_score
-    safety = 0.7 * d2e_score + 0.3 * fcf_score
-    shareholder = div_score
+            # 100株が予算内
+            if price * 100 > budget_yen:
+                continue
 
-    total = 0.45 * value + 0.30 * quality + 0.20 * safety + 0.05 * shareholder
+            vol_avg20 = float(df_t["Volume"].rolling(20).mean().iloc[-1])
+            if not np.isfinite(vol_avg20) or vol_avg20 < vol_avg20_min:
+                continue
 
-    debug = {
-        "pe": pe, "pb": pb, "roe": roe, "d2e": d2e, "margin": margin, "fcf": fcf, "divy": divy,
-        "pe_score": pe_score, "pb_score": pb_score, "roe_score": roe_score, "margin_score": margin_score,
-        "d2e_score": d2e_score, "fcf_score": fcf_score, "div_score": div_score,
-        "value_score": value, "quality_score": quality, "safety_score": safety,
+            ret_3m = float(close.iloc[-1] / close.iloc[-lookback_days - 1] - 1)
+
+            rets = close.pct_change().dropna()
+            vol = float(rets.tail(lookback_days).std()) if len(rets) >= 5 else float("nan")
+            if not np.isfinite(vol):
+                continue
+
+            # sector lookup
+            sector_row = master[master["ticker"] == t]
+            if sector_row.empty:
+                continue
+            sector = str(sector_row.iloc[0]["sector"])
+            bucket.setdefault(sector, []).append((ret_3m, vol, vol_avg20))
+
+    rows = []
+    for sector, arr in bucket.items():
+        if len(arr) < min_reps:
+            continue
+        ret_med = float(np.median([a[0] for a in arr]))
+        vol_med = float(np.median([a[1] for a in arr]))
+        vol_med20 = float(np.median([a[2] for a in arr]))
+        excess = float(ret_med - bench_ret) if np.isfinite(bench_ret) else ret_med
+
+        # スコア：相対強度（超過リターン）を主に、ボラで軽く罰則
+        score = excess * 100.0 - vol_med * 50.0
+
+        rows.append(
+            {
+                "sector": sector,
+                "n": int(len(arr)),
+                "ret_3m": ret_med,
+                "excess_vs_n225_3m": excess,
+                "vol_3m": vol_med,
+                "vol_avg20": vol_med20,
+                "score": score,
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    out = out.sort_values("score", ascending=False).reset_index(drop=True)
+    return out
+
+
+def select_hot_sectors(
+    sector_rank: pd.DataFrame,
+    top_n: int,
+    method: str = "quant",              # "quant" or "ai_overlay"
+    api_key: Optional[str] = None,
+) -> List[str]:
+    """
+    - quant: セクタースコア上位 top_n を採用（推奨）
+    - ai_overlay: quant上位（最大15）をAIに渡し、top_nに絞る（任意）
+    """
+    if sector_rank is None or sector_rank.empty:
+        return []
+
+    quant = sector_rank["sector"].head(max(top_n, 1)).tolist()
+
+    if method != "ai_overlay" or not api_key:
+        return quant[:top_n]
+
+    # AIは“未来予言”ではなく「数値に基づく絞り込み」だけさせる
+    allowed = sector_rank["sector"].head(15).tolist()
+    table = sector_rank.head(15)[["sector", "excess_vs_n225_3m", "vol_3m", "n"]].to_dict("records")
+
+    prompt = f"""以下は日本株（33業種）の“直近3ヶ月の相対強度(対N225超過)”ランキングです。
+あなたの仕事は、短期〜1ヶ月での順張り（押し目/ブレイク）に相性が良いセクターを {top_n} 個に絞ることです。
+
+制約：
+- “未来を断言”しない。ここにある数値（相対強度とボラ）に基づき選ぶ。
+- 出力はセクター名だけを改行区切りで。理由や文章は不要。
+
+データ（上位15）:
+{json.dumps(table, ensure_ascii=False)}
+"""
+
+    txt = _call_openai(
+        api_key,
+        "あなたは定量投資のリサーチャーです。入力の数値以外を持ち込まず、指定形式でのみ出力してください。",
+        prompt,
+    )
+    sectors_ai = _parse_sector_list(txt, allowed)
+    if not sectors_ai:
+        return quant[:top_n]
+    return sectors_ai[:top_n]
+
+def _score_prelim(latest: pd.Series, params: SwingParams) -> float:
+    """
+    事前スコア（バックテスト前）：
+    - 押し目の深さ（ちょうど良いレンジに近いほど）
+    - 出来高比（大きいほど）
+    - RSIが中庸ほど（過熱しすぎない）
+    """
+    sma_diff = float(latest["SMA_DIFF"])
+    vol_ratio = float(latest.get("VOL_RATIO", 1.0))
+    rsi = float(latest["RSI"])
+
+    # pullback: range center
+    pb_center = (params.pullback_low + params.pullback_high) / 2
+    pb_score = 1.0 - min(1.0, abs(sma_diff - pb_center) / max(1.0, abs(params.pullback_low - pb_center)))
+
+    rsi_center = (params.rsi_low + params.rsi_high) / 2
+    rsi_score = 1.0 - min(1.0, abs(rsi - rsi_center) / max(1.0, abs(params.rsi_high - rsi_center)))
+
+    vol_score = min(2.0, max(0.0, vol_ratio)) / 2.0
+
+    atr_pct = float(latest["ATR_PCT"])
+    atr_center = (params.atr_pct_min + params.atr_pct_max) / 2
+    atr_score = 1.0 - min(1.0, abs(atr_pct - atr_center) / max(0.5, abs(params.atr_pct_max - atr_center)))
+
+    return float(50 * pb_score + 30 * vol_score + 10 * rsi_score + 10 * atr_score)
+
+
+def scan_swing_candidates(
+    budget_yen: int = 300_000,
+    top_n: int = 3,
+    params: Optional[SwingParams] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    backtest_period: str = "2y",
+    backtest_topk: int = 20,
+    sector_prefilter: bool = True,
+    sector_top_n: int = 6,
+    sector_method: str = "quant",   # "quant" or "ai_overlay"
+    api_key: Optional[str] = None,
+) -> Dict[str, object]:
+    """
+    返り値:
+      {
+        "regime_ok": bool,
+        "candidates": [ {ticker,name,price,rsi,score_pre, bt:{...}} ...] (top_n)
+        "prelim_count": int,
+        "bt_count": int
+      }
+    """
+    params = params or SwingParams()
+
+
+    master_all = get_jpx_master()
+    if master_all.empty:
+        return {"regime_ok": True, "candidates": [], "prelim_count": 0, "bt_count": 0, "selected_sectors": [], "sector_ranking": [], "error": "JPXマスター取得に失敗しました"}
+
+    # --- セクター事前絞り込み（任意）---
+    sector_rank_records: List[Dict[str, object]] = []
+    selected_sectors: List[str] = []
+
+    master = master_all
+    if sector_prefilter:
+        if progress_callback:
+            progress_callback(0, 1, "セクター強度を計算中…")
+
+        sector_rank = rank_sectors_quant(
+            budget_yen=int(budget_yen),
+            vol_avg20_min=float(params.vol_avg20_min),
+            period="6mo",
+            lookback_days=63,
+            reps_per_sector=30,
+            min_reps=8,
+        )
+
+        if sector_rank is not None and not sector_rank.empty:
+            # UI表示用（上位15）
+            sector_rank_records = sector_rank.head(15).to_dict("records")
+
+            method_key = "ai_overlay" if str(sector_method).lower().startswith("ai") else "quant"
+            selected_sectors = select_hot_sectors(
+                sector_rank=sector_rank,
+                top_n=int(sector_top_n),
+                method=method_key,
+                api_key=api_key,
+            )
+
+            if selected_sectors:
+                master = master_all[master_all["sector"].isin(selected_sectors)].copy()
+
+    # 絞り込みで銘柄ゼロになったらフォールバック
+    if master is None or master.empty:
+        master = master_all
+        selected_sectors = []
+
+    tickers = master["ticker"].tolist()
+
+    regime_ok = _regime_is_ok()
+
+    # Stage 1: preliminary scan with chunk download (6mo)
+    prelim: List[Dict[str, object]] = []
+    chunks = _chunk(tickers, 50)
+
+    total = len(chunks)
+    for ci, c in enumerate(chunks, start=1):
+        if progress_callback:
+            progress_callback(ci, total, f"スキャン中 {ci}/{total}")
+
+        df_multi = _download_chunk_ohlcv(tuple(c), period="6mo")
+        if df_multi is None or df_multi.empty:
+            continue
+
+        for t in c:
+            df_t = _extract_one(df_multi, t)
+            if df_t is None or df_t.empty or len(df_t) < 90:
+                continue
+            ind = calculate_indicators(df_t)
+            if ind.empty:
+                continue
+            latest = ind.iloc[-1]
+
+            price = float(latest["Close"])
+            # 100株の投資単位が予算内か
+            if price * 100 > budget_yen:
+                continue
+
+            # filters
+            trend_ok = bool(price > latest["SMA_25"])
+            if params.require_sma25_over_sma75:
+                trend_ok = trend_ok and bool(latest["SMA_25"] > latest["SMA_75"])
+
+            rsi = float(latest["RSI"])
+            rsi_ok = params.rsi_low <= rsi <= params.rsi_high
+
+            atr_pct = float(latest["ATR_PCT"])
+            atr_ok = params.atr_pct_min <= atr_pct <= params.atr_pct_max
+
+            vol_avg20 = float(latest["VOL_AVG_20"])
+            vol_ok = vol_avg20 >= params.vol_avg20_min
+
+            if not (trend_ok and rsi_ok and atr_ok and vol_ok):
+                continue
+
+            if params.entry_mode == "pullback":
+                sma_diff = float(latest["SMA_DIFF"])
+                pb_ok = params.pullback_low <= sma_diff <= params.pullback_high
+                # trigger: close > yesterday high
+                trigger = bool(ind["Close"].iloc[-1] > ind["High"].iloc[-2])
+                if not (pb_ok and trigger):
+                    continue
+            else:
+                lb = params.breakout_lookback
+                prev_high = float(ind["High"].iloc[-lb-1:-1].max()) if len(ind) > lb+1 else float("nan")
+                breakout = bool(price > prev_high) if np.isfinite(prev_high) else False
+                vr = float(latest["VOL_RATIO"])
+                if not (breakout and vr >= params.breakout_vol_ratio):
+                    continue
+
+            score_pre = _score_prelim(latest, params)
+
+            row_m = master[master["ticker"] == t].iloc[0]
+            prelim.append(
+                {
+                    "ticker": t,
+                    "name": str(row_m["name"]),
+                    "sector": str(row_m["sector"]),
+                    "price": price,
+                    "rsi": rsi,
+                    "atr": float(latest["ATR"]),
+                    "atr_pct": atr_pct,
+                    "vol_avg20": vol_avg20,
+                    "score_pre": score_pre,
+                }
+            )
+
+    prelim_count = len(prelim)
+    if prelim_count == 0:
+        return {"regime_ok": regime_ok, "candidates": [], "prelim_count": 0, "bt_count": 0, "selected_sectors": selected_sectors, "sector_ranking": sector_rank_records, "universe": len(tickers)}
+
+    prelim_sorted = sorted(prelim, key=lambda x: float(x["score_pre"]), reverse=True)[: max(backtest_topk, top_n)]
+    bt_count = len(prelim_sorted)
+
+    # Stage 2: backtest topK and re-rank by expectancy/PF
+    ranked: List[Dict[str, object]] = []
+    for i, item in enumerate(prelim_sorted, start=1):
+        if progress_callback:
+            progress_callback(i, bt_count, f"バックテスト {item['ticker']}")
+
+        df = get_market_data(item["ticker"], period=backtest_period, interval="1d")
+        ind = calculate_indicators(df)
+        bt = backtest_swing(ind, params)
+
+        ranked.append(
+            {
+                **item,
+                "bt_trades": bt.n_trades,
+                "bt_win_rate": bt.win_rate,
+                "bt_pf": bt.profit_factor,
+                "bt_avg_r": bt.expectancy_r,
+                "bt_max_dd": bt.max_drawdown,
+            }
+        )
+
+    # rank: expectancy -> PF -> trades
+    ranked = sorted(
+        ranked,
+        key=lambda x: (float(x["bt_avg_r"]), float(x["bt_pf"]) if np.isfinite(float(x["bt_pf"])) else 0.0, float(x["bt_trades"])),
+        reverse=True,
+    )
+
+    return {
+        "regime_ok": regime_ok,
+        "selected_sectors": selected_sectors,
+        "sector_ranking": sector_rank_records,
+        "universe": len(tickers),
+        "candidates": ranked[:top_n],
+        "prelim_count": prelim_count,
+        "bt_count": bt_count,
     }
-    return float(_clamp(total, 0.0, 100.0)), debug
 
-def _timing_score(latest_close: float, sma25: float, sma75: float, sma200: float, rsi: float, sma_diff: float) -> float:
-    score = 50.0
 
-    if sma200 > 0:
-        score += 20.0 if latest_close > sma200 else -20.0
-
-    score += 10.0 if sma25 > sma75 else -10.0
-
-    ideal = -2.0
-    dist = abs(sma_diff - ideal)
-    score += max(0.0, 20.0 - dist * 3.0)
-
-    if rsi <= 30:
-        score += 15.0
-    elif 35 <= rsi <= 55:
-        score += 10.0
-    elif rsi >= 70:
-        score -= 20.0
-
-    return float(_clamp(score, 0.0, 100.0))
-
-def _liquidity_filter(df: pd.DataFrame) -> Tuple[bool, float]:
-    if df is None or df.empty or "Volume" not in df.columns:
-        return True, 0.0
-
-    vol20 = _safe_float(df["Volume"].tail(20).mean())
-    if vol20 is None:
-        return True, 0.0
-
-    ok = vol20 >= 100000
-    liq_score = 100.0 * _clamp(math.log10(vol20 + 1) / 6.0, 0.0, 1.0)
-    return ok, float(_clamp(liq_score, 0.0, 100.0))
-
-# -------------- Auto Scan --------------
-
+# Backward-compatible alias for main.py
 def auto_scan_value_stocks(api_key: str, progress_callback=None):
     """
-    main.py互換:
-      return (target_sectors, candidates_top3)
-
-    candidates dict:
-      ticker, name, price, rsi, score
-    + optional:
-      hit, value_score, timing_score, liquidity_score, pb, pe, roe, d2e, fcf
+    旧main.py互換：戻り値は (sectors, candidates)。
+    v4以降は「セクター事前絞り込み」を内部で行うため、選ばれたセクター一覧も返す。
     """
-    df_master = get_jpx_master()
-    if df_master.empty:
-        return ["エラー"], []
-
-    # 市場フィルタ（東証1部相当をPrime/Standardに寄せる）
-    df_universe = df_master.copy()
-    if "market" in df_universe.columns and df_universe["market"].astype(str).str.len().mean() > 0:
-        m = df_universe["market"].astype(str)
-        tmp = df_universe[m.str.contains("プライム|Prime|スタンダード|Standard", regex=True, na=False)].copy()
-        # フィルタ結果が空なら、ここは無理に絞らない（環境/JPX列仕様差で0件になるのを防ぐ）
-        if not tmp.empty:
-            df_universe = tmp
-
-    all_sectors = df_universe["sector"].dropna().unique().tolist()
-    target_sectors = get_promising_sectors(api_key, all_sectors, n=6)
-
-    target_df = df_universe[df_universe["sector"].isin(target_sectors)].copy()
-    if target_df.empty:
-        target_df = df_universe.copy()
-
-    scan_list = target_df.to_dict("records")
-    tickers = [x["ticker"] for x in scan_list]
-
-    # 価格データはまとめて取りに行く（失敗時は個別にフォールバック）
-    price_frames: Dict[str, pd.DataFrame] = {}
-    CHUNK = 40  # 大きすぎると失敗しやすい。環境により調整
-    for chunk_idx, chunk in enumerate(_chunked(tickers, CHUNK)):
-        if progress_callback:
-            progress_callback(min((chunk_idx + 1) * CHUNK, len(tickers)), len(tickers), f"price bulk {chunk_idx+1}")
-
-        bulk = _bulk_yahoo_chart(chunk, rng="1y", interval="1d")
-        if bulk:
-            price_frames.update(bulk)
-        else:
-            for t in chunk:
-                df = _yahoo_chart(t, rng="1y", interval="1d")
-                if df is not None and not df.empty:
-                    price_frames[t] = df
-                time.sleep(0.05)
-
-        time.sleep(0.1)
-
-    # pre-rank: 価格 + 流動性 + タイミング
-    pre_rank = []
-    for i, item in enumerate(scan_list):
-        ticker, comp_name = item["ticker"], item["name"]
-        try:
-            if progress_callback:
-                progress_callback(i + 1, len(scan_list), f"{ticker} {comp_name}")
-
-            df = price_frames.get(ticker)
-            if df is None or df.empty or len(df) < 210:
-                continue
-
-            ind = calculate_indicators(df)
-            if ind is None or ind.empty:
-                continue
-
-            latest = ind.iloc[-1]
-            latest_close = float(latest["Close"])
-            rsi = float(latest["RSI"])
-            sma25 = float(latest["SMA_25"])
-            sma75 = float(latest["SMA_75"])
-            sma200 = float(latest.get("SMA_200", float("nan")))
-            sma_diff = float(latest["SMA_DIFF"])
-
-            liq_ok, liq_score = _liquidity_filter(ind)
-            if not liq_ok:
-                continue
-
-            t_score = _timing_score(latest_close, sma25, sma75, sma200, rsi, sma_diff)
-
-            pre_rank.append({
-                "ticker": ticker,
-                "name": comp_name,
-                "price": latest_close,
-                "rsi": rsi,
-                "timing_score": t_score,
-                "liquidity_score": liq_score,
-                "sma_diff": sma_diff,
-                "sma25": sma25,
-                "sma75": sma75,
-                "sma200": sma200,
-            })
-        except Exception:
-            continue
-
-    if not pre_rank:
-        return target_sectors, []
-
-    pre_rank = sorted(pre_rank, key=lambda x: (x["timing_score"] + x["liquidity_score"]), reverse=True)
-    TOP_FOR_FUND = min(200, len(pre_rank))
-    short_list = pre_rank[:TOP_FOR_FUND]
-
-    candidates = []
-    near_miss = []
-
-    for j, base in enumerate(short_list):
-        ticker = base["ticker"]
-        try:
-            f = get_fundamentals_cached(ticker, max_age_days=14)
-            vq_score, _ = _value_quality_score(f)
-
-            timing_score = float(base["timing_score"])
-            liq_score = float(base["liquidity_score"])
-
-            total_score = 0.65 * vq_score + 0.25 * timing_score + 0.10 * liq_score
-
-            pe = f.get("trailingPE") or f.get("forwardPE")
-            pb = f.get("priceToBook")
-            roe = f.get("returnOnEquity")
-            d2e = f.get("debtToEquity")
-            fcf = f.get("freeCashflow")
-
-            strict_value_ok = (
-                (pb is not None and pb <= 1.5) and
-                (pe is not None and pe <= 18.0) and
-                (roe is not None and roe >= 0.08) and
-                (d2e is None or d2e <= 250.0) and
-                (fcf is None or fcf > 0)
-            )
-
-            sma200 = base["sma200"]
-            strict_timing_ok = (
-                (35.0 <= base["rsi"] <= 60.0) and
-                (-8.0 <= base["sma_diff"] <= 3.0) and
-                (base["price"] > (sma200 if not math.isnan(sma200) else 0.0))
-            )
-
-            hit = bool(strict_value_ok and strict_timing_ok)
-
-            out = {
-                "ticker": ticker,
-                "name": base["name"],
-                "price": float(base["price"]),
-                "rsi": float(base["rsi"]),
-                "score": float(total_score),
-                "hit": hit,
-                "value_score": float(vq_score),
-                "timing_score": float(timing_score),
-                "liquidity_score": float(liq_score),
-                "pb": _safe_float(pb),
-                "pe": _safe_float(pe),
-                "roe": _safe_float(roe),
-                "d2e": _safe_float(d2e),
-                "fcf": _safe_float(fcf),
-            }
-
-            if hit:
-                candidates.append(out)
-            else:
-                near_miss.append(out)
-
-        except Exception:
-            continue
-
-        if (j + 1) % 40 == 0:
-            time.sleep(0.05)
-
-    candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
-    if candidates:
-        return target_sectors, candidates[:3]
-
-    near_miss = sorted(near_miss, key=lambda x: x["score"], reverse=True)
-    return target_sectors, near_miss[:3]
-
-# -------------- AI report generation --------------
-
-def get_ai_analysis(api_key: str, ctx: dict) -> str:
-    return call_openai(
-        api_key,
-        "あなたは実戦派ファンドマネージャーです。与えられた数値から、短期/中期の注意点と売買判断の論点を簡潔に述べてください。",
-        f"銘柄:{ctx['pair_label']} 株価:{ctx['price']}円 RSI:{ctx['rsi']:.1f} ATR:{ctx['atr']:.2f} SMA5:{ctx['sma5']:.1f} SMA25:{ctx['sma25']:.1f}",
-        temperature=0.2,
+    # api_key is not required for scan; kept for compatibility
+    res = scan_swing_candidates(
+        budget_yen=300_000,
+        top_n=3,
+        params=SwingParams(entry_mode="pullback"),
+        progress_callback=progress_callback,
+        backtest_period="2y",
+        backtest_topk=20,
     )
+    return res.get("selected_sectors", []), res.get("candidates", [])
 
-def get_ai_order_strategy(api_key: str, ctx: dict) -> str:
-    return call_openai(
-        api_key,
-        "あなたは冷徹な執行責任者です。リスク管理込みで、Entry/Limit/Stop/利確案を具体的な数値で提示してください。",
-        f"銘柄:{ctx['pair_label']} 株価:{ctx['price']}円 RSI:{ctx['rsi']:.1f} ATR:{ctx['atr']:.2f}",
-        temperature=0.2,
-    )
 
-def get_ai_portfolio(api_key: str, ctx: dict) -> str:
-    return call_openai(
-        api_key,
-        "あなたはポートフォリオマネージャーです。週末跨ぎ/決算/材料のリスクも踏まえ、保有継続の是非を述べてください。",
-        f"銘柄:{ctx['pair_label']} 株価:{ctx['price']}円 RSI:{ctx['rsi']:.1f} ATR:{ctx['atr']:.2f}",
-        temperature=0.2,
-    )
+# -------------------------
+# 8) 注文書（アルゴリズム版）
+# -------------------------
+def build_trade_plan(
+    df_ind: pd.DataFrame,
+    params: SwingParams,
+    capital_yen: int,
+    risk_pct: float,
+    allow_partial_tp: bool = True,
+) -> Dict[str, object]:
+    """
+    現在の指標から、次のエントリーを想定した注文書を数値で生成。
+    - entry: 次営業日の寄り（推定）として、最新Closeをベースに提示（実務は指値や寄成）
+    - stop: ATR*mult
+    - tp1/tp2: Rベース
+    - shares: 100株単位で、リスク額・資金額の両方を満たす最大株数を算出
+    """
+    if df_ind is None or df_ind.empty:
+        return {}
+
+    last = df_ind.iloc[-1]
+    price = float(last["Close"])
+    atr = float(last["ATR"])
+    if not np.isfinite(price) or not np.isfinite(atr) or atr <= 0:
+        return {}
+
+    r = atr * params.atr_mult_stop
+    entry = price  # proxy
+    stop = entry - r
+    tp1 = entry + params.tp1_r * r
+    tp2 = entry + params.tp2_r * r
+
+    # position sizing
+    risk_yen = capital_yen * (risk_pct / 100.0)
+    per_share_risk = max(1e-9, entry - stop)
+    raw_shares = math.floor(risk_yen / per_share_risk)
+
+    # unit: 100 shares
+    unit_shares = (raw_shares // 100) * 100
+    if unit_shares < 100:
+        unit_shares = 0
+
+    # capital constraint
+    if unit_shares > 0:
+        max_by_cap = (capital_yen // (entry * 100)) * 100
+        unit_shares = int(min(unit_shares, max_by_cap))
+
+    plan = {
+        "entry_price": float(entry),
+        "stop_price": float(stop),
+        "tp1_price": float(tp1),
+        "tp2_price": float(tp2),
+        "r_yen_per_share": float(per_share_risk),
+        "risk_yen": float(risk_yen),
+        "shares": int(unit_shares),
+        "time_stop_days": int(params.time_stop_days),
+        "mode": params.entry_mode,
+        "atr_mult_stop": float(params.atr_mult_stop),
+        "tp1_r": float(params.tp1_r),
+        "tp2_r": float(params.tp2_r),
+    }
+    return plan
