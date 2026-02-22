@@ -724,6 +724,15 @@ def rank_sectors_quant(
     # sector -> list of (ret, vol, vol_avg20)
     bucket: Dict[str, List[Tuple[float, float, float]]] = {}
 
+    # debug stats for sector ranking (kept minimal)
+    stats = {
+        'rep_total': len(rep_tickers),
+        'budget_ok': 0,
+        'fail_budget': 0,
+        'data_ok': 0,
+        'fail_data_short': 0,
+    }
+
     # download reps in chunks
     for c in _chunk(rep_tickers, 50):
         df_multi = _download_chunk_ohlcv(tuple(c), period=period)
@@ -800,6 +809,11 @@ def rank_sectors_quant(
         return out
 
     out = out.sort_values("score", ascending=False).reset_index(drop=True)
+    # attach stats for optional UI display
+    try:
+        out.attrs['rank_stats'] = stats
+    except Exception:
+        pass
     return out
 
 
