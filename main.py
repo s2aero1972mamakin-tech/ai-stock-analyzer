@@ -152,7 +152,39 @@ if scan_btn:
             status.update(label="✅ 完了：候補を抽出しました", state="complete", expanded=False)
         else:
             status.update(label="⚠️ 条件クリア銘柄なし", state="complete", expanded=False)
-            st.sidebar.error("条件を緩める（出来高下限/RSI範囲/乖離/ATR%）か、エントリー型を切り替えてください。")
+
+            err = res.get("error", "")
+            relax_level = int(res.get("relax_level", 0))
+            params_eff = res.get("params_effective", {})
+            stats = res.get("filter_stats", {}) or {}
+
+            st.sidebar.error("条件クリア銘柄が0件でした。下の診断を見て、まずは絞り込み条件を緩めてください。")
+            if err:
+                st.sidebar.caption(f"理由: {err}")
+
+            # show whether auto-relax was tried
+            if relax_level >= 1:
+                st.sidebar.warning("自動緩和（条件をゆるめて再スキャン）を1回実施しましたが、まだ0件でした。")
+
+            if params_eff:
+                st.sidebar.markdown("**今回スキャンに使われた条件（effective）**")
+                st.sidebar.json(params_eff)
+
+            if stats:
+                st.sidebar.markdown("**どこで落ちているか（ざっくり）**")
+                # show key stats compactly
+                keys = ["universe","data_ok","budget_ok","trend_ok","rsi_ok","atr_ok","vol_ok","setup_ok","prelim_pass",
+                        "fail_data_short","fail_budget","fail_trend","fail_rsi","fail_atr","fail_vol","fail_setup"]
+                compact = {k: stats.get(k) for k in keys if k in stats}
+                st.sidebar.json(compact)
+
+            st.sidebar.markdown("---")
+            st.sidebar.markdown("**0件になりやすい原因（この順で試してください）**")
+            st.sidebar.write("1) エントリー型を **breakout（出来高ブレイク）** に変更")
+            st.sidebar.write("2) 20日平均出来高 下限を **100000 → 30000** くらいに下げる")
+            st.sidebar.write("3) RSI範囲を **40-65 → 35-70** に広げる")
+            st.sidebar.write("4) 押し目乖離を **-6〜-1 → -10〜0** に広げる（pullbackの場合）")
+            st.sidebar.write("5) ATR%上限を **6 → 10** に上げる（動く銘柄を許容）")
 
     st.rerun()
 
