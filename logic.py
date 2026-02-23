@@ -7,7 +7,7 @@
 # - 上位候補に対して簡易バックテスト（2年推奨）を走らせ、PF・平均R・最大DDを算出して再ランキング
 # - 注文書はRベース（SL/TP1/TP2/時間切れ/建値移動）で数値化
 #
-# 注：データは Stooq 取得（無料・APIキー不要）。銘柄によっては欠損/遅延があり得ます。
+# 注：データは yfinance 取得（無料APIのため遅延/欠損が起きる場合があります）
 # ============================================================
 
 from __future__ import annotations
@@ -17,15 +17,14 @@ import re
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from io import BytesIO, StringIO
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import requests
 import pytz
 import streamlit as st
+import yfinance as yf
 from openai import OpenAI
 
 TOKYO = pytz.timezone("Asia/Tokyo")
@@ -150,7 +149,7 @@ def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     # multiindex columns -> flatten
     if isinstance(df.columns, pd.MultiIndex):
-        # 旧: multi-index 形式 (Field, Ticker)
+        # yfinance multi-index: (Field, Ticker)
         # we'll handle per-ticker extraction elsewhere
         return df
     # timezone fix
@@ -159,114 +158,21 @@ def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ----------------------------
-# Market data source (Japan): Stooq (free, no API key)
-#  - We treat input tickers like "7203.T" or "7203" as JP stocks and map to Stooq symbols like "7203.jp".
-#  - Stooq provides daily OHLCV via CSV: https://stooq.com/q/d/l/?s=7203.jp&i=d
-# ----------------------------
-
-_STOOQ_CSV_URL = "https://stooq.com/q/d/l/?s={symbol}&i=d"
-
-def _to_stooq_symbol(ticker: str) -> str:
-    t = (ticker or "").strip().upper()
-    if not t:
-        return ""
-    # Accept: 7203, 7203.T, 7203.JP
-    if t.endswith(".T"):
-        code = t[:-2]
-    elif t.endswith(".JP"):
-        code = t[:-3]
-    else:
-        code = t
-        if "." in code:
-            code = code.split(".")[0]
-    code = code.strip()
-    # Typical JP codes are 4 digits; ETFs are also digits. Keep non-digit as-is.
-    if code.isdigit():
-        return f"{code.lower()}.jp"
-    return code.lower()
-
-def _period_to_start(period: str):
-    p = (period or "").strip().lower()
-    if not p or p in {"max", "all"}:
-        return None
-    m = re.match(r"^(\d+)(d|wk|mo|y)$", p)
-    if not m:
-        return None
-    n = int(m.group(1))
-    unit = m.group(2)
-    now = pd.Timestamp.now().normalize()
-    if unit == "d":
-        return now - pd.Timedelta(days=n)
-    if unit == "wk":
-        return now - pd.Timedelta(weeks=n)
-    if unit == "mo":
-        # approximate month = 30 days (good enough for slicing)
-        return now - pd.Timedelta(days=30 * n)
-    if unit == "y":
-        return now - pd.Timedelta(days=365 * n)
-    return None
-
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
-def _stooq_download_daily(stooq_symbol: str) -> pd.DataFrame:
-    if not stooq_symbol:
-        return pd.DataFrame()
-    url = _STOOQ_CSV_URL.format(symbol=stooq_symbol)
-    try:
-        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        txt = r.text
-    except Exception:
-        return pd.DataFrame()
-
-    # Stooq returns a short CSV even for missing symbols; guard by column check
-    try:
-        df = pd.read_csv(StringIO(txt))
-    except Exception:
-        return pd.DataFrame()
-
-    if df.empty or "Date" not in df.columns:
-        return pd.DataFrame()
-
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-
-    # Normalize column names and dtypes
-    colmap = {c: c.strip().capitalize() for c in df.columns}
-    df = df.rename(columns=colmap)
-
-    for c in ["Open", "High", "Low", "Close", "Volume"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-    df = df[keep].dropna(subset=["Close"])
-
-    return df
-
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_market_data(ticker: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
-    """Fetch OHLCV for a Japanese ticker.
-
-    Notes:
-      - Data source: Stooq (daily). `interval` is accepted for backward compatibility but treated as daily.
-      - `ticker` examples: "7203.T", "7203", "1306.T"
-    """
     try:
-        stooq_symbol = _to_stooq_symbol(ticker)
-        df = _stooq_download_daily(stooq_symbol)
-        if df.empty:
-            return pd.DataFrame()
-
-        start = _period_to_start(period)
-        if start is not None:
-            df = df[df.index >= start]
-
+        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False, threads=True)
+        df = _normalize_yf_df(df)
+        if isinstance(df.columns, pd.MultiIndex):
+            # sometimes single ticker still returns multi-index
+            df.columns = df.columns.droplevel(1)
         return df.dropna()
     except Exception:
         return pd.DataFrame()
 
 
-def get_benchmark_data(symbol: str = "1321.T", period: str = "5y") -> pd.DataFrame:
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_benchmark_data(symbol: str = "^N225", period: str = "5y") -> pd.DataFrame:
     return get_market_data(symbol, period=period, interval="1d")
 
 
@@ -715,62 +621,45 @@ def _chunk(lst: List[str], n: int) -> List[List[str]]:
     return [lst[i : i + n] for i in range(0, len(lst), n)]
 
 
-
-@st.cache_data(show_spinner=False, ttl=60 * 60)
-def _download_chunk_ohlcv(tickers: Tuple[str, ...], period: str = "6mo", interval: str = "1d") -> Dict[str, pd.DataFrame]:
-    """Download OHLCV for a chunk of JP tickers.
-
-    Stooq does not provide a true multi-ticker historical endpoint, so we fetch per-ticker.
-    To keep runtime reasonable, we parallelize with a small thread pool and rely on Streamlit caching.
-    """
-    tickers = tuple([t for t in tickers if t])
-    if not tickers:
-        return {}
-
-    out: Dict[str, pd.DataFrame] = {}
-
-    def _job(t: str):
-        return t, get_market_data(t, period=period, interval=interval)
-
-    max_workers = min(8, max(2, len(tickers)))
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(_job, t) for t in tickers]
-        for fut in as_completed(futures):
-            try:
-                t, df = fut.result()
-                if df is not None and not df.empty:
-                    out[t] = df
-            except Exception:
-                continue
-
-    return out
-
-
-
-def _extract_one(bundle, ticker: str) -> pd.DataFrame:
-    """Extract one ticker's DataFrame from a bundle returned by _download_chunk_ohlcv.
-
-    After the Stooq migration, the bundle is a dict[ticker -> df].
-    For backward compatibility, we still support the old MultiIndex DataFrame format.
-    """
-    if bundle is None:
+@st.cache_data(ttl=3600, show_spinner=False)
+def _download_chunk_ohlcv(tickers: Tuple[str, ...], period: str = "6mo") -> pd.DataFrame:
+    # yfinance multi ticker download
+    try:
+        df = yf.download(
+            tickers=list(tickers),
+            period=period,
+            interval="1d",
+            progress=False,
+            group_by="ticker",
+            auto_adjust=False,
+            threads=True,
+        )
+        return _normalize_yf_df(df)
+    except Exception:
         return pd.DataFrame()
-    if isinstance(bundle, dict):
-        df = bundle.get(ticker)
-        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
 
-    # Backward compatibility (旧 multi download 形式)
-    if isinstance(bundle, pd.DataFrame) and isinstance(bundle.columns, pd.MultiIndex):
-        if ("Close", ticker) in bundle.columns:
-            cols = [(c, ticker) for c in ["Open", "High", "Low", "Close", "Volume"] if (c, ticker) in bundle.columns]
-            d = bundle.loc[:, cols].copy()
-            d.columns = [c for c, _ in cols]
-            return d.dropna()
-    return pd.DataFrame()
+
+def _extract_one(df_multi: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    if df_multi is None or df_multi.empty:
+        return pd.DataFrame()
+    if isinstance(df_multi.columns, pd.MultiIndex):
+        # columns: (Field, Ticker) or (Ticker, Field) depending on yfinance; handle both
+        lvl0 = df_multi.columns.get_level_values(0)
+        lvl1 = df_multi.columns.get_level_values(1)
+        if ticker in set(lvl0):
+            sub = df_multi[ticker].copy()
+            sub.columns.name = None
+            return sub.dropna()
+        if ticker in set(lvl1):
+            sub = df_multi.xs(ticker, axis=1, level=1).copy()
+            sub.columns.name = None
+            return sub.dropna()
+    # single ticker
+    return df_multi.copy().dropna()
 
 
 def _regime_is_ok() -> bool:
-    bench = calculate_indicators(get_benchmark_data("1321.T", period="5y"), include_sma200=True)
+    bench = calculate_indicators(get_benchmark_data("^N225", period="5y"), include_sma200=True)
     if bench.empty:
         return True  # ベンチが取れないならスキャンは継続（保守的に止めない）
     last = bench.iloc[-1]
@@ -801,58 +690,130 @@ def _parse_sector_list(text: str, allowed: List[str]) -> List[str]:
     return out
 
 
-
-@st.cache_data(show_spinner=False, ttl=60 * 60)
+@st.cache_data(ttl=3600, show_spinner=False)
 def rank_sectors_quant(
-    jpx_master: pd.DataFrame,
-    lookback: str = "3mo",
-    benchmark_ticker: str = "1321.T",
-    min_hist_days: int = 40,
-    max_tickers: int = 1200,
+    budget_yen: int,
+    vol_avg20_min: float,
+    period: str = "6mo",
+    lookback_days: int = 63,      # 約3ヶ月
+    reps_per_sector: int = 30,     # 各セクター代表銘柄数（多いほど精度↑・重さ↑）
+    min_reps: int = 8,             # セクター評価に必要な最小サンプル
 ) -> pd.DataFrame:
-    """Quant-style sector strength for JP stocks (Stooq daily).
-
-    We compute each ticker's lookback return and average within sector.
-    This is intentionally simple and robust (no intraday / no fundamentals).
     """
-    if jpx_master is None or jpx_master.empty:
-        return pd.DataFrame(columns=["sector", "strength", "n"])
+    「AIで未来を当てる」ではなく、まずは数値で“強いセクター（相対強度）”を作る。
+    - 各セクターから代表銘柄(reps)を抽出
+    - 3ヶ月リターン（中央値）とボラ（標準偏差）でスコア化
+    - 予算（100株）と出来高下限も反映（あなたが実際に買える範囲に寄せる）
+    """
+    master = get_jpx_master()
+    if master.empty:
+        return pd.DataFrame()
 
-    dfm = jpx_master.copy()
-    dfm = dfm.dropna(subset=["ticker", "sector"])
-    tickers = dfm["ticker"].drop_duplicates().tolist()
-    if max_tickers and len(tickers) > max_tickers:
-        tickers = tickers[:max_tickers]
+    reps = master.sort_values("ticker").groupby("sector", as_index=False).head(reps_per_sector).copy()
+    rep_tickers = reps["ticker"].tolist()
+    if not rep_tickers:
+        return pd.DataFrame()
+
+    # benchmark（相対強度用）
+    bench = get_benchmark_data("^N225", period=period)
+    bench_close = bench.get("Close", pd.Series(dtype=float)).dropna()
+    bench_ret = np.nan
+    if len(bench_close) > lookback_days:
+        bench_ret = float(bench_close.iloc[-1] / bench_close.iloc[-lookback_days - 1] - 1)
+
+    # sector -> list of (ret, vol, vol_avg20)
+    bucket: Dict[str, List[Tuple[float, float, float]]] = {}
+
+    # debug stats for sector ranking (kept minimal)
+    stats = {
+        'rep_total': len(rep_tickers),
+        'budget_ok': 0,
+        'fail_budget': 0,
+        'data_ok': 0,
+        'fail_data_short': 0,
+    }
+
+    # download reps in chunks
+    for c in _chunk(rep_tickers, 50):
+        df_multi = _download_chunk_ohlcv(tuple(c), period=period)
+        if df_multi is None or df_multi.empty:
+            continue
+
+        for t in c:
+            df_t = _extract_one(df_multi, t)
+            if df_t is None or df_t.empty:
+                continue
+
+            # need enough bars for vol + lookback + vol_avg20
+            if len(df_t) < max(lookback_days + 5, 25):
+                continue
+
+            close = df_t["Close"].dropna()
+            if len(close) <= lookback_days:
+                continue
+
+            price = float(close.iloc[-1])
+            if not np.isfinite(price) or price <= 0:
+                continue
+
+            # 100株が予算内
+            if price * 100 > budget_yen:
+                stats['fail_budget'] += 1
+                continue
+            stats['budget_ok'] += 1
+
+            vol_avg20 = float(df_t["Volume"].rolling(20).mean().iloc[-1])
+            if not np.isfinite(vol_avg20) or vol_avg20 < vol_avg20_min:
+                continue
+
+            ret_3m = float(close.iloc[-1] / close.iloc[-lookback_days - 1] - 1)
+
+            rets = close.pct_change().dropna()
+            vol = float(rets.tail(lookback_days).std()) if len(rets) >= 5 else float("nan")
+            if not np.isfinite(vol):
+                continue
+
+            # sector lookup
+            sector_row = master[master["ticker"] == t]
+            if sector_row.empty:
+                continue
+            sector = str(sector_row.iloc[0]["sector"])
+            bucket.setdefault(sector, []).append((ret_3m, vol, vol_avg20))
 
     rows = []
-    for t in tickers:
-        d = get_market_data(t, period=lookback, interval="1d")
-        if d is None or d.empty or "Close" not in d.columns or len(d) < min_hist_days:
+    for sector, arr in bucket.items():
+        if len(arr) < min_reps:
             continue
-        c0 = float(d["Close"].iloc[0])
-        c1 = float(d["Close"].iloc[-1])
-        if not np.isfinite(c0) or c0 <= 0:
-            continue
-        ret = (c1 / c0) - 1.0
-        sec = dfm.loc[dfm["ticker"] == t, "sector"].iloc[0]
-        rows.append((sec, ret))
+        ret_med = float(np.median([a[0] for a in arr]))
+        vol_med = float(np.median([a[1] for a in arr]))
+        vol_med20 = float(np.median([a[2] for a in arr]))
+        excess = float(ret_med - bench_ret) if np.isfinite(bench_ret) else ret_med
 
-    if not rows:
-        return pd.DataFrame(columns=["sector", "strength", "n"])
+        # スコア：相対強度（超過リターン）を主に、ボラで軽く罰則
+        score = excess * 100.0 - vol_med * 50.0
 
-    tmp = pd.DataFrame(rows, columns=["sector", "ret"])
-    out = tmp.groupby("sector").agg(strength=("ret", "mean"), n=("ret", "size")).reset_index()
-    out = out.sort_values(["strength", "n"], ascending=[False, False]).reset_index(drop=True)
+        rows.append(
+            {
+                "sector": sector,
+                "n": int(len(arr)),
+                "ret_3m": ret_med,
+                "excess_vs_n225_3m": excess,
+                "vol_3m": vol_med,
+                "vol_avg20": vol_med20,
+                "score": score,
+            }
+        )
 
-    # Optional: normalize by benchmark (market-neutral-ish)
-    b = get_market_data(benchmark_ticker, period=lookback, interval="1d")
-    if b is not None and not b.empty and "Close" in b.columns and len(b) >= min_hist_days:
-        b0 = float(b["Close"].iloc[0])
-        b1 = float(b["Close"].iloc[-1])
-        if np.isfinite(b0) and b0 > 0:
-            bench_ret = (b1 / b0) - 1.0
-            out["strength_excess"] = out["strength"] - bench_ret
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
 
+    out = out.sort_values("score", ascending=False).reset_index(drop=True)
+    # attach stats for optional UI display
+    try:
+        out.attrs['rank_stats'] = stats
+    except Exception:
+        pass
     return out
 
 
