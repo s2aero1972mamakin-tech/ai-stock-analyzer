@@ -95,15 +95,6 @@ sector_top_n = st.sidebar.slider("採用する上位セクター数", 2, 12, 6, 
 sector_method = st.sidebar.selectbox("絞り込み方式", ["データ（推奨）", "AI＋データ（任意）"], index=0)
 sector_method_key = "ai_overlay" if sector_method.startswith("AI") else "quant"
 
-
-max_universe = st.sidebar.number_input(
-    "スクリーニング対象銘柄数上限（0=無制限）",
-    value=400,
-    step=50,
-    min_value=0,
-    help="Stooqは銘柄ごとに取得するため、全銘柄を無制限にすると時間がかかります。まずは400程度を推奨。",
-)
-
 params = logic.SwingParams(
     rsi_low=float(rsi_low),
     rsi_high=float(rsi_high),
@@ -118,9 +109,7 @@ params = logic.SwingParams(
     tp2_r=float(tp2_r),
     time_stop_days=int(time_stop_days),
     risk_pct=float(risk_pct),
-    max_universe=int(max_universe),
 )
-
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🚀 全銘柄スキャン")
