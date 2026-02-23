@@ -21,6 +21,18 @@ import logic
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
+import inspect
+
+def _st_plotly(fig, **kwargs):
+    """plotly_chart wrapper for Streamlit versions without use_container_width."""
+    try:
+        if "use_container_width" in inspect.signature(st.plotly_chart).parameters:
+            return st.plotly_chart(fig, use_container_width=True, **kwargs)
+    except Exception:
+        pass
+    return st.plotly_chart(fig, **kwargs)
+
+
 st.set_page_config(layout="wide", page_title="AI日本株 スイングスキャナ", page_icon="🤖")
 st.title("🤖 日本株（〜1ヶ月）スイング：スキャン + バックテスト + 注文書")
 st.caption("※勝率だけではなく「利確（平均利益）」も含めた期待値（AvgR / PF）で候補を選別します。")
@@ -83,6 +95,15 @@ sector_top_n = st.sidebar.slider("採用する上位セクター数", 2, 12, 6, 
 sector_method = st.sidebar.selectbox("絞り込み方式", ["データ（推奨）", "AI＋データ（任意）"], index=0)
 sector_method_key = "ai_overlay" if sector_method.startswith("AI") else "quant"
 
+
+max_universe = st.sidebar.number_input(
+    "スクリーニング対象銘柄数上限（0=無制限）",
+    value=400,
+    step=50,
+    min_value=0,
+    help="Stooqは銘柄ごとに取得するため、全銘柄を無制限にすると時間がかかります。まずは400程度を推奨。",
+)
+
 params = logic.SwingParams(
     rsi_low=float(rsi_low),
     rsi_high=float(rsi_high),
@@ -97,7 +118,9 @@ params = logic.SwingParams(
     tp2_r=float(tp2_r),
     time_stop_days=int(time_stop_days),
     risk_pct=float(risk_pct),
+    max_universe=int(max_universe),
 )
+
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🚀 全銘柄スキャン")
@@ -299,7 +322,7 @@ fig.add_trace(go.Scatter(x=df.index, y=df["SMA_5"], name="SMA5", line=dict(width
 fig.add_trace(go.Scatter(x=df.index, y=df["SMA_25"], name="SMA25", line=dict(width=2)))
 fig.add_trace(go.Scatter(x=df.index, y=df["SMA_75"], name="SMA75", line=dict(width=1)))
 fig.update_layout(xaxis_rangeslider_visible=False, height=520, margin=dict(l=0, r=0, t=30, b=0))
-st.plotly_chart(fig, use_container_width=True)
+_st_plotly(fig)
 
 st.markdown("### 📌 実行タブ")
 tab_plan, tab_bt, tab_tune, tab_ai = st.tabs(["📝 注文書（ロジック）", "📈 バックテスト", "🧪 パラメータ検証", "🧠 AIコメント（任意）"])
@@ -350,7 +373,7 @@ with tab_bt:
         fig2 = go.Figure()
         fig2.add_trace(go.Scatter(x=bt.equity_curve_r.index, y=bt.equity_curve_r.values, name="Equity (R)"))
         fig2.update_layout(height=320, margin=dict(l=0, r=0, t=30, b=0))
-        st.plotly_chart(fig2, use_container_width=True)
+        _st_plotly(fig2)
 
     with st.expander("取引ログ（Rベース）"):
         st.dataframe(bt.trades)
