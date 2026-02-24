@@ -218,9 +218,14 @@ def get_market_data(ticker: str, period: str = "2y") -> pd.DataFrame:
     start = _period_to_start(period)
     return df[df.index >= start].copy()
 
-def get_benchmark_data(period: str = "2y") -> pd.DataFrame:
-    """Benchmark (Nikkei 225) via Stooq."""
-    return get_market_data("^N225", period=period)
+def get_benchmark_data(ticker: str = "^N225", period: str = "2y") -> pd.DataFrame:
+    """Benchmark data via current market data source (default Nikkei 225).
+
+    Args:
+        ticker: Benchmark symbol (e.g., "^N225"). Kept for backward compatibility with older call sites.
+        period: Lookback window like "6mo", "1y", "2y".
+    """
+    return get_market_data(ticker, period=period)
 
 def calculate_indicators(df: pd.DataFrame, include_sma200: bool = False) -> pd.DataFrame:
     """指標計算。
