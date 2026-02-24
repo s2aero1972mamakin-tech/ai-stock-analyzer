@@ -218,45 +218,47 @@ def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_market_data(ticker: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
-    """Market data via Stooq (preferred), with yfinance fallback.
-    Ensures DatetimeIndex is tz-naive and filters by the requested period safely.
+
+def get_market_data(ticker: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
+    """価格データを取得（現在は Stooq を使用）。日本株のみ前提。
+
+    - ticker: "7868.T" など（内部で Stooq 向けに変換）
+    - period: "6mo", "1y", "2y" など
+    - interval: 現状 "1d" 想定（Stooq の日足）
     """
-    df = _stooq_download_ohlcv(ticker, interval=interval)
-    if df is None or df.empty:
-        # fallback to yfinance (may be slower / rate-limited)
-        df = _yfinance_download_ohlcv(ticker, period=period, interval=interval)
+    try:
+        stooq_symbol = _to_stooq_symbol(ticker)
+        df = _fetch_stooq_ohlc(stooq_symbol)
+    except Exception:
+        return pd.DataFrame()
 
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # normalize index to tz-naive DatetimeIndex
+    # Ensure datetime index (tz-naive)
     try:
         df = df.copy()
-        if not isinstance(df.index, pd.DatetimeIndex):
-            df.index = pd.to_datetime(df.index, errors="coerce")
-        df = df.loc[~df.index.isna()].copy()
-
-        # drop tz if present
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df.loc[~df.index.isna()]
         if getattr(df.index, "tz", None) is not None:
             df.index = df.index.tz_localize(None)
-
-        df = df.sort_index()
-
-        start_ts = _period_to_start(period)
-
-        # make start_ts tz-naive too (some envs produce tz-aware timestamps)
-        if isinstance(start_ts, pd.Timestamp) and start_ts.tzinfo is not None:
-            start_ts = start_ts.tz_convert(None)
-
-        # safety: ensure Timestamp
-        start_ts = pd.Timestamp(start_ts).to_pydatetime()
-        start_ts = pd.Timestamp(start_ts)  # tz-naive
-
-        return df.loc[df.index >= start_ts].copy()
     except Exception:
-        # last resort: return unfiltered (better than crashing)
+        return pd.DataFrame()
+
+    df = df.sort_index()
+
+    # Slice by period
+    start_ts = _period_to_start(period)
+    try:
+        start_ts = pd.Timestamp(start_ts)
+        if getattr(start_ts, "tzinfo", None) is not None:
+            # remove tz to match tz-naive index
+            start_ts = start_ts.tz_localize(None)
+    except Exception:
         return df
+
+    return df.loc[df.index >= start_ts].copy()
+
 
 def get_benchmark_data(ticker: str = "^N225", period: str = "2y") -> pd.DataFrame:
     """Benchmark data via current market data source (default Nikkei 225).
