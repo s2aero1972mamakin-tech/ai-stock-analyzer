@@ -239,7 +239,14 @@ def get_market_data(ticker: str, period: str = "2y") -> pd.DataFrame:
 
     df = df.sort_index()
     start = _period_to_start(period)
-    return df.loc[df.index >= start].copy()
+    # Robustify: ensure `start` is a Timestamp even if upstream passes a string.
+    start_ts = pd.to_datetime(start, errors="coerce")
+    if pd.isna(start_ts):
+        return df.copy()
+    # Ensure tz-naive to compare reliably
+    if getattr(df.index, "tz", None) is not None:
+        df.index = df.index.tz_localize(None)
+    return df.loc[df.index >= start_ts].copy()
 
 def get_benchmark_data(ticker: str = "^N225", period: str = "2y") -> pd.DataFrame:
     """Benchmark data via current market data source (default Nikkei 225).
