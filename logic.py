@@ -125,6 +125,11 @@ def get_jpx_master() -> pd.DataFrame:
     return df[["ticker", "name", "sector"]].drop_duplicates().reset_index(drop=True)
 
 
+# Backward compatible alias
+def load_jpx_master() -> pd.DataFrame:
+    return get_jpx_master()
+
+
 def get_company_name(ticker: str) -> str:
     m = get_jpx_master()
     if m.empty:
@@ -219,6 +224,11 @@ def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 
+
+
+# Compatibility wrapper (older name used in some code paths)
+def _stooq_download_ohlcv(ticker: str, interval: str = "d") -> pd.DataFrame:
+    return _fetch_stooq_ohlc(ticker, interval=interval)
 def get_market_data(ticker: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
     """価格データを取得（現在は Stooq を使用）。日本株のみ前提。
 
