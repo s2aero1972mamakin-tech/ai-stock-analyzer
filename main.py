@@ -27,7 +27,7 @@ def _st_plotly(fig, **kwargs):
     """plotly_chart wrapper for Streamlit versions without use_container_width."""
     try:
         if "use_container_width" in inspect.signature(st.plotly_chart).parameters:
-            return st.plotly_chart(fig, use_container_width=True, **kwargs)
+            return st.plotly_chart(fig, width='stretch', **kwargs)
     except Exception:
         pass
     return st.plotly_chart(fig, **kwargs)
