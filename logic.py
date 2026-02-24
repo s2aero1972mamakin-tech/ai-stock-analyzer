@@ -210,13 +210,36 @@ def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_market_data(ticker: str, period: str = "2y") -> pd.DataFrame:
-    """Get daily OHLCV for a single ticker via Stooq."""
+    """Get daily OHLCV for a single ticker via Stooq.
+
+    Note:
+        Stooq returns dates as strings in some edge cases (or empty frames can come back with
+        an object-typed index). We normalize to a DatetimeIndex before slicing by `period`
+        to avoid pandas TypeError on comparisons.
+    """
     symbol = _stooq_symbol(ticker)
     df = _fetch_stooq_ohlc(symbol)
     if df is None or df.empty:
         return pd.DataFrame()
+
+    # Normalize index to datetime to safely compare against Timestamp
+    df = df.copy()
+    try:
+        df.index = pd.to_datetime(df.index, errors="coerce")
+    except Exception:
+        # If index cannot be parsed, return as-is rather than crashing the app
+        return df
+
+    # Drop rows with invalid dates
+    if hasattr(df.index, "isna"):
+        df = df.loc[~df.index.isna()].copy()
+
+    if df.empty:
+        return df
+
+    df = df.sort_index()
     start = _period_to_start(period)
-    return df[df.index >= start].copy()
+    return df.loc[df.index >= start].copy()
 
 def get_benchmark_data(ticker: str = "^N225", period: str = "2y") -> pd.DataFrame:
     """Benchmark data via current market data source (default Nikkei 225).
