@@ -748,22 +748,67 @@ def _download_chunk_ohlcv(tickers: Tuple[str, ...], period: str = "6mo") -> pd.D
     return out_df.sort_index()
 
 def _extract_one(df_multi: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Extract one ticker's OHLCV frame from a possibly MultiIndex columns dataframe.
+
+    Supports:
+      - single ticker (simple columns)
+      - yfinance multi ticker output: (PriceField, Ticker)
+      - our concatenated multi ticker output: (Ticker, PriceField)
+    """
     if df_multi is None or df_multi.empty:
         return pd.DataFrame()
+
+    t = str(ticker).strip()
+
     if isinstance(df_multi.columns, pd.MultiIndex):
-        # columns: (Field, Ticker) or (Ticker, Field) depending on yfinance; handle both
-        lvl0 = df_multi.columns.get_level_values(0)
-        lvl1 = df_multi.columns.get_level_values(1)
-        if ticker in set(lvl0):
-            sub = df_multi[ticker].copy()
-            sub.columns.name = None
-            return sub.dropna()
-        if ticker in set(lvl1):
-            sub = df_multi.xs(ticker, axis=1, level=1).copy()
-            sub.columns.name = None
-            return sub.dropna()
-    # single ticker
-    return df_multi.copy().dropna()
+        lvl0 = df_multi.columns.get_level_values(0).astype(str)
+        lvl1 = df_multi.columns.get_level_values(1).astype(str)
+        set0 = set(lvl0)
+        set1 = set(lvl1)
+
+        # try a few normalizations (avoid breaking existing behavior)
+        cands = [t]
+        if t.endswith(".T"):
+            cands.append(t[:-2])
+        else:
+            # if numeric code, try .T
+            if t.isdigit():
+                cands.append(f"{t}.T")
+        # also try stripping common suffixes
+        cands = list(dict.fromkeys([c.strip() for c in cands if c.strip()]))
+
+        sub = None
+
+        # (Ticker, Field) -> select by level0
+        for cand in cands:
+            if cand in set0:
+                try:
+                    sub = df_multi[cand].copy()
+                    break
+                except Exception:
+                    pass
+
+        # (Field, Ticker) -> select by level1
+        if sub is None:
+            for cand in cands:
+                if cand in set1:
+                    try:
+                        sub = df_multi.xs(cand, axis=1, level=1).copy()
+                        break
+                    except Exception:
+                        pass
+
+        if sub is None or getattr(sub, "empty", True):
+            return pd.DataFrame()
+
+        # If still MultiIndex for some reason, flatten by taking the last level
+        if isinstance(sub.columns, pd.MultiIndex):
+            sub.columns = [str(c[-1]) for c in sub.columns.values]
+        sub.columns.name = None
+        return sub
+
+    # single ticker frame
+    return df_multi.copy()
 
 
 def _regime_is_ok() -> bool:
