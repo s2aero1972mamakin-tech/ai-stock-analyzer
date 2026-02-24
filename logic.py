@@ -40,21 +40,30 @@ def _stooq_symbol(ticker: str) -> str:
     return t.lower()
 
 def _period_to_start(period: str) -> pd.Timestamp:
-    """Approximate yfinance-like 'period' into start timestamp."""
-    p = (period or "1y").strip().lower()
+    """Convert lookback period string (e.g. '6mo','1y','2y') to a tz-naive start timestamp (00:00)."""
     now = pd.Timestamp.utcnow().normalize()
-    m = re.fullmatch(r"(\d+)(d|mo|y)", p)
-    if not m:
-        return now - pd.Timedelta(days=365)
-    n = int(m.group(1))
-    unit = m.group(2)
-    if unit == "d":
-        days = n
-    elif unit == "mo":
-        days = int(round(n * 30.5))
+    # pd.Timestamp.utcnow() is usually tz-naive, but be defensive
+    if now.tzinfo is not None:
+        now = now.tz_convert(None)
+
+    p = str(period).strip().lower()
+    if p.endswith("mo"):
+        n = int(re.sub(r"[^0-9]", "", p) or "6")
+        start = now - pd.DateOffset(months=n)
+    elif p.endswith("y"):
+        n = int(re.sub(r"[^0-9]", "", p) or "2")
+        start = now - pd.DateOffset(years=n)
+    elif p.endswith("d"):
+        n = int(re.sub(r"[^0-9]", "", p) or "180")
+        start = now - pd.DateOffset(days=n)
     else:
-        days = int(round(n * 365.25))
-    return now - pd.Timedelta(days=days)
+        # default 2y
+        start = now - pd.DateOffset(years=2)
+
+    start = pd.Timestamp(start).normalize()
+    if start.tzinfo is not None:
+        start = start.tz_convert(None)
+    return start
 
 def _fetch_stooq_ohlc(symbol: str) -> pd.DataFrame:
     """Fetch daily OHLCV from Stooq CSV endpoint."""
@@ -209,44 +218,45 @@ def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_market_data(ticker: str, period: str = "2y") -> pd.DataFrame:
-    """Get daily OHLCV for a single ticker via Stooq.
-
-    Note:
-        Stooq returns dates as strings in some edge cases (or empty frames can come back with
-        an object-typed index). We normalize to a DatetimeIndex before slicing by `period`
-        to avoid pandas TypeError on comparisons.
+def get_market_data(ticker: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
+    """Market data via Stooq (preferred), with yfinance fallback.
+    Ensures DatetimeIndex is tz-naive and filters by the requested period safely.
     """
-    symbol = _stooq_symbol(ticker)
-    df = _fetch_stooq_ohlc(symbol)
+    df = _stooq_download_ohlcv(ticker, interval=interval)
+    if df is None or df.empty:
+        # fallback to yfinance (may be slower / rate-limited)
+        df = _yfinance_download_ohlcv(ticker, period=period, interval=interval)
+
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # Normalize index to datetime to safely compare against Timestamp
-    df = df.copy()
+    # normalize index to tz-naive DatetimeIndex
     try:
-        df.index = pd.to_datetime(df.index, errors="coerce")
-    except Exception:
-        # If index cannot be parsed, return as-is rather than crashing the app
-        return df
-
-    # Drop rows with invalid dates
-    if hasattr(df.index, "isna"):
+        df = df.copy()
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index, errors="coerce")
         df = df.loc[~df.index.isna()].copy()
 
-    if df.empty:
-        return df
+        # drop tz if present
+        if getattr(df.index, "tz", None) is not None:
+            df.index = df.index.tz_localize(None)
 
-    df = df.sort_index()
-    start = _period_to_start(period)
-    # Robustify: ensure `start` is a Timestamp even if upstream passes a string.
-    start_ts = pd.to_datetime(start, errors="coerce")
-    if pd.isna(start_ts):
-        return df.copy()
-    # Ensure tz-naive to compare reliably
-    if getattr(df.index, "tz", None) is not None:
-        df.index = df.index.tz_localize(None)
-    return df.loc[df.index >= start_ts].copy()
+        df = df.sort_index()
+
+        start_ts = _period_to_start(period)
+
+        # make start_ts tz-naive too (some envs produce tz-aware timestamps)
+        if isinstance(start_ts, pd.Timestamp) and start_ts.tzinfo is not None:
+            start_ts = start_ts.tz_convert(None)
+
+        # safety: ensure Timestamp
+        start_ts = pd.Timestamp(start_ts).to_pydatetime()
+        start_ts = pd.Timestamp(start_ts)  # tz-naive
+
+        return df.loc[df.index >= start_ts].copy()
+    except Exception:
+        # last resort: return unfiltered (better than crashing)
+        return df
 
 def get_benchmark_data(ticker: str = "^N225", period: str = "2y") -> pd.DataFrame:
     """Benchmark data via current market data source (default Nikkei 225).
