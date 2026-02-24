@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 import re
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from io import BytesIO
 from typing import Callable, Dict, List, Optional, Tuple
@@ -251,9 +251,9 @@ def get_market_data(ticker: str, period: str = "6mo", interval: str = "1d") -> p
     start_ts = _period_to_start(period)
     try:
         start_ts = pd.Timestamp(start_ts)
-        if getattr(start_ts, "tzinfo", None) is not None:
-            # remove tz to match tz-naive index
-            start_ts = start_ts.tz_localize(None)
+        # Normalize timezone so we can compare reliably with tz-naive daily indices (Stooq etc.)
+        if getattr(start_ts, "tz", None) is not None:
+            start_ts = start_ts.tz_convert(None)
     except Exception:
         return df
 
@@ -1199,30 +1199,26 @@ def scan_swing_candidates(
     if prelim_count == 0:
         # 自動緩和（1回だけ）：条件が厳しすぎて “0件” になるのを避ける
         if relax_level == 0:
-            relaxed = SwingParams()
-            # copy current
-            for k in [
-                "rsi_low","rsi_high","pullback_low","pullback_high","atr_pct_min","atr_pct_max","vol_avg20_min",
-                "require_sma25_over_sma75","entry_mode","atr_mult_stop","tp1_r","tp2_r","time_stop_days",
-                "breakout_lookback","breakout_vol_ratio","risk_pct"
-            ]:
-                setattr(relaxed, k, getattr(params, k))
-
-            # relax knobs
-            relaxed.require_sma25_over_sma75 = False
-            relaxed.rsi_low = max(20.0, float(params.rsi_low) - 5.0)
-            relaxed.rsi_high = min(85.0, float(params.rsi_high) + 5.0)
-            relaxed.pullback_low = float(params.pullback_low) - 4.0
-            relaxed.pullback_high = float(params.pullback_high) + 2.0
-            relaxed.atr_pct_min = max(0.5, float(params.atr_pct_min) - 0.5)
-            relaxed.atr_pct_max = min(15.0, float(params.atr_pct_max) + 4.0)
-            relaxed.vol_avg20_min = max(20_000.0, float(params.vol_avg20_min) * 0.5)
+            relaxed = replace(
+                params,
+                # relax knobs
+                require_sma25_over_sma75=False,
+                rsi_low=max(20.0, float(params.rsi_low) - 5.0),
+                rsi_high=min(85.0, float(params.rsi_high) + 5.0),
+                pullback_low=float(params.pullback_low) - 4.0,
+                pullback_high=float(params.pullback_high) + 2.0,
+                atr_pct_min=max(0.5, float(params.atr_pct_min) - 0.5),
+                atr_pct_max=min(15.0, float(params.atr_pct_max) + 4.0),
+                vol_avg20_min=max(20_000.0, float(params.vol_avg20_min) * 0.5),
+            )
 
             # pullbackで0件のときは breakout に切替（短期で候補を作りやすい）
             if str(params.entry_mode) == "pullback":
-                relaxed.entry_mode = "breakout"
-                relaxed.breakout_vol_ratio = max(1.2, float(params.breakout_vol_ratio) - 0.3)
-
+                relaxed = replace(
+                    relaxed,
+                    entry_mode="breakout",
+                    breakout_vol_ratio=max(1.2, float(params.breakout_vol_ratio) - 0.3),
+                )
             return scan_swing_candidates(
                 budget_yen=budget_yen,
                 top_n=top_n,
