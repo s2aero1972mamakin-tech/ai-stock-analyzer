@@ -22,9 +22,59 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+def _stooq_symbol(ticker: str) -> str:
+    """Convert common JP tickers to Stooq symbols.
+    Examples:
+      '7868.T' -> '7868.jp'
+      '7868'   -> '7868.jp'
+      '^N225'  -> '^nkx'  (Nikkei 225 on Stooq)
+    """
+    t = str(ticker).strip()
+    if t.upper() in {"^N225", "N225", "NIKKEI"}:
+        return "^nkx"
+    if t.endswith(".T") or t.endswith(".t"):
+        return t[:-2].lower() + ".jp"
+    if re.fullmatch(r"\d{4}", t):
+        return t + ".jp"
+    return t.lower()
+
+def _period_to_start(period: str) -> pd.Timestamp:
+    """Approximate yfinance-like 'period' into start timestamp."""
+    p = (period or "1y").strip().lower()
+    now = pd.Timestamp.utcnow().normalize()
+    m = re.fullmatch(r"(\d+)(d|mo|y)", p)
+    if not m:
+        return now - pd.Timedelta(days=365)
+    n = int(m.group(1))
+    unit = m.group(2)
+    if unit == "d":
+        days = n
+    elif unit == "mo":
+        days = int(round(n * 30.5))
+    else:
+        days = int(round(n * 365.25))
+    return now - pd.Timedelta(days=days)
+
+def _fetch_stooq_ohlc(symbol: str) -> pd.DataFrame:
+    """Fetch daily OHLCV from Stooq CSV endpoint."""
+    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text))
+    if df.empty:
+        return df
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+    if "Adj Close" not in df.columns and "Close" in df.columns:
+        df["Adj Close"] = df["Close"]
+    cols = [c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in df.columns]
+    return df[cols]
+
 import pytz
 import streamlit as st
-import yfinance as yf
+import requests
+import io
 from openai import OpenAI
 
 TOKYO = pytz.timezone("Asia/Tokyo")
@@ -159,26 +209,19 @@ def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_market_data(ticker: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
-    try:
-        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False, threads=True)
-        df = _normalize_yf_df(df)
-        if isinstance(df.columns, pd.MultiIndex):
-            # sometimes single ticker still returns multi-index
-            df.columns = df.columns.droplevel(1)
-        return df.dropna()
-    except Exception:
+def get_market_data(ticker: str, period: str = "2y") -> pd.DataFrame:
+    """Get daily OHLCV for a single ticker via Stooq."""
+    symbol = _stooq_symbol(ticker)
+    df = _fetch_stooq_ohlc(symbol)
+    if df is None or df.empty:
         return pd.DataFrame()
+    start = _period_to_start(period)
+    return df[df.index >= start].copy()
 
+def get_benchmark_data(period: str = "2y") -> pd.DataFrame:
+    """Benchmark (Nikkei 225) via Stooq."""
+    return get_market_data("^N225", period=period)
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_benchmark_data(symbol: str = "^N225", period: str = "5y") -> pd.DataFrame:
-    return get_market_data(symbol, period=period, interval="1d")
-
-
-# -------------------------
-# 3) 指標計算
-# -------------------------
 def calculate_indicators(df: pd.DataFrame, include_sma200: bool = False) -> pd.DataFrame:
     """指標計算。
     重要: 6mo 等の短い期間では SMA200 が作れないため、include_sma200=False で呼ぶこと。
@@ -623,21 +666,29 @@ def _chunk(lst: List[str], n: int) -> List[List[str]]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _download_chunk_ohlcv(tickers: Tuple[str, ...], period: str = "6mo") -> pd.DataFrame:
-    # yfinance multi ticker download
-    try:
-        df = yf.download(
-            tickers=list(tickers),
-            period=period,
-            interval="1d",
-            progress=False,
-            group_by="ticker",
-            auto_adjust=False,
-            threads=True,
-        )
-        return _normalize_yf_df(df)
-    except Exception:
+    """Download OHLCV for multiple tickers via Stooq and return MultiIndex columns.
+    Columns: level0=ticker, level1=field.
+    """
+    frames: Dict[str, pd.DataFrame] = {}
+    for t in tickers:
+        df = get_market_data(t, period=period)
+        if df is None or df.empty:
+            continue
+        frames[t] = df
+
+    if not frames:
         return pd.DataFrame()
 
+    all_idx = sorted(set().union(*[set(df.index) for df in frames.values()]))
+    out = {}
+    for t, df in frames.items():
+        df2 = df.reindex(all_idx)
+        for field in df2.columns:
+            out[(t, field)] = df2[field].values
+
+    out_df = pd.DataFrame(out, index=pd.to_datetime(all_idx))
+    out_df.columns = pd.MultiIndex.from_tuples(out_df.columns, names=["Ticker", "Field"])
+    return out_df.sort_index()
 
 def _extract_one(df_multi: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if df_multi is None or df_multi.empty:
