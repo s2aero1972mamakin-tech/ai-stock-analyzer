@@ -744,52 +744,88 @@ def _download_chunk_ohlcv(tickers: Tuple[str, ...], period: str = "6mo") -> pd.D
     return out_df.sort_index()
 
 def _extract_one(df_multi: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """Extract one ticker frame from a concatenated OHLCV DataFrame.
-
-    Supports columns like:
-      - MultiIndex (ticker, field)
-      - MultiIndex (field, ticker)  (yfinance-style)
-      - single-index columns already being OHLCV
+    """
+    _download_chunk_ohlcv() で作った MultiIndex 列から、指定 ticker の OHLCV を抜き出す。
+    - 期待する列は (ticker, field) または (field, ticker) のどちらでも来うる
+    - ticker 表記ゆれ（例: 7203.T / 7203.JP / 7203）を吸収する
+    - 見つからない場合、MultiIndex 全体を返すと下流が壊れるので **空 DF** を返す
     """
     if df_multi is None or df_multi.empty:
         return pd.DataFrame()
 
-    # Try the given ticker plus a few safe aliases (e.g., "7203" -> "7203.T")
-    aliases = [ticker]
-    if isinstance(ticker, str):
-        t = ticker.strip()
-        if re.fullmatch(r"\d{4}", t):
-            aliases += [f"{t}.T", f"{t}.JP", f"{t}.jp"]
-        if t.endswith(".T"):
-            core = t[:-2]
-            if re.fullmatch(r"\d{4}", core):
-                aliases += [core, f"{core}.JP", f"{core}.jp"]
-        if t.endswith(".JP") or t.endswith(".jp"):
-            core = t[:-3]
-            if re.fullmatch(r"\d{4}", core):
-                aliases += [core, f"{core}.T"]
-
-    aliases = [a for a in aliases if a]  # drop empty
-
     cols = df_multi.columns
 
-    if isinstance(cols, pd.MultiIndex) and cols.nlevels >= 2:
-        lvl0 = cols.get_level_values(0)
-        lvl1 = cols.get_level_values(1)
+    # Single-level columns (already one ticker's frame)
+    if not isinstance(cols, pd.MultiIndex):
+        return df_multi.copy()
 
-        for a in aliases:
-            if a in lvl0:
-                out = df_multi[a].copy()
-                return out
-            if a in lvl1:
-                # yfinance-style: (field, ticker)
-                out = df_multi.xs(a, axis=1, level=1, drop_level=True).copy()
-                return out
+    def _norm(sym: str) -> str:
+        s = str(sym).strip().lower()
+        # drop common suffixes
+        s = re.sub(r"\.(t|jp|us|ns|to|l|hk|ss|sz)$", "", s)
+        # keep only first 4 digits for JP stocks if present
+        m = re.match(r"^(\d{4})", s)
+        if m:
+            return m.group(1)
+        return s.lstrip("^")
 
-    # Not multiindex or not found: assume df_multi is already a single-ticker OHLCV
-    return df_multi.copy().dropna()
+    target_norm = _norm(ticker)
+    # candidate norms: original, stripped, etc.
+    cand_norms = {target_norm, _norm(ticker.replace(".T", "")), _norm(ticker.replace(".JP", ""))}
+    cand_norms = {c for c in cand_norms if c}
 
+    # Build maps for each level
+    lvl0 = list(cols.get_level_values(0))
+    lvl1 = list(cols.get_level_values(1)) if cols.nlevels >= 2 else []
 
+    map0 = {}
+    for v in set(lvl0):
+        map0.setdefault(_norm(v), []).append(v)
+
+    map1 = {}
+    for v in set(lvl1):
+        map1.setdefault(_norm(v), []).append(v)
+
+    # try to decide layout:
+    # layout A: (ticker, field) -> level0 has tickers, level1 has fields like Open/High/Low/Close/Volume
+    # layout B: (field, ticker) -> level0 has fields, level1 has tickers
+    fields = {"open", "high", "low", "close", "volume", "adj close", "adj_close", "adjclose"}
+
+    lvl0_is_fieldish = any(_norm(v) in fields for v in lvl0)
+    lvl1_is_fieldish = any(_norm(v) in fields for v in lvl1)
+
+    # pick matching label for ticker from appropriate level
+    chosen = None
+    if lvl0_is_fieldish and not lvl1_is_fieldish:
+        # (field, ticker) => ticker in level1
+        for cn in cand_norms:
+            if cn in map1:
+                chosen = map1[cn][0]
+                break
+        if chosen is None:
+            return pd.DataFrame()
+        try:
+            out = df_multi.xs(chosen, level=1, axis=1)
+        except Exception:
+            return pd.DataFrame()
+        return out.dropna(how="all").copy()
+    else:
+        # default: (ticker, field) => ticker in level0
+        for cn in cand_norms:
+            if cn in map0:
+                chosen = map0[cn][0]
+                break
+        if chosen is None:
+            # last resort: direct match
+            if ticker in set(lvl0):
+                chosen = ticker
+            else:
+                return pd.DataFrame()
+        try:
+            out = df_multi.xs(chosen, level=0, axis=1)
+        except Exception:
+            return pd.DataFrame()
+        return out.dropna(how="all").copy()
 def _regime_is_ok() -> bool:
     bench = calculate_indicators(get_benchmark_data("^N225", period="5y"), include_sma200=True)
     if bench.empty:
