@@ -39,6 +39,12 @@ def _stooq_symbol(ticker: str) -> str:
         return t + ".jp"
     return t.lower()
 
+# Backward-compatible alias
+def _to_stooq_symbol(ticker: str) -> str:
+    return _stooq_symbol(ticker)
+
+
+
 def _period_to_start(period: str) -> pd.Timestamp:
     """Convert lookback period string (e.g. '6mo','1y','2y') to a tz-naive start timestamp (00:00)."""
     now = pd.Timestamp.utcnow().normalize()
@@ -123,11 +129,6 @@ def get_jpx_master() -> pd.DataFrame:
     df["ticker"] = df["コード"].astype(str).str.zfill(4) + ".T"
     df = df.rename(columns={"銘柄名": "name", "33業種区分": "sector"})
     return df[["ticker", "name", "sector"]].drop_duplicates().reset_index(drop=True)
-
-
-# Backward compatible alias
-def load_jpx_master() -> pd.DataFrame:
-    return get_jpx_master()
 
 
 def get_company_name(ticker: str) -> str:
@@ -224,11 +225,6 @@ def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 
-
-
-# Compatibility wrapper (older name used in some code paths)
-def _stooq_download_ohlcv(ticker: str, interval: str = "d") -> pd.DataFrame:
-    return _fetch_stooq_ohlc(ticker, interval=interval)
 def get_market_data(ticker: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
     """価格データを取得（現在は Stooq を使用）。日本株のみ前提。
 
@@ -237,7 +233,7 @@ def get_market_data(ticker: str, period: str = "6mo", interval: str = "1d") -> p
     - interval: 現状 "1d" 想定（Stooq の日足）
     """
     try:
-        stooq_symbol = _stooq_symbol(ticker)
+        stooq_symbol = _to_stooq_symbol(ticker)
         df = _fetch_stooq_ohlc(stooq_symbol)
     except Exception:
         return pd.DataFrame()
@@ -748,67 +744,50 @@ def _download_chunk_ohlcv(tickers: Tuple[str, ...], period: str = "6mo") -> pd.D
     return out_df.sort_index()
 
 def _extract_one(df_multi: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """Extract one ticker's OHLCV frame from a possibly MultiIndex columns dataframe.
+    """Extract one ticker frame from a concatenated OHLCV DataFrame.
 
-    Supports:
-      - single ticker (simple columns)
-      - yfinance multi ticker output: (PriceField, Ticker)
-      - our concatenated multi ticker output: (Ticker, PriceField)
+    Supports columns like:
+      - MultiIndex (ticker, field)
+      - MultiIndex (field, ticker)  (yfinance-style)
+      - single-index columns already being OHLCV
     """
     if df_multi is None or df_multi.empty:
         return pd.DataFrame()
 
-    t = str(ticker).strip()
-
-    if isinstance(df_multi.columns, pd.MultiIndex):
-        lvl0 = df_multi.columns.get_level_values(0).astype(str)
-        lvl1 = df_multi.columns.get_level_values(1).astype(str)
-        set0 = set(lvl0)
-        set1 = set(lvl1)
-
-        # try a few normalizations (avoid breaking existing behavior)
-        cands = [t]
+    # Try the given ticker plus a few safe aliases (e.g., "7203" -> "7203.T")
+    aliases = [ticker]
+    if isinstance(ticker, str):
+        t = ticker.strip()
+        if re.fullmatch(r"\d{4}", t):
+            aliases += [f"{t}.T", f"{t}.JP", f"{t}.jp"]
         if t.endswith(".T"):
-            cands.append(t[:-2])
-        else:
-            # if numeric code, try .T
-            if t.isdigit():
-                cands.append(f"{t}.T")
-        # also try stripping common suffixes
-        cands = list(dict.fromkeys([c.strip() for c in cands if c.strip()]))
+            core = t[:-2]
+            if re.fullmatch(r"\d{4}", core):
+                aliases += [core, f"{core}.JP", f"{core}.jp"]
+        if t.endswith(".JP") or t.endswith(".jp"):
+            core = t[:-3]
+            if re.fullmatch(r"\d{4}", core):
+                aliases += [core, f"{core}.T"]
 
-        sub = None
+    aliases = [a for a in aliases if a]  # drop empty
 
-        # (Ticker, Field) -> select by level0
-        for cand in cands:
-            if cand in set0:
-                try:
-                    sub = df_multi[cand].copy()
-                    break
-                except Exception:
-                    pass
+    cols = df_multi.columns
 
-        # (Field, Ticker) -> select by level1
-        if sub is None:
-            for cand in cands:
-                if cand in set1:
-                    try:
-                        sub = df_multi.xs(cand, axis=1, level=1).copy()
-                        break
-                    except Exception:
-                        pass
+    if isinstance(cols, pd.MultiIndex) and cols.nlevels >= 2:
+        lvl0 = cols.get_level_values(0)
+        lvl1 = cols.get_level_values(1)
 
-        if sub is None or getattr(sub, "empty", True):
-            return pd.DataFrame()
+        for a in aliases:
+            if a in lvl0:
+                out = df_multi[a].copy()
+                return out
+            if a in lvl1:
+                # yfinance-style: (field, ticker)
+                out = df_multi.xs(a, axis=1, level=1, drop_level=True).copy()
+                return out
 
-        # If still MultiIndex for some reason, flatten by taking the last level
-        if isinstance(sub.columns, pd.MultiIndex):
-            sub.columns = [str(c[-1]) for c in sub.columns.values]
-        sub.columns.name = None
-        return sub
-
-    # single ticker frame
-    return df_multi.copy()
+    # Not multiindex or not found: assume df_multi is already a single-ticker OHLCV
+    return df_multi.copy().dropna()
 
 
 def _regime_is_ok() -> bool:
@@ -1040,104 +1019,6 @@ def _score_prelim(latest: pd.Series, params: SwingParams) -> float:
     return float(50 * pb_score + 30 * vol_score + 10 * rsi_score + 10 * atr_score)
 
 
-
-# -------------------------
-# 7.5) 自動緩和（0件フォールバック）
-# -------------------------
-def _clamp(x: float, lo: float, hi: float) -> float:
-    try:
-        return float(max(lo, min(hi, x)))
-    except Exception:
-        return float(lo)
-
-def _apply_auto_relax(params: SwingParams, level: int) -> Tuple[SwingParams, Dict[str, object]]:
-    """Return relaxed params and a note dict for UI/debug.
-
-    level:
-      1) pullback→breakout に自動切替 + 主要フィルタを緩める
-      2) さらに緩める（出来高/ATR/RSI/トレンド要件）
-    """
-    note: Dict[str, object] = {"level": int(level), "changes": {}}
-    p = params
-
-    if level <= 0:
-        return p, note
-
-    # Base relax (level 1)
-    if level >= 1:
-        # switch to breakout (most important)
-        entry_mode = "breakout"
-        note["changes"]["entry_mode"] = f"{p.entry_mode} -> {entry_mode}"
-
-        # widen RSI band a bit
-        rsi_low = _clamp(p.rsi_low - 5.0, 10.0, 80.0)
-        rsi_high = _clamp(p.rsi_high + 5.0, 20.0, 90.0)
-        if rsi_low >= rsi_high:
-            rsi_low, rsi_high = 35.0, 75.0
-        note["changes"]["rsi"] = f"{p.rsi_low}-{p.rsi_high} -> {rsi_low}-{rsi_high}"
-
-        # allow more volatile names
-        atr_pct_min = _clamp(min(p.atr_pct_min, 0.8), 0.3, 10.0)
-        atr_pct_max = _clamp(max(p.atr_pct_max, 10.0), 2.0, 25.0)
-        note["changes"]["atr_pct"] = f"{p.atr_pct_min}-{p.atr_pct_max} -> {atr_pct_min}-{atr_pct_max}"
-
-        # relax liquidity a lot (stooq has sparse volume for some)
-        vol_avg20_min = float(max(0.0, p.vol_avg20_min * 0.3))
-        note["changes"]["vol_avg20_min"] = f"{p.vol_avg20_min} -> {vol_avg20_min}"
-
-        # breakout specific: lower volume ratio threshold
-        breakout_vol_ratio = float(min(p.breakout_vol_ratio, 1.2))
-        note["changes"]["breakout_vol_ratio"] = f"{p.breakout_vol_ratio} -> {breakout_vol_ratio}"
-
-        # trend requirement: loosen
-        require_sma25_over_sma75 = False
-        note["changes"]["require_sma25_over_sma75"] = f"{p.require_sma25_over_sma75} -> {require_sma25_over_sma75}"
-
-        p = replace(
-            p,
-            entry_mode=entry_mode,
-            rsi_low=float(rsi_low),
-            rsi_high=float(rsi_high),
-            atr_pct_min=float(atr_pct_min),
-            atr_pct_max=float(atr_pct_max),
-            vol_avg20_min=float(vol_avg20_min),
-            breakout_vol_ratio=float(breakout_vol_ratio),
-            require_sma25_over_sma75=bool(require_sma25_over_sma75),
-        )
-
-    # Extra relax (level 2)
-    if level >= 2:
-        rsi_low = 30.0
-        rsi_high = 80.0
-        atr_pct_min = 0.3
-        atr_pct_max = 15.0
-        vol_avg20_min = float(max(0.0, p.vol_avg20_min * 0.33))
-        breakout_vol_ratio = 1.0
-        require_sma25_over_sma75 = False
-
-        note["changes"]["level2"] = {
-            "rsi": f"-> {rsi_low}-{rsi_high}",
-            "atr_pct": f"-> {atr_pct_min}-{atr_pct_max}",
-            "vol_avg20_min": f"-> {vol_avg20_min}",
-            "breakout_vol_ratio": f"-> {breakout_vol_ratio}",
-            "require_sma25_over_sma75": f"-> {require_sma25_over_sma75}",
-        }
-
-        p = replace(
-            p,
-            rsi_low=float(rsi_low),
-            rsi_high=float(rsi_high),
-            atr_pct_min=float(atr_pct_min),
-            atr_pct_max=float(atr_pct_max),
-            vol_avg20_min=float(vol_avg20_min),
-            breakout_vol_ratio=float(breakout_vol_ratio),
-            require_sma25_over_sma75=bool(require_sma25_over_sma75),
-        )
-
-    return p, note
-
-
-
 def scan_swing_candidates(
     budget_yen: int = 300_000,
     top_n: int = 3,
@@ -1157,29 +1038,15 @@ def scan_swing_candidates(
         "regime_ok": bool,
         "candidates": [ {ticker,name,price,rsi,score_pre, bt:{...}} ...] (top_n)
         "prelim_count": int,
-        "bt_count": int, "universe": int(len(tickers)), "selected_sectors": selected_sectors, "sector_ranking": sector_rank_records, "relax_level": int(relax_level), "params_effective": (params.__dict__ if hasattr(params, "__dict__") else {}), "filter_stats": stats
+        "bt_count": int
       }
     """
     params = params or SwingParams()
 
 
-
-    # --- ユニバース（JPX銘柄マスター）---
-    master_all = load_jpx_master()
-    if master_all is None or getattr(master_all, "empty", True):
-        return {
-            "regime_ok": True,
-            "candidates": [],
-            "prelim_count": 0,
-            "bt_count": 0,
-            "selected_sectors": [],
-            "sector_ranking": [],
-            "relax_level": int(relax_level),
-            "params_effective": (params.__dict__ if hasattr(params, "__dict__") else {}),
-            "filter_stats": {"error": "JPX銘柄マスターの取得に失敗しました"},
-            "universe": 0,
-            "error": "JPXマスター取得に失敗しました",
-        }
+    master_all = get_jpx_master()
+    if master_all.empty:
+        return {"regime_ok": True, "candidates": [], "prelim_count": 0, "bt_count": 0, "selected_sectors": [], "sector_ranking": [], "error": "JPXマスター取得に失敗しました"}
 
     # --- セクター事前絞り込み（任意）---
     sector_rank_records: List[Dict[str, object]] = []
