@@ -16,6 +16,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pytz
 import streamlit as st
+import datetime
 
 import logic
 
@@ -115,6 +116,20 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("🚀 全銘柄スキャン")
 scan_label = "🔥 スキャン開始（セクター→銘柄スキャン）" if sector_prefilter else "🔥 スキャン開始（JPX全銘柄）"
 scan_btn = st.sidebar.button(scan_label, type="primary")
+# ---- last scan diagnostics (persist across reruns) ----
+if "last_scan_diag" in st.session_state:
+    with st.sidebar.expander("🧾 前回スキャン診断（filter_stats）", expanded=False):
+        st.caption(st.session_state["last_scan_diag"].get("timestamp", ""))
+        st.json(st.session_state["last_scan_diag"].get("filter_stats", {}))
+        if st.session_state["last_scan_diag"].get("auto_relax_trace"):
+            st.markdown("**auto_relax_trace**")
+            st.json(st.session_state["last_scan_diag"]["auto_relax_trace"])
+        if st.session_state["last_scan_diag"].get("params_effective"):
+            st.markdown("**params_effective**")
+            st.json(st.session_state["last_scan_diag"]["params_effective"])
+        if st.session_state["last_scan_diag"].get("mode"):
+            st.markdown(f"**mode**: `{st.session_state['last_scan_diag']['mode']}`")
+
 
 # OpenAI key (optional)
 st.sidebar.markdown("---")
@@ -149,6 +164,19 @@ if scan_btn:
             sector_method=str(sector_method_key),
             api_key=(api_key if sector_method_key == "ai_overlay" else None),
         )
+
+
+        # Persist diagnostics (kept even after st.rerun())
+        try:
+            st.session_state["last_scan_diag"] = {
+                "timestamp": str(datetime.datetime.now()),
+                "mode": res.get("mode"),
+                "filter_stats": res.get("filter_stats", {}),
+                "params_effective": res.get("params_effective", {}),
+                "auto_relax_trace": res.get("auto_relax_trace", []),
+            }
+        except Exception:
+            pass
 
         st.session_state.scan_meta = res
         candidates = res.get("candidates", [])
