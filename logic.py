@@ -19,6 +19,7 @@ import re
 import time
 from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, Optional, Tuple
+import dataclasses
 
 import numpy as np
 import pandas as pd
@@ -1001,3 +1002,4 @@ PF={ctx.get('pf')}, AvgR={ctx.get('avg_r')}, WinRate={ctx.get('win_rate')}, MaxD
 この銘柄を保有している前提で、優先すべきリスク管理と、追加/撤退判断を提案してください。
 """,
     )
+
