@@ -27,6 +27,9 @@ TOKYO = pytz.timezone("Asia/Tokyo")
 import inspect
 import dataclasses
 
+
+APP_BUILD = "2026-02-26T05:48:29Z / diagfix"
+
 def _st_plotly(fig, **kwargs):
     """plotly_chart wrapper for Streamlit versions without use_container_width."""
     try:
@@ -133,6 +136,7 @@ def render_diag_sidebar(ph):
 # Sidebar: Settings
 # -------------------------
 st.sidebar.header("⚙️ スキャン設定（期待値最大化）")
+st.sidebar.caption(f"build: {APP_BUILD}")
 
 capital = st.sidebar.number_input("運用軍資金（円）", value=300000, step=10000, min_value=10000)
 risk_pct = st.sidebar.slider("1トレード許容損失（%）", min_value=0.5, max_value=10.0, value=2.0, step=0.5)
@@ -279,6 +283,12 @@ if scan_btn:
                 "auto_relax_trace": res.get("auto_relax_trace", []),
                 "error": res.get("error"),
             }
+        except Exception:
+            pass
+
+        # Update sidebar diagnostic panel immediately in this run
+        try:
+            render_diag_sidebar(diag_ph)
         except Exception:
             pass
 
