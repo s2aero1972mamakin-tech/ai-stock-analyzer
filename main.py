@@ -19,6 +19,7 @@ import streamlit as st
 import datetime
 
 import logic
+import json
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
@@ -129,6 +130,14 @@ if "last_scan_diag" in st.session_state:
             st.json(st.session_state["last_scan_diag"]["params_effective"])
         if st.session_state["last_scan_diag"].get("mode"):
             st.markdown(f"**mode**: `{st.session_state['last_scan_diag']['mode']}`")
+        diag = st.session_state.get('last_scan_diag', {})
+        try:
+            ts = str(diag.get('timestamp','latest'))
+            safe_ts = ts.replace(':','').replace(' ','_').replace('/','-')
+            diag_json = json.dumps(diag, ensure_ascii=False, indent=2, default=str)
+            st.download_button('⬇️ 診断JSONをダウンロード', data=diag_json, file_name=f'scan_diag_{safe_ts}.json', mime='application/json')
+        except Exception as e:
+            st.caption(f'診断JSONの生成に失敗: {e}')
 
 
 # OpenAI key (optional)
@@ -217,6 +226,20 @@ if scan_btn:
                         "fail_data_short","fail_budget","fail_trend","fail_rsi","fail_atr","fail_vol","fail_setup"]
                 compact = {k: stats.get(k) for k in keys if k in stats}
                 st.sidebar.json(compact)
+            # ダウンロード用（診断JSON）
+            try:
+                ts_local = datetime.now().strftime('%Y%m%d_%H%M%S')
+                diag = {
+                    'timestamp': ts_local,
+                    'mode': str(mode_key),
+                    'relax_level': int(relax_level),
+                    'params_effective': params_eff,
+                    'filter_stats': stats,
+                }
+                diag_json = json.dumps(diag, ensure_ascii=False, indent=2, default=str)
+                st.sidebar.download_button('⬇️ この診断JSONをダウンロード', data=diag_json, file_name=f'scan_diag_{ts_local}.json', mime='application/json')
+            except Exception as e:
+                st.sidebar.caption(f'診断JSONの生成に失敗: {e}')
 
             st.sidebar.markdown("---")
             st.sidebar.markdown("**0件になりやすい原因（この順で試してください）**")
