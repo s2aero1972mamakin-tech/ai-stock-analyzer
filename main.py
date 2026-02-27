@@ -30,7 +30,7 @@ def _st_plotly(fig, **kwargs):
     """plotly_chart wrapper for Streamlit versions without use_container_width."""
     try:
         if "use_container_width" in inspect.signature(st.plotly_chart).parameters:
-            return st.plotly_chart(fig, use_container_width=True, **kwargs)
+            return st.plotly_chart(fig, width='stretch', **kwargs)
     except Exception:
         pass
     return st.plotly_chart(fig, **kwargs)
@@ -57,6 +57,48 @@ def _init_state():
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
+
+
+def _render_scan_diag_sidebar(*, expanded: bool = False, title: str = "🧾 スキャン診断JSON"):
+    """サイドバーに診断JSONを表示＋ダウンロードボタンを出す。
+    重要：scanボタン押下直後の“同一実行”でも表示できるよう、scan処理の後でも呼べるようにする。
+    """
+    diag = st.session_state.get("last_scan_diag")
+    if not isinstance(diag, dict) or not diag:
+        return
+
+    with st.sidebar.expander(title, expanded=expanded):
+        st.caption(diag.get("timestamp", ""))
+        st.json(diag.get("filter_stats", {}) or {})
+        if diag.get("auto_relax_trace"):
+            st.markdown("**auto_relax_trace**")
+            st.json(diag.get("auto_relax_trace") or [])
+        if diag.get("params_effective"):
+            st.markdown("**params_effective**")
+            st.json(diag.get("params_effective") or {})
+        if diag.get("mode"):
+            st.markdown(f"**mode**: `{diag.get('mode','')}`")
+        if diag.get("relax_level") is not None:
+            st.markdown(f"**relax_level**: `{diag.get('relax_level')}`")
+        if diag.get("selected_sectors"):
+            st.markdown("**selected_sectors**")
+            st.json(diag.get("selected_sectors") or [])
+
+        # download
+        try:
+            ts = str(diag.get("timestamp", "latest"))
+            safe_ts = ts.replace(":", "").replace(" ", "_").replace("/", "-")
+            diag_json = json.dumps(diag, ensure_ascii=False, indent=2, default=str)
+            st.download_button(
+                "⬇️ 診断JSONをダウンロード",
+                data=diag_json,
+                file_name=f"scan_diag_{safe_ts}.json",
+                mime="application/json",
+                key=f"dl_diag_{safe_ts}",
+            )
+        except Exception as e:
+            st.caption(f"診断JSONの生成に失敗: {e}")
 
 _init_state()
 
@@ -128,59 +170,8 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("🚀 全銘柄スキャン")
 scan_label = "🔥 スキャン開始（セクター→銘柄スキャン）" if sector_prefilter else "🔥 スキャン開始（JPX全銘柄）"
 scan_btn = st.sidebar.button(scan_label, type="primary")
-
 # ---- last scan diagnostics (persist across reruns) ----
-st.sidebar.markdown("---")
-st.sidebar.subheader("🧾 診断JSON")
-
-diag = st.session_state.get("last_scan_diag")
-if isinstance(diag, dict) and diag:
-    ts = str(diag.get("timestamp", "latest"))
-    safe_ts = ts.replace(":", "").replace(" ", "_").replace("/", "-")
-
-    with st.sidebar.expander("🧾 前回スキャン診断（概要/統計/条件）", expanded=False):
-        st.caption(ts)
-        if diag.get("mode"):
-            st.markdown(f"**mode**: `{diag.get('mode')}`")
-        if diag.get("relax_level") is not None:
-            st.markdown(f"**relax_level**: `{diag.get('relax_level')}`")
-        if diag.get("selected_sectors"):
-            st.markdown("**selected_sectors**")
-            st.json(diag.get("selected_sectors", []))
-        if diag.get("filter_stats"):
-            st.markdown("**filter_stats**")
-            st.json(diag.get("filter_stats", {}))
-        if diag.get("params_effective"):
-            st.markdown("**params_effective**")
-            st.json(diag.get("params_effective", {}))
-        if diag.get("auto_relax_trace"):
-            st.markdown("**auto_relax_trace**")
-            st.json(diag.get("auto_relax_trace", []))
-
-    # ALWAYS show the download button in the sidebar (not in the main panel).
-    try:
-        diag_json = json.dumps(diag, ensure_ascii=False, indent=2, default=str)
-        st.sidebar.download_button(
-            "⬇️ 診断JSONをダウンロード",
-            data=diag_json,
-            file_name=f"scan_diag_{safe_ts}.json",
-            mime="application/json",
-        )
-    except Exception as e:
-        st.sidebar.caption(f"診断JSONの生成に失敗: {e}")
-
-    if st.sidebar.button("🧹 診断をクリア", help="前回診断を消します（スキャン結果は消えません）"):
-        st.session_state.pop("last_scan_diag", None)
-        st.rerun()
-else:
-    st.sidebar.caption("まだ診断JSONはありません。スキャン後にここに表示されます。")
-    st.sidebar.download_button(
-        "⬇️ 診断JSONをダウンロード",
-        data="{}",
-        file_name="scan_diag_empty.json",
-        mime="application/json",
-        disabled=True,
-    )
+_render_scan_diag_sidebar(expanded=False)
 
 
 # OpenAI key (optional)
@@ -204,8 +195,7 @@ if scan_btn:
             progress_bar.progress(pct)
             status_text.text(f"🔍 {info} ({current}/{total})")
 
-        try:
-            res = logic.scan_swing_candidates(
+        res = logic.scan_swing_candidates(
             budget_yen=int(budget),
             top_n=3,
             params=params,
@@ -217,24 +207,6 @@ if scan_btn:
             sector_method=str(sector_method_key),
             api_key=(api_key if sector_method_key == "ai_overlay" else None),
         )
-        except Exception as e:
-            # keep UI alive and persist diagnostics
-            status.update(label="❌ スキャン中に例外が発生しました", state="error", expanded=True)
-            st.exception(e)
-            res = {
-                "regime_ok": True,
-                "candidates": [],
-                "prelim_count": 0,
-                "bt_count": 0,
-                "selected_sectors": [],
-                "sector_ranking": [],
-                "universe": 0,
-                "filter_stats": {"error": str(e)},
-                "auto_relax_trace": [],
-                "error": str(e),
-                "params_effective": {"entry_mode": entry_mode_key},
-                "relax_level": 0,
-            }
 
 
         # Persist diagnostics (kept even after st.rerun())
@@ -250,6 +222,9 @@ if scan_btn:
             }
         except Exception:
             pass
+
+        # show diag immediately in sidebar (same run)
+        _render_scan_diag_sidebar(expanded=True, title='🧾 今回スキャン診断JSON')
 
         st.session_state.scan_meta = res
         candidates = res.get("candidates", [])
