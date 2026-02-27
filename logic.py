@@ -72,79 +72,56 @@ def _period_to_start(period: str) -> pd.Timestamp:
         start = start.tz_convert(None)
     return start
 
-def _fetch_stooq_ohlc(
-    symbol: str,
-    start: Optional[datetime.date] = None,
-    end: Optional[datetime.date] = None,
-    retry_count: int = 3,
-    pause: float = 0.25,
-    session: Optional[requests.Session] = None,
-) -> pd.DataFrame:
+def _fetch_stooq_ohlc(symbol: str) -> pd.DataFrame:
     """Fetch daily OHLCV from Stooq CSV endpoint.
-
-    Uses optional date range parameters (d1/d2) to reduce payload size.
-    - base endpoint: https://stooq.com/q/d/l/
-    - params: s=<symbol>, i=d, d1=YYYYMMDD, d2=YYYYMMDD
+    - Returns empty DataFrame on failure.
+    - The last request status/error is stored in _LAST_STOOQ_META (see _snapshot_stooq_meta()).
     """
-    base_url = "https://stooq.com/q/d/l/"
-    sess = session or _STOOQ_SESSION
+    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+    try:
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        _LAST_STOOQ_META.update({
+            "ok": True,
+            "status": int(getattr(r, "status_code", 0) or 0),
+            "url": url,
+            "error": None,
+            "bytes": len(r.text) if hasattr(r, "text") else None,
+        })
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+    except Exception as e:
+        _LAST_STOOQ_META.update({"ok": False, "status": None, "url": url, "error": str(e), "bytes": None})
+        return pd.DataFrame()
 
-    params = {"s": symbol, "i": "d"}
-    if start is not None:
-        try:
-            params["d1"] = pd.Timestamp(start).strftime("%Y%m%d")
-        except Exception:
-            pass
-    if end is not None:
-        try:
-            params["d2"] = pd.Timestamp(end).strftime("%Y%m%d")
-        except Exception:
-            pass
-
-    last_exc: Optional[Exception] = None
-    for attempt in range(int(max(0, retry_count)) + 1):
-        try:
-            r = sess.get(
-                base_url,
-                params=params,
-                timeout=(10, 25),
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            r.raise_for_status()
-            df = pd.read_csv(io.StringIO(r.text))
-            if df.empty:
-                return df
-            if "Date" not in df.columns:
-                return pd.DataFrame()
-
-            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-            df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-
-            if "Adj Close" not in df.columns and "Close" in df.columns:
-                df["Adj Close"] = df["Close"]
-
-            cols = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
-            return df[cols]
-        except Exception as e:
-            last_exc = e
-            if attempt < int(max(0, retry_count)):
-                # exponential backoff with jitter-ish
-                try:
-                    time.sleep(float(pause) * (2 ** attempt))
-                except Exception:
-                    pass
-                continue
-            return pd.DataFrame()
-
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if "Date" not in df.columns:
+        return pd.DataFrame()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+    if "Adj Close" not in df.columns and "Close" in df.columns:
+        df["Adj Close"] = df["Close"]
+    cols = [c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in df.columns]
+    return df[cols]
 
 import pytz
 import streamlit as st
 import requests
 import io
-import time
 from openai import OpenAI
 
 TOKYO = pytz.timezone("Asia/Tokyo")
+
+
+# --- Stooq diagnostics (to make scan failures visible) ---
+_LAST_STOOQ_META = {"ok": None, "status": None, "url": None, "error": None, "bytes": None}
+
+
+def _snapshot_stooq_meta() -> dict:
+    """Return a shallow copy of the last Stooq request meta."""
+    return dict(_LAST_STOOQ_META)
+
+
 
 
 # -------------------------
@@ -275,6 +252,7 @@ def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 
 def get_market_data(ticker: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
     """価格データを取得（現在は Stooq を使用）。日本株のみ前提。
@@ -283,24 +261,11 @@ def get_market_data(ticker: str, period: str = "6mo", interval: str = "1d") -> p
     - period: "6mo", "1y", "2y" など
     - interval: 現状 "1d" 想定（Stooq の日足）
     """
-    # Determine desired date window first (to reduce payload)
-    start_ts = _period_to_start(period)
-    try:
-        start_date = pd.Timestamp(start_ts).date()
-    except Exception:
-        start_date = None
-
-    try:
-        end_date = datetime.datetime.now(TOKYO).date()
-    except Exception:
-        end_date = None
-
     try:
         stooq_symbol = _to_stooq_symbol(ticker)
-        df = _fetch_stooq_ohlc(stooq_symbol, start=start_date, end=end_date)
+        df = _fetch_stooq_ohlc(stooq_symbol)
     except Exception:
         return pd.DataFrame()
-
 
     if df is None or df.empty:
         return pd.DataFrame()
@@ -342,19 +307,11 @@ def get_benchmark_data(ticker: str = "^N225", period: str = "2y") -> pd.DataFram
 def calculate_indicators(df: pd.DataFrame, include_sma200: bool = False) -> pd.DataFrame:
     """指標計算。
     重要: 6mo 等の短い期間では SMA200 が作れないため、include_sma200=False で呼ぶこと。
-
-    追加（安定化）:
-    - 売買代金（TURNOVER = Close*Volume）とその20日平均を計算（流動性フィルタ用）
     """
     if df is None or df.empty:
         return pd.DataFrame()
 
     d = df.copy()
-
-    # Guard: ensure required columns exist
-    for col in ("Open", "High", "Low", "Close", "Volume"):
-        if col not in d.columns:
-            return pd.DataFrame()
 
     # SMAs
     for w in (5, 10, 25, 75):
@@ -362,7 +319,7 @@ def calculate_indicators(df: pd.DataFrame, include_sma200: bool = False) -> pd.D
     if include_sma200:
         d["SMA_200"] = d["Close"].rolling(window=200).mean()
 
-    # RSI(14) - EWMA smoothing
+    # RSI(14)
     delta = d["Close"].diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
@@ -386,27 +343,17 @@ def calculate_indicators(df: pd.DataFrame, include_sma200: bool = False) -> pd.D
     d["SMA25_SLOPE5"] = d["SMA_25"].pct_change(5) * 100
     d["SMA75_SLOPE10"] = d["SMA_75"].pct_change(10) * 100
 
-    # Liquidity (shares)
+    # Volume
     d["VOL_AVG_20"] = d["Volume"].rolling(window=20).mean()
     d["VOL_RATIO"] = d["Volume"] / d["VOL_AVG_20"]
-
-    # Liquidity (JPY turnover)
-    d["TURNOVER"] = d["Close"] * d["Volume"]
-    d["TURNOVER_AVG_20"] = d["TURNOVER"].rolling(window=20).mean()
-    d["TURNOVER_RATIO"] = d["TURNOVER"] / d["TURNOVER_AVG_20"]
 
     # Range
     d["HIGH_20"] = d["High"].rolling(20).max()
     d["LOW_20"] = d["Low"].rolling(20).min()
 
     # dropna only on required columns (avoid wiping out short-period data)
-    base_cols = [
-        "Close", "High", "Low", "Volume",
-        "SMA_25", "SMA_75", "RSI", "ATR", "ATR_PCT",
-        "SMA_DIFF", "VOL_AVG_20", "VOL_RATIO",
-        "TURNOVER_AVG_20", "TURNOVER_RATIO",
-        "HIGH_20", "LOW_20", "SMA25_SLOPE5", "SMA75_SLOPE10",
-    ]
+    base_cols = ["Close", "High", "Low", "Volume", "SMA_25", "SMA_75", "RSI", "ATR", "ATR_PCT",
+                 "SMA_DIFF", "VOL_AVG_20", "VOL_RATIO", "HIGH_20", "LOW_20", "SMA25_SLOPE5", "SMA75_SLOPE10"]
     if include_sma200:
         base_cols.append("SMA_200")
 
@@ -429,52 +376,33 @@ def judge_condition(price: float, sma5: float, sma25: float, sma75: float, rsi: 
 # -------------------------
 @dataclass(frozen=True)
 class SwingParams:
-    # --------------------
-    # Entry / Universe filters
-    # --------------------
+    # entry filters
     rsi_low: float = 40.0
     rsi_high: float = 65.0
-
-    # Pullback (SMA25乖離 %)
-    pullback_low: float = -6.0     # 下限（より下げ過ぎは避ける）
-    pullback_high: float = -1.0    # 上限
-
-    # Volatility (ATR% = ATR/Close*100)
+    pullback_low: float = -6.0     # SMA25乖離の下限（より下げ過ぎは避ける）
+    pullback_high: float = -1.0    # SMA25乖離の上限
     atr_pct_min: float = 1.0
     atr_pct_max: float = 6.0
+    vol_avg20_min: float = 100_000.0
 
-    # Liquidity filters
-    vol_avg20_min: float = 100_000.0          # 出来高（株数）20日平均の下限（後方互換）
-    turnover_avg20_min_yen: float = 0.0       # 売買代金（円）20日平均の下限（0で無効）
-
-    # Trend filters
+    # trend filters
     require_sma25_over_sma75: bool = True
-    regime_filter: bool = False               # Trueなら「N225がSMA200上」のときだけロング候補を出す（0件時はauto-relaxでOFF化）
 
-    # Entry trigger type: "pullback" or "breakout"
+    # entry trigger type: "pullback" or "breakout"
     entry_mode: str = "pullback"
 
-    # Pullback trigger relaxation (頻度を落としすぎないための安全弁)
-    pullback_allow_sma5_trigger: bool = True  # Close>昨日高 だけでなく Close>SMA5 でも可（勝率はStage2で選別）
-
-    # Exit rules
+    # exit rules
     atr_mult_stop: float = 1.5
     tp1_r: float = 1.0
     tp2_r: float = 3.0
     time_stop_days: int = 10
 
-    # Breakout config
+    # breakout config
     breakout_lookback: int = 20
     breakout_vol_ratio: float = 1.5
 
-    # Backtest / ranking stabilization
-    min_trades_bt: int = 8                   # 少数トレードの“事故”を除外
-    score_shrink_k: float = 20.0             # expectancy の縮小係数（大きいほど少数トレードを強く抑制）
-    score_pf_clip: float = 4.0               # PF上限（inf対策）
-    score_dd_ref: float = 0.20               # DD罰則の基準（20%）
-
-    # Risk sizing (UI can override)
-    risk_pct: float = 2.0
+    # risk sizing
+    risk_pct: float = 2.0  # for position sizing (UI can override)
 
 
 # -------------------------
@@ -818,6 +746,7 @@ def _chunk(lst: List[str], n: int) -> List[List[str]]:
     return [lst[i : i + n] for i in range(0, len(lst), n)]
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def _download_chunk_ohlcv(tickers: Tuple[str, ...], period: str = "6mo") -> pd.DataFrame:
     """Download OHLCV for multiple tickers via Stooq and return MultiIndex columns.
     Columns: level0=ticker, level1=field.
@@ -958,53 +887,27 @@ def _parse_sector_list(text: str, allowed: List[str]) -> List[str]:
     return out
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def rank_sectors_quant(
     budget_yen: int,
     vol_avg20_min: float,
-    turnover_avg20_min_yen: float = 0.0,
     period: str = "6mo",
     lookback_days: int = 63,      # 約3ヶ月
-    reps_per_sector: int = 30,     # 各セクターからサンプルする最大銘柄数（多いほど精度↑・重さ↑）
+    reps_per_sector: int = 30,     # 各セクター代表銘柄数（多いほど精度↑・重さ↑）
     min_reps: int = 8,             # セクター評価に必要な最小サンプル
 ) -> pd.DataFrame:
     """
-    数値で“強いセクター（相対強度）”を作る（安定版）:
-    - 各セクターから「ティッカー順の先頭」ではなく、セクター内を“均等サンプル”して代表を作る（偏り低減）
+    「AIで未来を当てる」ではなく、まずは数値で“強いセクター（相対強度）”を作る。
+    - 各セクターから代表銘柄(reps)を抽出
     - 3ヶ月リターン（中央値）とボラ（標準偏差）でスコア化
-    - 予算（100株）と流動性（出来高 / 売買代金）を反映（実際に買える範囲に寄せる）
+    - 予算（100株）と出来高下限も反映（あなたが実際に買える範囲に寄せる）
     """
     master = get_jpx_master()
     if master.empty:
         return pd.DataFrame()
 
-    # per-sector ticker list
-    sector_map: Dict[str, List[str]] = {}
-    for _, r in master.iterrows():
-        sector_map.setdefault(str(r["sector"]), []).append(str(r["ticker"]))
-    for k in list(sector_map.keys()):
-        sector_map[k] = sorted(list(dict.fromkeys(sector_map[k])))
-
-    def _sample_even(lst: List[str], k: int) -> List[str]:
-        if not lst:
-            return []
-        if len(lst) <= k:
-            return lst
-        idxs = np.linspace(0, len(lst) - 1, k).astype(int)
-        idxs = sorted(set(int(i) for i in idxs))
-        return [lst[i] for i in idxs]
-
-    # cap sampling size for safety
-    k_per_sector = int(min(max(int(reps_per_sector), 15), 60))
-
-    reps_rows: List[Tuple[str, str]] = []  # (ticker, sector)
-    rep_tickers: List[str] = []
-    for sector, lst in sector_map.items():
-        sampled = _sample_even(lst, k_per_sector)
-        for t in sampled:
-            reps_rows.append((t, sector))
-            rep_tickers.append(t)
-
-    rep_tickers = list(dict.fromkeys(rep_tickers))
+    reps = master.sort_values("ticker").groupby("sector", as_index=False).head(reps_per_sector).copy()
+    rep_tickers = reps["ticker"].tolist()
     if not rep_tickers:
         return pd.DataFrame()
 
@@ -1015,21 +918,19 @@ def rank_sectors_quant(
     if len(bench_close) > lookback_days:
         bench_ret = float(bench_close.iloc[-1] / bench_close.iloc[-lookback_days - 1] - 1)
 
-    # sector -> list of (ret, vol, vol_avg20, turnover_avg20)
-    bucket: Dict[str, List[Tuple[float, float, float, float]]] = {}
+    # sector -> list of (ret, vol, vol_avg20)
+    bucket: Dict[str, List[Tuple[float, float, float]]] = {}
 
+    # debug stats for sector ranking (kept minimal)
     stats = {
-        "rep_total": len(rep_tickers),
-        "budget_ok": 0,
-        "fail_budget": 0,
-        "data_ok": 0,
-        "fail_data_short": 0,
-        "fail_liquidity": 0,
+        'rep_total': len(rep_tickers),
+        'budget_ok': 0,
+        'fail_budget': 0,
+        'data_ok': 0,
+        'fail_data_short': 0,
     }
 
-    # map ticker->sector for quick lookup
-    t2s = {t: s for t, s in reps_rows}
-
+    # download reps in chunks
     for c in _chunk(rep_tickers, 50):
         df_multi = _download_chunk_ohlcv(tuple(c), period=period)
         if df_multi is None or df_multi.empty:
@@ -1040,13 +941,12 @@ def rank_sectors_quant(
             if df_t is None or df_t.empty:
                 continue
 
+            # need enough bars for vol + lookback + vol_avg20
             if len(df_t) < max(lookback_days + 5, 25):
-                stats["fail_data_short"] += 1
                 continue
 
             close = df_t["Close"].dropna()
             if len(close) <= lookback_days:
-                stats["fail_data_short"] += 1
                 continue
 
             price = float(close.iloc[-1])
@@ -1055,19 +955,12 @@ def rank_sectors_quant(
 
             # 100株が予算内
             if price * 100 > budget_yen:
-                stats["fail_budget"] += 1
+                stats['fail_budget'] += 1
                 continue
-            stats["budget_ok"] += 1
+            stats['budget_ok'] += 1
 
             vol_avg20 = float(df_t["Volume"].rolling(20).mean().iloc[-1])
-            turnover_avg20 = float((df_t["Close"] * df_t["Volume"]).rolling(20).mean().iloc[-1])
-
-            # liquidity gates
-            if not np.isfinite(vol_avg20) or vol_avg20 < float(vol_avg20_min):
-                stats["fail_liquidity"] += 1
-                continue
-            if float(turnover_avg20_min_yen) > 0 and (not np.isfinite(turnover_avg20) or turnover_avg20 < float(turnover_avg20_min_yen)):
-                stats["fail_liquidity"] += 1
+            if not np.isfinite(vol_avg20) or vol_avg20 < vol_avg20_min:
                 continue
 
             ret_3m = float(close.iloc[-1] / close.iloc[-lookback_days - 1] - 1)
@@ -1077,24 +970,23 @@ def rank_sectors_quant(
             if not np.isfinite(vol):
                 continue
 
-            sector = str(t2s.get(t, ""))
-            if not sector:
+            # sector lookup
+            sector_row = master[master["ticker"] == t]
+            if sector_row.empty:
                 continue
-
-            bucket.setdefault(sector, []).append((ret_3m, vol, vol_avg20, turnover_avg20))
-            stats["data_ok"] += 1
+            sector = str(sector_row.iloc[0]["sector"])
+            bucket.setdefault(sector, []).append((ret_3m, vol, vol_avg20))
 
     rows = []
     for sector, arr in bucket.items():
-        if len(arr) < int(min_reps):
+        if len(arr) < min_reps:
             continue
         ret_med = float(np.median([a[0] for a in arr]))
         vol_med = float(np.median([a[1] for a in arr]))
         vol_med20 = float(np.median([a[2] for a in arr]))
-        to_med20 = float(np.median([a[3] for a in arr]))
         excess = float(ret_med - bench_ret) if np.isfinite(bench_ret) else ret_med
 
-        # score: relative strength (excess) primarily, lightly penalize volatility
+        # スコア：相対強度（超過リターン）を主に、ボラで軽く罰則
         score = excess * 100.0 - vol_med * 50.0
 
         rows.append(
@@ -1105,7 +997,6 @@ def rank_sectors_quant(
                 "excess_vs_n225_3m": excess,
                 "vol_3m": vol_med,
                 "vol_avg20": vol_med20,
-                "turnover_avg20_yen": to_med20,
                 "score": score,
             }
         )
@@ -1115,11 +1006,13 @@ def rank_sectors_quant(
         return out
 
     out = out.sort_values("score", ascending=False).reset_index(drop=True)
+    # attach stats for optional UI display
     try:
-        out.attrs["rank_stats"] = stats
+        out.attrs['rank_stats'] = stats
     except Exception:
         pass
     return out
+
 
 def select_hot_sectors(
     sector_rank: pd.DataFrame,
@@ -1164,131 +1057,32 @@ def select_hot_sectors(
         return quant[:top_n]
     return sectors_ai[:top_n]
 
-def _score_prelim(
-    latest: pd.Series,
-    params: SwingParams,
-    *,
-    prev_high: Optional[float] = None,
-    pullback_trigger: str = "yday_high",  # "yday_high" or "sma5"
-) -> float:
-    """バックテスト前の事前スコア（軽い優先度付け）。
-    目的は「Stage2に回す上位Kの質を上げる」ことであり、最終判断はバックテストに委ねる。
-
-    - pullback: 乖離の“ちょうど良さ” + 流動性 + 過熱しないRSI + 低〜中ボラ + トレンド強度
-    - breakout : ブレイク余裕（ATR基準） + 流動性 + トレンド強度 + RSI + ATR%
-
-    Args:
-        latest: indicators計算済みの最終行
-        prev_high: breakoutの直近高値（当日を含めない）
-        pullback_trigger: pullbackのトリガー種別（スコアに微小反映）
+def _score_prelim(latest: pd.Series, params: SwingParams) -> float:
     """
-
-    def sf(x, default=np.nan) -> float:
-        try:
-            v = float(x)
-            return v if np.isfinite(v) else float(default)
-        except Exception:
-            return float(default)
-
-    mode = str(getattr(params, "entry_mode", "pullback"))
-    close = sf(latest.get("Close", np.nan))
-    rsi = sf(latest.get("RSI", np.nan))
-    atr = sf(latest.get("ATR", np.nan))
-    atr_pct = sf(latest.get("ATR_PCT", np.nan))
-    sma_diff = sf(latest.get("SMA_DIFF", np.nan))
-    vol_ratio = sf(latest.get("VOL_RATIO", 1.0), default=1.0)
-    to_ratio = sf(latest.get("TURNOVER_RATIO", np.nan))
-
-    # Liquidity score (prefer turnover_ratio when available)
-    liq_ratio = to_ratio if np.isfinite(to_ratio) else vol_ratio
-    liq_score = min(2.0, max(0.0, liq_ratio)) / 2.0  # 0..1
-
-    # Trend strength: (SMA25/SMA75 - 1) capped
-    sma25 = sf(latest.get("SMA_25", np.nan))
-    sma75 = sf(latest.get("SMA_75", np.nan))
-    ts = 0.0
-    if np.isfinite(sma25) and np.isfinite(sma75) and sma75 > 0:
-        ts = max(0.0, min(0.20, (sma25 / sma75) - 1.0)) / 0.20  # 0..1
-
-    # RSI score (centered)
-    rsi_center = (float(params.rsi_low) + float(params.rsi_high)) / 2.0
-    rsi_span = max(5.0, float(params.rsi_high) - float(params.rsi_low))
-    rsi_score_center = 1.0 - min(1.0, abs(rsi - rsi_center) / (rsi_span / 2.0 + 5.0))
-
-    # ATR score: prefer lower within range (too高いと飛びやすい)
-    if float(params.atr_pct_max) > float(params.atr_pct_min):
-        atr_score_low = 1.0 - min(
-            1.0,
-            max(0.0, atr_pct - float(params.atr_pct_min)) / max(0.5, float(params.atr_pct_max) - float(params.atr_pct_min)),
-        )
-    else:
-        atr_score_low = 0.5
-
-    if mode == "pullback":
-        pb_center = (float(params.pullback_low) + float(params.pullback_high)) / 2.0
-        pb_span = max(1.0, abs(float(params.pullback_low) - float(params.pullback_high)))
-        pb_score = 1.0 - min(1.0, abs(sma_diff - pb_center) / (pb_span / 2.0 + 1.0))
-
-        trig_bonus = 0.03 if str(pullback_trigger) == "yday_high" else 0.0
-
-        score = (
-            45.0 * pb_score
-            + 20.0 * liq_score
-            + 15.0 * rsi_score_center
-            + 10.0 * atr_score_low
-            + 10.0 * ts
-            + 50.0 * trig_bonus
-        )
-        return float(score)
-
-    # breakout
-    br = 0.0
-    if prev_high is not None and np.isfinite(prev_high) and np.isfinite(atr) and atr > 0 and np.isfinite(close):
-        br = max(0.0, min(2.0, (close - float(prev_high)) / atr)) / 2.0  # 0..1
-
-    # For breakout, slightly prefer RSI above center (within allowed band)
-    rsi_score = 0.5 * rsi_score_center + 0.5 * max(0.0, min(1.0, (rsi - rsi_center + 5.0) / 20.0))
-
-    # ATR score for breakout: prefer mid (too低いと抜けない/ too高いと飛ぶ)
-    atr_center = (float(params.atr_pct_min) + float(params.atr_pct_max)) / 2.0
-    atr_span = max(0.5, float(params.atr_pct_max) - float(params.atr_pct_min))
-    atr_score_mid = 1.0 - min(1.0, abs(atr_pct - atr_center) / (atr_span / 2.0 + 0.5))
-
-    score = 35.0 * br + 25.0 * liq_score + 20.0 * ts + 10.0 * rsi_score + 10.0 * atr_score_mid
-    return float(score)
-
-
-def _rank_score(bt: BacktestResult, years: float, params: SwingParams) -> float:
-    """Stage2ランキング用の安定スコア（勝率×利確幅×頻度 を同時に設計）。
-    - expectancy(R) を主軸にしつつ、少数トレードを縮小し、頻度・PF・DDで整える。
+    事前スコア（バックテスト前）：
+    - 押し目の深さ（ちょうど良いレンジに近いほど）
+    - 出来高比（大きいほど）
+    - RSIが中庸ほど（過熱しすぎない）
     """
-    n = float(max(0, int(bt.n_trades)))
-    if n <= 0:
-        return float("-inf")
+    sma_diff = float(latest["SMA_DIFF"])
+    vol_ratio = float(latest.get("VOL_RATIO", 1.0))
+    rsi = float(latest["RSI"])
 
-    # Expectancy shrinkage
-    shrink_k = float(getattr(params, "score_shrink_k", 20.0))
-    shrink = n / (n + max(1.0, shrink_k))
-    e_adj = float(bt.expectancy_r) * shrink
+    # pullback: range center
+    pb_center = (params.pullback_low + params.pullback_high) / 2
+    pb_score = 1.0 - min(1.0, abs(sma_diff - pb_center) / max(1.0, abs(params.pullback_low - pb_center)))
 
-    # Frequency (trades per year)
-    yrs = float(max(1e-6, years))
-    freq = n / yrs
-    freq_boost = 1.0 + float(np.log1p(max(0.0, freq)))
+    rsi_center = (params.rsi_low + params.rsi_high) / 2
+    rsi_score = 1.0 - min(1.0, abs(rsi - rsi_center) / max(1.0, abs(params.rsi_high - rsi_center)))
 
-    # PF clipping / normalization
-    pf_clip = float(getattr(params, "score_pf_clip", 4.0))
-    pf = float(bt.profit_factor) if np.isfinite(float(bt.profit_factor)) else 0.0
-    pf_c = max(0.0, min(pf_clip, pf))
-    pf_norm = 0.5 + 0.5 * (pf_c / max(1e-6, pf_clip))
+    vol_score = min(2.0, max(0.0, vol_ratio)) / 2.0
 
-    # DD penalty (exp)
-    dd_ref = float(getattr(params, "score_dd_ref", 0.20))
-    dd = float(bt.max_drawdown) if np.isfinite(float(bt.max_drawdown)) else 0.0
-    dd_abs = abs(min(0.0, dd))
-    dd_pen = float(np.exp(-dd_abs / max(1e-6, dd_ref)))
+    atr_pct = float(latest["ATR_PCT"])
+    atr_center = (params.atr_pct_min + params.atr_pct_max) / 2
+    atr_score = 1.0 - min(1.0, abs(atr_pct - atr_center) / max(0.5, abs(params.atr_pct_max - atr_center)))
 
-    return float(e_adj * freq_boost * pf_norm * dd_pen)
+    return float(50 * pb_score + 30 * vol_score + 10 * rsi_score + 10 * atr_score)
+
 
 def scan_swing_candidates(
     budget_yen: int = 300_000,
@@ -1302,7 +1096,6 @@ def scan_swing_candidates(
     sector_method: str = "quant",   # "quant" or "ai_overlay"
     api_key: Optional[str] = None,
     relax_level: int = 0,
-    auto_relax_trace: Optional[List[Dict[str, object]]] = None,
 ) -> Dict[str, object]:
     """
     返り値:
@@ -1314,22 +1107,11 @@ def scan_swing_candidates(
       }
     """
     params = params or SwingParams()
-    trace: List[Dict[str, object]] = list(auto_relax_trace) if auto_relax_trace else []
+
 
     master_all = get_jpx_master()
     if master_all.empty:
-        return {
-            "regime_ok": True,
-            "candidates": [],
-            "prelim_count": 0,
-            "bt_count": 0,
-            "selected_sectors": [],
-            "sector_ranking": [],
-            "universe": 0,
-            "filter_stats": {"error": "JPX master empty"},
-            "auto_relax_trace": trace,
-            "error": "JPXマスター取得に失敗しました",
-        }
+        return {"regime_ok": True, "candidates": [], "prelim_count": 0, "bt_count": 0, "selected_sectors": [], "sector_ranking": [], "error": "JPXマスター取得に失敗しました"}
 
     # --- セクター事前絞り込み（任意）---
     sector_rank_records: List[Dict[str, object]] = []
@@ -1343,7 +1125,6 @@ def scan_swing_candidates(
         sector_rank = rank_sectors_quant(
             budget_yen=int(budget_yen),
             vol_avg20_min=float(params.vol_avg20_min),
-            turnover_avg20_min_yen=float(getattr(params, "turnover_avg20_min_yen", 0.0) or 0.0),
             period="6mo",
             lookback_days=63,
             reps_per_sector=30,
@@ -1351,6 +1132,7 @@ def scan_swing_candidates(
         )
 
         if sector_rank is not None and not sector_rank.empty:
+            # UI表示用（上位15）
             sector_rank_records = sector_rank.head(15).to_dict("records")
 
             method_key = "ai_overlay" if str(sector_method).lower().startswith("ai") else "quant"
@@ -1360,6 +1142,7 @@ def scan_swing_candidates(
                 method=method_key,
                 api_key=api_key,
             )
+
             if selected_sectors:
                 master = master_all[master_all["sector"].isin(selected_sectors)].copy()
 
@@ -1370,28 +1153,257 @@ def scan_swing_candidates(
 
     tickers = master["ticker"].tolist()
 
-    # Regime check (N225 > SMA200)
+    # --- Stooq connectivity / symbol sanity probe (first 3 tickers) ---
+    stooq_probe: List[Dict[str, object]] = []
+    _probe_ok = 0
+    for _t in tickers[:3]:
+        _sym = _to_stooq_symbol(_t)
+        _dfp = get_market_data(_t, period="6mo")
+        _meta = _snapshot_stooq_meta()
+        _rows = int(len(_dfp)) if _dfp is not None else 0
+        if _rows > 0:
+            _probe_ok += 1
+        _dfrom = str(_dfp.index.min().date()) if _dfp is not None and not _dfp.empty else None
+        _dto = str(_dfp.index.max().date()) if _dfp is not None and not _dfp.empty else None
+        stooq_probe.append({
+            "ticker": _t,
+            "stooq_symbol": _sym,
+            "rows": _rows,
+            "date_from": _dfrom,
+            "date_to": _dto,
+            "last_req": _meta,
+        })
+
+
     regime_ok = _regime_is_ok()
 
-    # Optional hard regime filter (auto-relax will disable it once)
-    if bool(getattr(params, "regime_filter", False)) and (not regime_ok):
-        trace.append(
-            {
-                "step": "regime_filter_block",
-                "regime_ok": False,
-                "action": "auto_relax_off" if relax_level == 0 else "blocked",
-            }
-        )
-        if relax_level == 0:
-            relaxed = replace(params, regime_filter=False)
-            trace.append(
+    # Stage 1: preliminary scan with chunk download (6mo)
+    prelim: List[Dict[str, object]] = []
+
+    # debug stats: where candidates are filtered out
+    stats = {
+        'universe': len(tickers),
+        'chunks': total if 'total' in locals() else None,
+        'data_ok': 0,
+        'chunk_empty': 0,
+        'chunk_nonempty': 0,
+        'probe_tried': 0,
+        'probe_ok': 0,
+        'budget_ok': 0,
+        'trend_ok': 0,
+        'rsi_ok': 0,
+        'atr_ok': 0,
+        'vol_ok': 0,
+        'setup_ok': 0,
+        'prelim_pass': 0,
+        'fail_data_short': 0,
+        'fail_budget': 0,
+        'fail_trend': 0,
+        'fail_rsi': 0,
+        'fail_atr': 0,
+        'fail_vol': 0,
+        'fail_setup': 0,
+    }
+    # attach probe result to stats (and abort early if nothing can be fetched)
+    stats['probe_tried'] = int(len(stooq_probe))
+    stats['probe_ok'] = int(_probe_ok)
+
+    if stats['probe_tried'] > 0 and stats['probe_ok'] == 0:
+        # No data for even the first few tickers => scanning will be meaningless.
+        return {
+            "regime_ok": True,
+            "mode": params.entry_mode,
+            "selected_sectors": selected_sectors,
+            "sector_ranking": sector_rank_records,
+            "universe": len(tickers),
+            "candidates": [],
+            "prelim_count": 0,
+            "bt_count": 0,
+            "filter_stats": stats,
+            "relax_level": relax_level,
+            "params_effective": {
+                "entry_mode": params.entry_mode,
+                "require_sma25_over_sma75": params.require_sma25_over_sma75,
+                "rsi": [params.rsi_low, params.rsi_high],
+                "pullback": [params.pullback_low, params.pullback_high],
+                "atr_pct": [params.atr_pct_min, params.atr_pct_max],
+                "vol_avg20_min": params.vol_avg20_min,
+                "breakout_vol_ratio": params.breakout_vol_ratio,
+            },
+            "auto_relax_trace": [],
+            "stooq_probe": stooq_probe,
+            "error": "Stooqから価格データを取得できません（疎通テスト: 0件）。ネットワーク/レート制限/シンボル形式を確認してください。",
+        }
+
+    chunks = _chunk(tickers, 50)
+
+    total = len(chunks)
+    stats['chunks'] = total
+    for ci, c in enumerate(chunks, start=1):
+        if progress_callback:
+            progress_callback(ci, total, f"スキャン中 {ci}/{total}")
+
+        df_multi = _download_chunk_ohlcv(tuple(c), period="6mo")
+        if df_multi is None or df_multi.empty:
+            stats['chunk_empty'] += 1
+            continue
+        stats['chunk_nonempty'] += 1
+
+        for t in c:
+            df_t = _extract_one(df_multi, t)
+            if df_t is None or df_t.empty or len(df_t) < 90:
+                continue
+            ind = calculate_indicators(df_t, include_sma200=False)
+            if ind.empty:
+                stats['fail_data_short'] += 1
+                continue
+            stats['data_ok'] += 1
+            latest = ind.iloc[-1]
+
+            price = float(latest["Close"])
+            # 100株の投資単位が予算内か
+            if price * 100 > budget_yen:
+                stats['fail_budget'] += 1
+                continue
+            stats['budget_ok'] += 1
+
+            # filters
+            # trend / regime (entry_modeで条件を分ける)
+            slope5 = float(latest.get("SMA25_SLOPE5", np.nan))
+            slope_ok = bool(np.isfinite(slope5) and slope5 > 0.0)
+
+            if params.entry_mode == "pullback":
+                # 押し目では「SMA25の下」に潜るのが普通なので、Close>SMA25は要求しない
+                trend_ok = True
+                if params.require_sma25_over_sma75:
+                    trend_ok = trend_ok and bool(latest["SMA_25"] > latest["SMA_75"])
+                # 大局は上（SMA75の上）
+                trend_ok = trend_ok and bool(price > latest["SMA_75"])
+                trend_ok = trend_ok and slope_ok
+            else:
+                # ブレイクは強いのでSMA25の上を要求
+                trend_ok = bool(price > latest["SMA_25"])
+                if params.require_sma25_over_sma75:
+                    trend_ok = trend_ok and bool(latest["SMA_25"] > latest["SMA_75"])
+                trend_ok = trend_ok and slope_ok
+
+            rsi = float(latest["RSI"])
+            rsi_ok = params.rsi_low <= rsi <= params.rsi_high
+
+            atr_pct = float(latest["ATR_PCT"])
+            atr_ok = params.atr_pct_min <= atr_pct <= params.atr_pct_max
+
+            vol_avg20 = float(latest["VOL_AVG_20"])
+            vol_ok = vol_avg20 >= params.vol_avg20_min
+
+            if not trend_ok:
+                stats['fail_trend'] += 1
+                continue
+            stats['trend_ok'] += 1
+
+            if not rsi_ok:
+                stats['fail_rsi'] += 1
+                continue
+            stats['rsi_ok'] += 1
+
+            if not atr_ok:
+                stats['fail_atr'] += 1
+                continue
+            stats['atr_ok'] += 1
+
+            if not vol_ok:
+                stats['fail_vol'] += 1
+                continue
+            stats['vol_ok'] += 1
+
+            if params.entry_mode == "pullback":
+                sma_diff = float(latest["SMA_DIFF"])
+                pb_ok = params.pullback_low <= sma_diff <= params.pullback_high
+                # trigger: close > yesterday high
+                trigger = bool(ind["Close"].iloc[-1] > ind["High"].iloc[-2])
+                if not (pb_ok and trigger):
+                    stats['fail_setup'] += 1
+                    continue
+                stats['setup_ok'] += 1
+            else:
+                lb = params.breakout_lookback
+                prev_high = float(ind["High"].iloc[-lb-1:-1].max()) if len(ind) > lb+1 else float("nan")
+                breakout = bool(price > prev_high) if np.isfinite(prev_high) else False
+                vr = float(latest["VOL_RATIO"])
+                if not (breakout and vr >= params.breakout_vol_ratio):
+                    stats['fail_setup'] += 1
+                    continue
+                stats['setup_ok'] += 1
+
+            score_pre = _score_prelim(latest, params)
+
+            row_m = master[master["ticker"] == t].iloc[0]
+            prelim.append(
                 {
-                    "step": "auto_relax",
-                    "reason": "regime_filter",
-                    "from": {"regime_filter": True},
-                    "to": {"regime_filter": False},
+                    "ticker": t,
+                    "name": str(row_m["name"]),
+                    "sector": str(row_m["sector"]),
+                    "price": price,
+                    "rsi": rsi,
+                    "atr": float(latest["ATR"]),
+                    "atr_pct": atr_pct,
+                    "vol_avg20": vol_avg20,
+                    "score_pre": score_pre,
                 }
             )
+
+    # If we couldn't evaluate even one ticker, report it explicitly (avoid silent all-zero stats)
+    if stats.get('data_ok', 0) == 0:
+        return {
+            "regime_ok": regime_ok,
+            "mode": params.entry_mode,
+            "selected_sectors": selected_sectors,
+            "sector_ranking": sector_rank_records,
+            "universe": len(tickers),
+            "candidates": [],
+            "prelim_count": 0,
+            "bt_count": 0,
+            "filter_stats": stats,
+            "relax_level": relax_level,
+            "params_effective": {
+                "entry_mode": params.entry_mode,
+                "require_sma25_over_sma75": params.require_sma25_over_sma75,
+                "rsi": [params.rsi_low, params.rsi_high],
+                "pullback": [params.pullback_low, params.pullback_high],
+                "atr_pct": [params.atr_pct_min, params.atr_pct_max],
+                "vol_avg20_min": params.vol_avg20_min,
+                "breakout_vol_ratio": params.breakout_vol_ratio,
+            },
+            "auto_relax_trace": [],
+            "stooq_probe": stooq_probe,
+            "error": f"OHLCV取得0件（chunk_empty={stats.get('chunk_empty', 0)}/{stats.get('chunks', '?')}）。Stooqが遮断/制限されている可能性が高いです。まず stooq_probe を確認してください。",
+        }
+
+    prelim_count = len(prelim)
+    stats['prelim_pass'] = prelim_count
+    if prelim_count == 0:
+        # 自動緩和（1回だけ）：条件が厳しすぎて “0件” になるのを避ける
+        if relax_level == 0:
+            relaxed = replace(
+                params,
+                # relax knobs
+                require_sma25_over_sma75=False,
+                rsi_low=max(20.0, float(params.rsi_low) - 5.0),
+                rsi_high=min(85.0, float(params.rsi_high) + 5.0),
+                pullback_low=float(params.pullback_low) - 4.0,
+                pullback_high=float(params.pullback_high) + 2.0,
+                atr_pct_min=max(0.5, float(params.atr_pct_min) - 0.5),
+                atr_pct_max=min(15.0, float(params.atr_pct_max) + 4.0),
+                vol_avg20_min=max(20_000.0, float(params.vol_avg20_min) * 0.5),
+            )
+
+            # pullbackで0件のときは breakout に切替（短期で候補を作りやすい）
+            if str(params.entry_mode) == "pullback":
+                relaxed = replace(
+                    relaxed,
+                    entry_mode="breakout",
+                    breakout_vol_ratio=max(1.2, float(params.breakout_vol_ratio) - 0.3),
+                )
             return scan_swing_candidates(
                 budget_yen=budget_yen,
                 top_n=top_n,
@@ -1404,272 +1416,6 @@ def scan_swing_candidates(
                 sector_method=sector_method,
                 api_key=api_key,
                 relax_level=1,
-                auto_relax_trace=trace,
-            )
-
-        return {
-            "regime_ok": regime_ok,
-            "candidates": [],
-            "prelim_count": 0,
-            "bt_count": 0,
-            "selected_sectors": selected_sectors,
-            "sector_ranking": sector_rank_records,
-            "universe": len(tickers),
-            "filter_stats": {"universe": len(tickers), "regime_block": 1},
-            "auto_relax_trace": trace,
-            "relax_level": relax_level,
-            "params_effective": {"entry_mode": params.entry_mode, "regime_filter": True},
-            "error": "地合いフィルタ（N225>SMA200）により候補を出しませんでした",
-        }
-
-    # Stage 1: preliminary scan with chunk download (6mo)
-    prelim: List[Dict[str, object]] = []
-
-    stats = {
-        "universe": len(tickers),
-        "chunks": 0,
-        "data_ok": 0,
-        "budget_ok": 0,
-        "trend_ok": 0,
-        "rsi_ok": 0,
-        "atr_ok": 0,
-        "vol_ok": 0,
-        "turnover_ok": 0,
-        "setup_ok": 0,
-        "prelim_pass": 0,
-        "fail_data_short": 0,
-        "fail_budget": 0,
-        "fail_trend": 0,
-        "fail_rsi": 0,
-        "fail_atr": 0,
-        "fail_vol": 0,
-        "fail_turnover": 0,
-        "fail_setup": 0,
-        "bt_tried": 0,
-        "fail_bt_trades": 0,
-        "ranked_pass": 0,
-    }
-
-    chunks = _chunk(tickers, 50)
-    total = len(chunks)
-    stats["chunks"] = total
-
-    for ci, c in enumerate(chunks, start=1):
-        if progress_callback:
-            progress_callback(ci, total, f"スキャン中 {ci}/{total}")
-
-        df_multi = _download_chunk_ohlcv(tuple(c), period="6mo")
-        if df_multi is None or df_multi.empty:
-            continue
-
-        for t in c:
-            df_t = _extract_one(df_multi, t)
-            if df_t is None or df_t.empty or len(df_t) < 90:
-                stats["fail_data_short"] += 1
-                continue
-
-            ind = calculate_indicators(df_t, include_sma200=False)
-            if ind.empty:
-                stats["fail_data_short"] += 1
-                continue
-
-            stats["data_ok"] += 1
-            latest = ind.iloc[-1]
-
-            price = float(latest["Close"])
-            if price * 100 > float(budget_yen):
-                stats["fail_budget"] += 1
-                continue
-            stats["budget_ok"] += 1
-
-            # --- trend gate ---
-            slope5 = float(latest.get("SMA25_SLOPE5", np.nan))
-            slope_ok = bool(np.isfinite(slope5) and slope5 > 0.0)
-
-            if str(params.entry_mode) == "pullback":
-                # 押し目では「SMA25の下」に潜るのが普通なので、Close>SMA25は要求しない
-                trend_ok = True
-                if bool(params.require_sma25_over_sma75):
-                    trend_ok = trend_ok and bool(latest["SMA_25"] > latest["SMA_75"])
-                # 大局は上（SMA75の上）
-                trend_ok = trend_ok and bool(price > latest["SMA_75"])
-                trend_ok = trend_ok and slope_ok
-            else:
-                # ブレイクは強いのでSMA25の上を要求
-                trend_ok = bool(price > latest["SMA_25"])
-                if bool(params.require_sma25_over_sma75):
-                    trend_ok = trend_ok and bool(latest["SMA_25"] > latest["SMA_75"])
-                trend_ok = trend_ok and slope_ok
-
-            if not trend_ok:
-                stats["fail_trend"] += 1
-                continue
-            stats["trend_ok"] += 1
-
-            # --- RSI gate ---
-            rsi = float(latest["RSI"])
-            if not (float(params.rsi_low) <= rsi <= float(params.rsi_high)):
-                stats["fail_rsi"] += 1
-                continue
-            stats["rsi_ok"] += 1
-
-            # --- ATR gate ---
-            atr_pct = float(latest["ATR_PCT"])
-            if not (float(params.atr_pct_min) <= atr_pct <= float(params.atr_pct_max)):
-                stats["fail_atr"] += 1
-                continue
-            stats["atr_ok"] += 1
-
-            # --- liquidity gates ---
-            vol_avg20 = float(latest["VOL_AVG_20"])
-            if not (np.isfinite(vol_avg20) and vol_avg20 >= float(params.vol_avg20_min)):
-                stats["fail_vol"] += 1
-                continue
-            stats["vol_ok"] += 1
-
-            turnover_avg20 = float(latest.get("TURNOVER_AVG_20", np.nan))
-            to_min = float(getattr(params, "turnover_avg20_min_yen", 0.0) or 0.0)
-            if to_min > 0:
-                if not (np.isfinite(turnover_avg20) and turnover_avg20 >= to_min):
-                    stats["fail_turnover"] += 1
-                    continue
-            stats["turnover_ok"] += 1
-
-            # --- setup / trigger ---
-            score_pre = float("nan")
-            trigger_kind = ""
-
-            if str(params.entry_mode) == "pullback":
-                sma_diff = float(latest["SMA_DIFF"])
-                pb_ok = float(params.pullback_low) <= sma_diff <= float(params.pullback_high)
-
-                # trigger:
-                trigger_yday = bool(ind["Close"].iloc[-1] > ind["High"].iloc[-2])
-                trigger_sma5 = bool(getattr(params, "pullback_allow_sma5_trigger", True)) and bool(ind["Close"].iloc[-1] > latest["SMA_5"])
-                trigger = bool(trigger_yday or trigger_sma5)
-                trigger_kind = "yday_high" if trigger_yday else ("sma5" if trigger_sma5 else "")
-
-                if not (pb_ok and trigger):
-                    stats["fail_setup"] += 1
-                    continue
-                stats["setup_ok"] += 1
-
-                score_pre = _score_prelim(latest, params, pullback_trigger=trigger_kind or "sma5")
-            else:
-                lb = int(params.breakout_lookback)
-                if lb < 5:
-                    lb = 5
-
-                # prev_high: exclude today
-                if len(ind) > lb + 1:
-                    prev_high = float(ind["High"].iloc[-lb-1:-1].max())
-                else:
-                    prev_high = float("nan")
-
-                breakout = bool(np.isfinite(prev_high) and price > prev_high)
-
-                # volume gate: use the larger of vol_ratio and turnover_ratio (when available)
-                vr = float(latest.get("VOL_RATIO", 1.0))
-                tor = float(latest.get("TURNOVER_RATIO", np.nan))
-                liq_ratio = tor if np.isfinite(tor) else vr
-
-                vol_gate = bool(liq_ratio >= float(params.breakout_vol_ratio))
-
-                if not (breakout and vol_gate):
-                    stats["fail_setup"] += 1
-                    continue
-                stats["setup_ok"] += 1
-
-                score_pre = _score_prelim(latest, params, prev_high=prev_high)
-
-            # append prelim
-            row_m = master[master["ticker"] == t].iloc[0]
-            prelim.append(
-                {
-                    "ticker": t,
-                    "name": str(row_m["name"]),
-                    "sector": str(row_m["sector"]),
-                    "price": price,
-                    "rsi": rsi,
-                    "atr": float(latest["ATR"]),
-                    "atr_pct": atr_pct,
-                    "vol_avg20": vol_avg20,
-                    "turnover_avg20_yen": turnover_avg20,
-                    "score_pre": float(score_pre) if np.isfinite(float(score_pre)) else 0.0,
-                    "trigger": trigger_kind,
-                }
-            )
-
-    prelim_count = len(prelim)
-    stats["prelim_pass"] = prelim_count
-
-    if prelim_count == 0:
-        # 自動緩和（1回だけ）：条件が厳しすぎて “0件” になるのを避ける
-        if relax_level == 0:
-            relaxed = replace(
-                params,
-                require_sma25_over_sma75=False,
-                regime_filter=False,
-                rsi_low=max(15.0, float(params.rsi_low) - 7.0),
-                rsi_high=min(90.0, float(params.rsi_high) + 7.0),
-                pullback_low=float(params.pullback_low) - 5.0,
-                pullback_high=float(params.pullback_high) + 3.0,
-                atr_pct_min=max(0.5, float(params.atr_pct_min) - 0.8),
-                atr_pct_max=min(18.0, float(params.atr_pct_max) + 5.0),
-                vol_avg20_min=max(20_000.0, float(params.vol_avg20_min) * 0.5),
-                turnover_avg20_min_yen=max(0.0, float(getattr(params, "turnover_avg20_min_yen", 0.0) or 0.0) * 0.5),
-            )
-
-            # pullbackで0件のときは breakout に切替（短期で候補を作りやすい）
-            if str(params.entry_mode) == "pullback":
-                relaxed = replace(
-                    relaxed,
-                    entry_mode="breakout",
-                    breakout_vol_ratio=max(1.15, float(params.breakout_vol_ratio) - 0.35),
-                )
-
-            trace.append(
-                {
-                    "step": "auto_relax",
-                    "reason": "prelim_zero",
-                    "from": {
-                        "entry_mode": str(params.entry_mode),
-                        "require_sma25_over_sma75": bool(params.require_sma25_over_sma75),
-                        "rsi": [float(params.rsi_low), float(params.rsi_high)],
-                        "pullback": [float(params.pullback_low), float(params.pullback_high)],
-                        "atr_pct": [float(params.atr_pct_min), float(params.atr_pct_max)],
-                        "vol_avg20_min": float(params.vol_avg20_min),
-                        "turnover_avg20_min_yen": float(getattr(params, "turnover_avg20_min_yen", 0.0) or 0.0),
-                        "breakout_vol_ratio": float(params.breakout_vol_ratio),
-                        "regime_filter": bool(getattr(params, "regime_filter", False)),
-                    },
-                    "to": {
-                        "entry_mode": str(relaxed.entry_mode),
-                        "require_sma25_over_sma75": bool(relaxed.require_sma25_over_sma75),
-                        "rsi": [float(relaxed.rsi_low), float(relaxed.rsi_high)],
-                        "pullback": [float(relaxed.pullback_low), float(relaxed.pullback_high)],
-                        "atr_pct": [float(relaxed.atr_pct_min), float(relaxed.atr_pct_max)],
-                        "vol_avg20_min": float(relaxed.vol_avg20_min),
-                        "turnover_avg20_min_yen": float(getattr(relaxed, "turnover_avg20_min_yen", 0.0) or 0.0),
-                        "breakout_vol_ratio": float(relaxed.breakout_vol_ratio),
-                        "regime_filter": bool(getattr(relaxed, "regime_filter", False)),
-                    },
-                }
-            )
-
-            return scan_swing_candidates(
-                budget_yen=budget_yen,
-                top_n=top_n,
-                params=relaxed,
-                progress_callback=progress_callback,
-                backtest_period=backtest_period,
-                backtest_topk=backtest_topk,
-                sector_prefilter=False,
-                sector_top_n=sector_top_n,
-                sector_method=sector_method,
-                api_key=api_key,
-                relax_level=1,
-                auto_relax_trace=trace,
             )
 
         return {
@@ -1681,35 +1427,21 @@ def scan_swing_candidates(
             "sector_ranking": sector_rank_records,
             "universe": len(tickers),
             "filter_stats": stats,
-            "auto_relax_trace": trace,
-            "relax_level": relax_level,
-            "params_effective": {"entry_mode": params.entry_mode},
-            "error": "候補が0件でした（条件が厳しい/データ欠損の可能性）",
+            "error": "候補が0件でした（条件が厳しい/データ取得失敗の可能性）",
         }
 
-    # Backtest topK (keep a bit more than top_n)
-    prelim_sorted = sorted(prelim, key=lambda x: float(x.get("score_pre", 0.0)), reverse=True)[: max(int(backtest_topk), int(top_n))]
-    stats["bt_tried"] = len(prelim_sorted)
+    prelim_sorted = sorted(prelim, key=lambda x: float(x["score_pre"]), reverse=True)[: max(backtest_topk, top_n)]
+    bt_count = len(prelim_sorted)
 
+    # Stage 2: backtest topK and re-rank by expectancy/PF
     ranked: List[Dict[str, object]] = []
     for i, item in enumerate(prelim_sorted, start=1):
         if progress_callback:
-            progress_callback(i, stats["bt_tried"], f"バックテスト {item['ticker']}")
+            progress_callback(i, bt_count, f"バックテスト {item['ticker']}")
 
         df = get_market_data(item["ticker"], period=backtest_period, interval="1d")
         ind = calculate_indicators(df, include_sma200=False)
-        if ind.empty:
-            continue
-
         bt = backtest_swing(ind, params)
-
-        # stabilize: require minimum trades (avoid sample noise)
-        if int(bt.n_trades) < int(getattr(params, "min_trades_bt", 8)):
-            stats["fail_bt_trades"] += 1
-            continue
-
-        years = max(0.5, float(len(ind)) / 252.0)
-        bt_score = _rank_score(bt, years, params)
 
         ranked.append(
             {
@@ -1719,64 +1451,13 @@ def scan_swing_candidates(
                 "bt_pf": bt.profit_factor,
                 "bt_avg_r": bt.expectancy_r,
                 "bt_max_dd": bt.max_drawdown,
-                "bt_years": years,
-                "bt_score": bt_score,
             }
         )
 
-    stats["ranked_pass"] = len(ranked)
-
-    if not ranked:
-        # まだ0件なら、min_tradesだけ緩める（1回だけ）
-        if relax_level == 0 and int(getattr(params, "min_trades_bt", 8)) > 3:
-            relaxed = replace(params, min_trades_bt=max(3, int(getattr(params, "min_trades_bt", 8)) // 2))
-            trace.append(
-                {
-                    "step": "auto_relax",
-                    "reason": "bt_trades_zero",
-                    "from": {"min_trades_bt": int(getattr(params, "min_trades_bt", 8))},
-                    "to": {"min_trades_bt": int(getattr(relaxed, "min_trades_bt", 3))},
-                }
-            )
-            return scan_swing_candidates(
-                budget_yen=budget_yen,
-                top_n=top_n,
-                params=relaxed,
-                progress_callback=progress_callback,
-                backtest_period=backtest_period,
-                backtest_topk=backtest_topk,
-                sector_prefilter=False,
-                sector_top_n=sector_top_n,
-                sector_method=sector_method,
-                api_key=api_key,
-                relax_level=1,
-                auto_relax_trace=trace,
-            )
-
-        return {
-            "regime_ok": regime_ok,
-            "candidates": [],
-            "prelim_count": prelim_count,
-            "bt_count": 0,
-            "selected_sectors": selected_sectors,
-            "sector_ranking": sector_rank_records,
-            "universe": len(tickers),
-            "filter_stats": stats,
-            "auto_relax_trace": trace,
-            "relax_level": relax_level,
-            "params_effective": {"entry_mode": params.entry_mode},
-            "error": "バックテストで有効な候補が0件でした（トレード数不足/データ欠損の可能性）",
-        }
-
-    # Final ranking by stable score -> expectancy -> PF -> trades
+    # rank: expectancy -> PF -> trades
     ranked = sorted(
         ranked,
-        key=lambda x: (
-            float(x.get("bt_score", float("-inf"))),
-            float(x.get("bt_avg_r", 0.0)),
-            float(x.get("bt_pf", 0.0)) if np.isfinite(float(x.get("bt_pf", 0.0))) else 0.0,
-            float(x.get("bt_trades", 0)),
-        ),
+        key=lambda x: (float(x["bt_avg_r"]), float(x["bt_pf"]) if np.isfinite(float(x["bt_pf"])) else 0.0, float(x["bt_trades"])),
         reverse=True,
     )
 
@@ -1785,32 +1466,22 @@ def scan_swing_candidates(
         "selected_sectors": selected_sectors,
         "sector_ranking": sector_rank_records,
         "universe": len(tickers),
-        "candidates": ranked[: int(top_n)],
+        "candidates": ranked[:top_n],
         "prelim_count": prelim_count,
-        "bt_count": len(ranked),
+        "bt_count": bt_count,
         "filter_stats": stats,
-        "auto_relax_trace": trace,
         "relax_level": relax_level,
         "params_effective": {
-            "entry_mode": str(params.entry_mode),
-            "require_sma25_over_sma75": bool(params.require_sma25_over_sma75),
-            "regime_filter": bool(getattr(params, "regime_filter", False)),
-            "rsi": [float(params.rsi_low), float(params.rsi_high)],
-            "pullback": [float(params.pullback_low), float(params.pullback_high)],
-            "atr_pct": [float(params.atr_pct_min), float(params.atr_pct_max)],
-            "vol_avg20_min": float(params.vol_avg20_min),
-            "turnover_avg20_min_yen": float(getattr(params, "turnover_avg20_min_yen", 0.0) or 0.0),
-            "breakout_vol_ratio": float(params.breakout_vol_ratio),
-            "breakout_lookback": int(params.breakout_lookback),
-            "min_trades_bt": int(getattr(params, "min_trades_bt", 8)),
-            "score_shrink_k": float(getattr(params, "score_shrink_k", 20.0)),
-            "score_pf_clip": float(getattr(params, "score_pf_clip", 4.0)),
-            "score_dd_ref": float(getattr(params, "score_dd_ref", 0.20)),
+            "entry_mode": params.entry_mode,
+            "require_sma25_over_sma75": params.require_sma25_over_sma75,
+            "rsi": [params.rsi_low, params.rsi_high],
+            "pullback": [params.pullback_low, params.pullback_high],
+            "atr_pct": [params.atr_pct_min, params.atr_pct_max],
+            "vol_avg20_min": params.vol_avg20_min,
+            "breakout_vol_ratio": params.breakout_vol_ratio,
         },
     }
 
-
-# Backward-compatible alias for main.py
 
 # Backward-compatible alias for main.py
 def auto_scan_value_stocks(api_key: str, progress_callback=None):
