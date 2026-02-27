@@ -17,6 +17,8 @@ import math
 import re
 import json
 from dataclasses import dataclass, replace
+import dataclasses
+import traceback
 from datetime import datetime
 from io import BytesIO
 from typing import Callable, Dict, List, Optional, Tuple
@@ -1913,3 +1915,39 @@ def build_trade_plan(
         "tp2_r": float(params.tp2_r),
     }
     return plan
+
+
+# -------------------------
+# crash-safe wrapper
+# -------------------------
+def scan_swing_candidates_safe(*args, **kwargs):
+    """Crash-safe wrapper around scan_swing_candidates.
+
+    - Never raises.
+    - Always returns a dict with at least: candidates, prelim_count, bt_count, filter_stats, error(optional), traceback(optional).
+    """
+    auto_relax_trace = kwargs.get('auto_relax_trace')
+    trace = list(auto_relax_trace) if isinstance(auto_relax_trace, list) else []
+    try:
+        return scan_swing_candidates(*args, **kwargs)
+    except Exception as e:
+        tb = traceback.format_exc()
+        params = kwargs.get('params', None)
+        try:
+            params_eff = dataclasses.asdict(params) if params is not None else {}
+        except Exception:
+            params_eff = {}
+        return {
+            'regime_ok': True,
+            'candidates': [],
+            'prelim_count': 0,
+            'bt_count': 0,
+            'selected_sectors': [],
+            'sector_ranking': [],
+            'universe': 0,
+            'filter_stats': {'error': str(e), 'exception': str(e)},
+            'auto_relax_trace': trace,
+            'params_effective': params_eff,
+            'error': str(e),
+            'traceback': tb,
+        }
