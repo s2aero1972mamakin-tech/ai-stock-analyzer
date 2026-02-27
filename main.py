@@ -21,20 +21,17 @@ import datetime
 
 import logic
 import json
+import traceback
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
 import inspect
-import dataclasses
-
-
-APP_BUILD = "2026-02-26T08:00:00Z / stable2"
 
 def _st_plotly(fig, **kwargs):
     """plotly_chart wrapper for Streamlit versions without use_container_width."""
     try:
         if "use_container_width" in inspect.signature(st.plotly_chart).parameters:
-            return st.plotly_chart(fig, use_container_width=True, **kwargs)
+            return st.plotly_chart(fig, width='stretch', **kwargs)
     except Exception:
         pass
     return st.plotly_chart(fig, **kwargs)
@@ -64,122 +61,11 @@ def _init_state():
 
 _init_state()
 
-# -------------------------
-# Helpers (robustness)
-# -------------------------
-def build_swing_params(**kwargs):
-    """Build SwingParams safely (main.py と logic.py の不一致でも落ちない)."""
-    allowed = None
-    try:
-        if dataclasses.is_dataclass(logic.SwingParams):
-            allowed = {f.name for f in dataclasses.fields(logic.SwingParams)}
-    except Exception:
-        allowed = None
-
-    if not allowed:
-        try:
-            allowed = set(inspect.signature(logic.SwingParams).parameters.keys())
-            allowed.discard("self")
-        except Exception:
-            allowed = set()
-
-    safe = {k: v for k, v in kwargs.items() if k in allowed}
-    dropped = sorted([k for k in kwargs.keys() if k not in safe])
-
-    # mismatch があっても落ちないようにしつつ、気づけるように残す
-    if dropped:
-        st.session_state["_dropped_param_keys"] = dropped
-    else:
-        st.session_state.pop("_dropped_param_keys", None)
-
-    return logic.SwingParams(**safe)
-
-
-def render_diag_sidebar(ph):
-    """Render diagnostic JSON panel in sidebar (persist across reruns)."""
-    diag = st.session_state.get("last_scan_diag")
-    with ph.container():
-        if not diag:
-            st.caption("🧾 診断JSON：スキャン実行後にここへ表示されます。")
-            return
-
-        ts = str(diag.get("timestamp", "")) or "latest"
-
-        def _json_default(o):
-            # numpy / pandas / datetime をできるだけ数値・ISOに寄せてJSON化
-            try:
-                import numpy as _np
-                import pandas as _pd
-                from datetime import datetime as _dt
-                if isinstance(o, (_np.integer,)):
-                    return int(o)
-                if isinstance(o, (_np.floating,)):
-                    return float(o)
-                if isinstance(o, (_np.ndarray,)):
-                    return o.tolist()
-                if isinstance(o, (_pd.Timestamp,)):
-                    return o.isoformat()
-                if isinstance(o, (_dt,)):
-                    return o.isoformat()
-            except Exception:
-                pass
-            return str(o)
-
-        diag_json = json.dumps(diag, ensure_ascii=False, indent=2, default=_json_default)
-        safe_ts = ts.replace(":", "-").replace(" ", "_").replace("/", "-")
-
-        with st.expander("🧾 スキャン診断（filter_stats / params / auto-relax）", expanded=False):
-            st.caption(ts)
-
-            dropped = st.session_state.get("_dropped_param_keys")
-            if dropped:
-                st.warning("⚠️ main.py と logic.py のパラメータ不一致があり、無視した項目があります: " + ", ".join(map(str, dropped)))
-
-            st.download_button(
-                "⬇️ 診断JSONをダウンロード",
-                data=diag_json.encode("utf-8"),
-                file_name=f"scan_diag_{safe_ts}.json",
-                mime="application/json",
-                key="diag_download_btn",
-            )
-
-            c1, c2 = st.columns([1, 1])
-            with c1:
-                if st.button("🧹 診断をクリア", key="diag_clear_btn"):
-                    st.session_state.pop("last_scan_diag", None)
-                    st.session_state.pop("_dropped_param_keys", None)
-                    st.rerun()
-            with c2:
-                st.caption(f"bytes: {len(diag_json.encode('utf-8')):,}")
-
-            st.markdown(f"**mode**: `{diag.get('mode','')}`")
-            if diag.get("relax_level") is not None:
-                st.markdown(f"**relax_level**: `{diag.get('relax_level')}`")
-
-            if diag.get("selected_sectors"):
-                st.markdown("**selected_sectors**")
-                st.json(diag.get("selected_sectors", []))
-
-            if diag.get("error"):
-                st.error(str(diag.get("error")))
-
-            st.markdown("**filter_stats**")
-            st.json(diag.get("filter_stats", {}))
-
-            if diag.get("params_effective"):
-                st.markdown("**params_effective**")
-                st.json(diag.get("params_effective", {}))
-
-            if diag.get("auto_relax_trace"):
-                st.markdown("**auto_relax_trace**")
-                st.json(diag.get("auto_relax_trace", []))
-
 
 # -------------------------
 # Sidebar: Settings
 # -------------------------
 st.sidebar.header("⚙️ スキャン設定（期待値最大化）")
-st.sidebar.caption(f"build: {APP_BUILD}")
 
 capital = st.sidebar.number_input("運用軍資金（円）", value=300000, step=10000, min_value=10000)
 risk_pct = st.sidebar.slider("1トレード許容損失（%）", min_value=0.5, max_value=10.0, value=2.0, step=0.5)
@@ -219,7 +105,7 @@ sector_top_n = st.sidebar.slider("採用する上位セクター数", 2, 12, 6, 
 sector_method = st.sidebar.selectbox("絞り込み方式", ["データ（推奨）", "AI＋データ（任意）"], index=0)
 sector_method_key = "ai_overlay" if sector_method.startswith("AI") else "quant"
 
-params = build_swing_params(
+params = logic.SwingParams(
     rsi_low=float(rsi_low),
     rsi_high=float(rsi_high),
     pullback_low=float(pb_low),
@@ -239,14 +125,111 @@ params = build_swing_params(
     risk_pct=float(risk_pct),
 )
 
-
 st.sidebar.markdown("---")
 st.sidebar.subheader("🚀 全銘柄スキャン")
 scan_label = "🔥 スキャン開始（セクター→銘柄スキャン）" if sector_prefilter else "🔥 スキャン開始（JPX全銘柄）"
 scan_btn = st.sidebar.button(scan_label, type="primary")
-# ---- last scan diagnostics (persist across reruns / shows immediately) ----
-diag_ph = st.sidebar.empty()
-render_diag_sidebar(diag_ph)
+
+# ---- last scan diagnostics (renderable after scan within same run) ----
+diag_slot = st.sidebar.empty()
+
+def _json_sanitize(obj):
+    """Make an object JSON-serializable (numpy/pandas included)."""
+    try:
+        import numpy as _np  # type: ignore
+    except Exception:
+        _np = None  # type: ignore
+
+    if obj is None or isinstance(obj, (str, int, bool)):
+        return obj
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if _np is not None:
+        try:
+            if isinstance(obj, (_np.integer,)):
+                return int(obj)
+            if isinstance(obj, (_np.floating,)):
+                v = float(obj)
+                return v if math.isfinite(v) else None
+            if isinstance(obj, (_np.ndarray,)):
+                return [_json_sanitize(v) for v in obj.tolist()]
+        except Exception:
+            pass
+    if isinstance(obj, (datetime.datetime, datetime.date)):
+        try:
+            return obj.isoformat()
+        except Exception:
+            return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_sanitize(v) for v in obj]
+    # pandas objects
+    try:
+        import pandas as _pd  # type: ignore
+        if isinstance(obj, _pd.DataFrame):
+            return obj.to_dict(orient="records")
+        if isinstance(obj, _pd.Series):
+            return obj.to_dict()
+    except Exception:
+        pass
+    return str(obj)
+
+def render_last_diag():
+    diag = st.session_state.get("last_scan_diag")
+    with diag_slot.container():
+        with st.expander("🧾 前回スキャン診断（filter_stats）", expanded=False):
+            if not diag:
+                st.caption("まだ診断データがありません。スキャン後にここへ表示され、JSONもダウンロードできます。")
+                st.download_button(
+                    "⬇️ 診断JSONをダウンロード",
+                    data="{}",
+                    file_name="scan_diag_empty.json",
+                    mime="application/json",
+                    disabled=True,
+                )
+                return
+
+            st.caption(diag.get("timestamp", ""))
+            if diag.get("error"):
+                st.error(str(diag.get("error")))
+            st.json(diag.get("filter_stats", {}))
+
+            if diag.get("auto_relax_trace"):
+                st.markdown("**auto_relax_trace**")
+                st.json(diag["auto_relax_trace"])
+            if diag.get("params_effective"):
+                st.markdown("**params_effective**")
+                st.json(diag["params_effective"])
+            if diag.get("mode"):
+                st.markdown(f"**mode**: `{diag.get('mode','')}`")
+            if diag.get("relax_level") is not None:
+                st.markdown(f"**relax_level**: `{diag.get('relax_level')}`")
+            if diag.get("selected_sectors"):
+                st.markdown("**selected_sectors**")
+                st.json(diag.get("selected_sectors", []))
+            if diag.get("traceback"):
+                st.markdown("**traceback**")
+                st.code(str(diag.get("traceback")), language="text")
+
+            # Download button (safe serialization)
+            try:
+                ts = str(diag.get("timestamp", "latest"))
+                safe_ts = ts.replace(":", "").replace(" ", "_").replace("/", "-")
+                diag_json = json.dumps(_json_sanitize(diag), ensure_ascii=False, indent=2)
+                st.download_button(
+                    "⬇️ 診断JSONをダウンロード",
+                    data=diag_json,
+                    file_name=f"scan_diag_{safe_ts}.json",
+                    mime="application/json",
+                )
+            except Exception as e:
+                st.caption(f"診断JSONの生成に失敗: {e}")
+
+# initial render (will update after scan via placeholder)
+render_last_diag()
+
+
 
 # OpenAI key (optional)
 st.sidebar.markdown("---")
@@ -270,70 +253,55 @@ if scan_btn:
             status_text.text(f"🔍 {info} ({current}/{total})")
 
         try:
-
             res = logic.scan_swing_candidates(
-            budget_yen=int(budget),
-            top_n=3,
-            params=params,
-            progress_callback=update_progress,
-            backtest_period=bt_period,
-            backtest_topk=int(bt_topk),
-            sector_prefilter=bool(sector_prefilter),
-            sector_top_n=int(sector_top_n),
-            sector_method=str(sector_method_key),
-            api_key=(api_key if sector_method_key == "ai_overlay" else None),
-
+                budget_yen=int(budget),
+                top_n=3,
+                params=params,
+                progress_callback=update_progress,
+                backtest_period=bt_period,
+                backtest_topk=int(bt_topk),
+                sector_prefilter=bool(sector_prefilter),
+                sector_top_n=int(sector_top_n),
+                sector_method=str(sector_method_key),
+                api_key=(api_key if sector_method_key == "ai_overlay" else None),
             )
-
         except Exception as e:
-
-            res = {
-
-                "regime_ok": True,
-
-                "candidates": [],
-
-                "prelim_count": 0,
-
-                "bt_count": 0,
-
+            tb = traceback.format_exc()
+            # Save diagnostics even when the scan crashes
+            st.session_state["last_scan_diag"] = {
+                "timestamp": str(datetime.datetime.now()),
+                "mode": getattr(params, "entry_mode", ""),
+                "relax_level": None,
                 "selected_sectors": [],
-
-                "sector_ranking": [],
-
-                "filter_stats": {"exception": str(e)},
-
+                "filter_stats": {"exception": f"{type(e).__name__}: {e}"},
                 "params_effective": {},
-
                 "auto_relax_trace": [],
-
-                "error": str(e),
-
+                "error": f"{type(e).__name__}: {e}",
+                "traceback": tb,
             }
+            render_last_diag()
+            status.update(label="❌ エラーで中断（診断JSONを確認してください）", state="error", expanded=True)
+            st.error("スキャン中に例外が発生しました。サイドバーの診断JSONを開いてください。")
+            st.stop()
 
-            status.update(label=f"❌ スキャン中に例外: {e}", state="error", expanded=True)
 
 
         # Persist diagnostics (kept even after st.rerun())
         try:
             st.session_state["last_scan_diag"] = {
-                "timestamp": datetime.now(TOKYO).isoformat(timespec="seconds"),
+                "timestamp": str(datetime.datetime.now()),
                 "mode": (res.get("params_effective", {}) or {}).get("entry_mode"),
                 "relax_level": res.get("relax_level", 0),
                 "selected_sectors": res.get("selected_sectors", []),
                 "filter_stats": res.get("filter_stats", {}),
                 "params_effective": res.get("params_effective", {}),
                 "auto_relax_trace": res.get("auto_relax_trace", []),
-                "error": res.get("error"),
             }
         except Exception:
             pass
 
-        # Update sidebar diagnostic panel immediately in this run
-        try:
-            render_diag_sidebar(diag_ph)
-        except Exception:
-            pass
+        # Refresh sidebar diagnostics immediately (same run)
+        render_last_diag()
 
         st.session_state.scan_meta = res
         candidates = res.get("candidates", [])
