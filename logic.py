@@ -21,8 +21,6 @@ from datetime import datetime
 from io import BytesIO
 from typing import Callable, Dict, List, Optional, Tuple
 
-LOGIC_BUILD = "2026-02-26T08:00:00Z / stable2"
-
 import numpy as np
 import pandas as pd
 
@@ -74,25 +72,76 @@ def _period_to_start(period: str) -> pd.Timestamp:
         start = start.tz_convert(None)
     return start
 
-def _fetch_stooq_ohlc(symbol: str) -> pd.DataFrame:
-    """Fetch daily OHLCV from Stooq CSV endpoint."""
-    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    if df.empty:
-        return df
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-    if "Adj Close" not in df.columns and "Close" in df.columns:
-        df["Adj Close"] = df["Close"]
-    cols = [c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in df.columns]
-    return df[cols]
+def _fetch_stooq_ohlc(
+    symbol: str,
+    start: Optional[datetime.date] = None,
+    end: Optional[datetime.date] = None,
+    retry_count: int = 3,
+    pause: float = 0.25,
+    session: Optional[requests.Session] = None,
+) -> pd.DataFrame:
+    """Fetch daily OHLCV from Stooq CSV endpoint.
+
+    Uses optional date range parameters (d1/d2) to reduce payload size.
+    - base endpoint: https://stooq.com/q/d/l/
+    - params: s=<symbol>, i=d, d1=YYYYMMDD, d2=YYYYMMDD
+    """
+    base_url = "https://stooq.com/q/d/l/"
+    sess = session or _STOOQ_SESSION
+
+    params = {"s": symbol, "i": "d"}
+    if start is not None:
+        try:
+            params["d1"] = pd.Timestamp(start).strftime("%Y%m%d")
+        except Exception:
+            pass
+    if end is not None:
+        try:
+            params["d2"] = pd.Timestamp(end).strftime("%Y%m%d")
+        except Exception:
+            pass
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(int(max(0, retry_count)) + 1):
+        try:
+            r = sess.get(
+                base_url,
+                params=params,
+                timeout=(10, 25),
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            r.raise_for_status()
+            df = pd.read_csv(io.StringIO(r.text))
+            if df.empty:
+                return df
+            if "Date" not in df.columns:
+                return pd.DataFrame()
+
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+
+            if "Adj Close" not in df.columns and "Close" in df.columns:
+                df["Adj Close"] = df["Close"]
+
+            cols = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
+            return df[cols]
+        except Exception as e:
+            last_exc = e
+            if attempt < int(max(0, retry_count)):
+                # exponential backoff with jitter-ish
+                try:
+                    time.sleep(float(pause) * (2 ** attempt))
+                except Exception:
+                    pass
+                continue
+            return pd.DataFrame()
+
 
 import pytz
 import streamlit as st
 import requests
 import io
+import time
 from openai import OpenAI
 
 TOKYO = pytz.timezone("Asia/Tokyo")
@@ -226,7 +275,6 @@ def _normalize_yf_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 
 def get_market_data(ticker: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
     """価格データを取得（現在は Stooq を使用）。日本株のみ前提。
@@ -235,11 +283,24 @@ def get_market_data(ticker: str, period: str = "6mo", interval: str = "1d") -> p
     - period: "6mo", "1y", "2y" など
     - interval: 現状 "1d" 想定（Stooq の日足）
     """
+    # Determine desired date window first (to reduce payload)
+    start_ts = _period_to_start(period)
+    try:
+        start_date = pd.Timestamp(start_ts).date()
+    except Exception:
+        start_date = None
+
+    try:
+        end_date = datetime.datetime.now(TOKYO).date()
+    except Exception:
+        end_date = None
+
     try:
         stooq_symbol = _to_stooq_symbol(ticker)
-        df = _fetch_stooq_ohlc(stooq_symbol)
+        df = _fetch_stooq_ohlc(stooq_symbol, start=start_date, end=end_date)
     except Exception:
         return pd.DataFrame()
+
 
     if df is None or df.empty:
         return pd.DataFrame()
@@ -757,7 +818,6 @@ def _chunk(lst: List[str], n: int) -> List[List[str]]:
     return [lst[i : i + n] for i in range(0, len(lst), n)]
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def _download_chunk_ohlcv(tickers: Tuple[str, ...], period: str = "6mo") -> pd.DataFrame:
     """Download OHLCV for multiple tickers via Stooq and return MultiIndex columns.
     Columns: level0=ticker, level1=field.
@@ -898,7 +958,6 @@ def _parse_sector_list(text: str, allowed: List[str]) -> List[str]:
     return out
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def rank_sectors_quant(
     budget_yen: int,
     vol_avg20_min: float,
