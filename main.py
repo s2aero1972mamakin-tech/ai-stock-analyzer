@@ -30,7 +30,7 @@ def _st_plotly(fig, **kwargs):
     """plotly_chart wrapper for Streamlit versions without use_container_width."""
     try:
         if "use_container_width" in inspect.signature(st.plotly_chart).parameters:
-            return st.plotly_chart(fig, width='stretch', **kwargs)
+            return st.plotly_chart(fig, use_container_width=True, **kwargs)
     except Exception:
         pass
     return st.plotly_chart(fig, **kwargs)
@@ -80,7 +80,13 @@ st.sidebar.markdown("#### フィルタ（勝ちやすい局面）")
 rsi_low, rsi_high = st.sidebar.slider("RSI範囲", min_value=10, max_value=90, value=(40, 65), step=1)
 pb_low, pb_high = st.sidebar.slider("25日線乖離（%）(押し目用)", min_value=-20.0, max_value=5.0, value=(-6.0, -1.0), step=0.5)
 atr_min, atr_max = st.sidebar.slider("ATR%（動く幅）", min_value=0.5, max_value=15.0, value=(1.0, 6.0), step=0.5)
-vol_min = st.sidebar.number_input("20日平均出来高 下限", value=100000, step=10000, min_value=0)
+vol_min = st.sidebar.number_input("20日平均出来高 下限（株数）", value=100000, step=10000, min_value=0)
+
+# 売買代金フィルタ（推奨：株価×出来高）
+turnover_min_m = st.sidebar.number_input("20日平均 売買代金 下限（百万円）", value=0.0, step=10.0, min_value=0.0)
+regime_filter = st.sidebar.checkbox("地合いフィルタ（N225>SMA200 のときだけ）", value=False)
+min_trades_bt = st.sidebar.slider("バックテスト最低トレード数（少数トレードの誤差対策）", 0, 30, 8, step=1)
+pullback_allow_sma5_trigger = st.sidebar.checkbox("押し目トリガーを緩和（Close>SMA5 も許可）", value=True)
 
 st.sidebar.markdown("#### 出口（利確を伸ばす）")
 atr_mult = st.sidebar.slider("損切: ATR倍率", 0.5, 4.0, 1.5, step=0.1)
@@ -106,6 +112,10 @@ params = logic.SwingParams(
     atr_pct_min=float(atr_min),
     atr_pct_max=float(atr_max),
     vol_avg20_min=float(vol_min),
+    turnover_avg20_min_yen=float(turnover_min_m) * 1_000_000.0,
+    regime_filter=bool(regime_filter),
+    min_trades_bt=int(min_trades_bt),
+    pullback_allow_sma5_trigger=bool(pullback_allow_sma5_trigger),
     entry_mode=entry_mode_key,
     atr_mult_stop=float(atr_mult),
     tp1_r=float(tp1_r),
@@ -118,32 +128,59 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("🚀 全銘柄スキャン")
 scan_label = "🔥 スキャン開始（セクター→銘柄スキャン）" if sector_prefilter else "🔥 スキャン開始（JPX全銘柄）"
 scan_btn = st.sidebar.button(scan_label, type="primary")
+
 # ---- last scan diagnostics (persist across reruns) ----
-if "last_scan_diag" in st.session_state:
-    with st.sidebar.expander("🧾 前回スキャン診断（filter_stats）", expanded=False):
-        st.caption(st.session_state["last_scan_diag"].get("timestamp", ""))
-        if st.session_state["last_scan_diag"].get("error"):
-            st.error(st.session_state["last_scan_diag"]["error"])
-        if st.session_state["last_scan_diag"].get("stooq_probe"):
-            st.markdown("**stooq_probe（疎通テスト）**")
-            st.json(st.session_state["last_scan_diag"]["stooq_probe"])
-        st.json(st.session_state["last_scan_diag"].get("filter_stats", {}))
-        if st.session_state["last_scan_diag"].get("auto_relax_trace"):
-            st.markdown("**auto_relax_trace**")
-            st.json(st.session_state["last_scan_diag"]["auto_relax_trace"])
-        if st.session_state["last_scan_diag"].get("params_effective"):
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧾 診断JSON")
+
+diag = st.session_state.get("last_scan_diag")
+if isinstance(diag, dict) and diag:
+    ts = str(diag.get("timestamp", "latest"))
+    safe_ts = ts.replace(":", "").replace(" ", "_").replace("/", "-")
+
+    with st.sidebar.expander("🧾 前回スキャン診断（概要/統計/条件）", expanded=False):
+        st.caption(ts)
+        if diag.get("mode"):
+            st.markdown(f"**mode**: `{diag.get('mode')}`")
+        if diag.get("relax_level") is not None:
+            st.markdown(f"**relax_level**: `{diag.get('relax_level')}`")
+        if diag.get("selected_sectors"):
+            st.markdown("**selected_sectors**")
+            st.json(diag.get("selected_sectors", []))
+        if diag.get("filter_stats"):
+            st.markdown("**filter_stats**")
+            st.json(diag.get("filter_stats", {}))
+        if diag.get("params_effective"):
             st.markdown("**params_effective**")
-            st.json(st.session_state["last_scan_diag"]["params_effective"])
-        if st.session_state["last_scan_diag"].get("mode"):
-            st.markdown(f"**mode**: `{st.session_state['last_scan_diag']['mode']}`")
-        diag = st.session_state.get('last_scan_diag', {})
-        try:
-            ts = str(diag.get('timestamp','latest'))
-            safe_ts = ts.replace(':','').replace(' ','_').replace('/','-')
-            diag_json = json.dumps(diag, ensure_ascii=False, indent=2, default=str)
-            st.download_button('⬇️ 診断JSONをダウンロード', data=diag_json, file_name=f'scan_diag_{safe_ts}.json', mime='application/json')
-        except Exception as e:
-            st.caption(f'診断JSONの生成に失敗: {e}')
+            st.json(diag.get("params_effective", {}))
+        if diag.get("auto_relax_trace"):
+            st.markdown("**auto_relax_trace**")
+            st.json(diag.get("auto_relax_trace", []))
+
+    # ALWAYS show the download button in the sidebar (not in the main panel).
+    try:
+        diag_json = json.dumps(diag, ensure_ascii=False, indent=2, default=str)
+        st.sidebar.download_button(
+            "⬇️ 診断JSONをダウンロード",
+            data=diag_json,
+            file_name=f"scan_diag_{safe_ts}.json",
+            mime="application/json",
+        )
+    except Exception as e:
+        st.sidebar.caption(f"診断JSONの生成に失敗: {e}")
+
+    if st.sidebar.button("🧹 診断をクリア", help="前回診断を消します（スキャン結果は消えません）"):
+        st.session_state.pop("last_scan_diag", None)
+        st.rerun()
+else:
+    st.sidebar.caption("まだ診断JSONはありません。スキャン後にここに表示されます。")
+    st.sidebar.download_button(
+        "⬇️ 診断JSONをダウンロード",
+        data="{}",
+        file_name="scan_diag_empty.json",
+        mime="application/json",
+        disabled=True,
+    )
 
 
 # OpenAI key (optional)
@@ -167,7 +204,8 @@ if scan_btn:
             progress_bar.progress(pct)
             status_text.text(f"🔍 {info} ({current}/{total})")
 
-        res = logic.scan_swing_candidates(
+        try:
+            res = logic.scan_swing_candidates(
             budget_yen=int(budget),
             top_n=3,
             params=params,
@@ -179,18 +217,36 @@ if scan_btn:
             sector_method=str(sector_method_key),
             api_key=(api_key if sector_method_key == "ai_overlay" else None),
         )
+        except Exception as e:
+            # keep UI alive and persist diagnostics
+            status.update(label="❌ スキャン中に例外が発生しました", state="error", expanded=True)
+            st.exception(e)
+            res = {
+                "regime_ok": True,
+                "candidates": [],
+                "prelim_count": 0,
+                "bt_count": 0,
+                "selected_sectors": [],
+                "sector_ranking": [],
+                "universe": 0,
+                "filter_stats": {"error": str(e)},
+                "auto_relax_trace": [],
+                "error": str(e),
+                "params_effective": {"entry_mode": entry_mode_key},
+                "relax_level": 0,
+            }
 
 
         # Persist diagnostics (kept even after st.rerun())
         try:
             st.session_state["last_scan_diag"] = {
                 "timestamp": str(datetime.datetime.now()),
-                "mode": res.get("mode"),
+                "mode": (res.get("params_effective", {}) or {}).get("entry_mode"),
+                "relax_level": res.get("relax_level", 0),
+                "selected_sectors": res.get("selected_sectors", []),
                 "filter_stats": res.get("filter_stats", {}),
                 "params_effective": res.get("params_effective", {}),
                 "auto_relax_trace": res.get("auto_relax_trace", []),
-                "error": res.get("error", ""),
-                "stooq_probe": res.get("stooq_probe", []),
             }
         except Exception:
             pass
@@ -239,7 +295,7 @@ if scan_btn:
                 ts_local = datetime.now().strftime('%Y%m%d_%H%M%S')
                 diag = {
                     'timestamp': ts_local,
-                    'mode': str(mode_key),
+                    'mode': str(params_eff.get('entry_mode', entry_mode_key)),
                     'relax_level': int(relax_level),
                     'params_effective': params_eff,
                     'filter_stats': stats,
