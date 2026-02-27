@@ -24,11 +24,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-import time
-import io
-import requests
-from requests import Response
-
 def _stooq_symbol(ticker: str) -> str:
     """Convert common JP tickers to Stooq symbols.
     Examples:
@@ -78,53 +73,71 @@ def _period_to_start(period: str) -> pd.Timestamp:
     return start
 
 def _fetch_stooq_ohlc(symbol: str) -> pd.DataFrame:
-    """Fetch daily OHLCV from Stooq CSV endpoint (robust).
+    """Fetch daily OHLCV from Stooq CSV endpoint.
 
-    Stooq は短時間に大量アクセスすると 429/403 になることがあります。
-    ここでは User-Agent 付与 + endpoint フォールバック + リトライ を入れています。
-    失敗時は例外を投げず空DFを返します（上位で統計に反映）。
+    安定化ポイント:
+    - stooq.pl / stooq.com の両方を試す
+    - User-Agent 付与（requestsの既定UAで弾かれる環境対策）
+    - 429/5xx/一時的なネットワーク失敗はリトライ（指数バックオフ）
+    - 返ってきた内容がCSVっぽくない場合（HTMLなど）は失敗として扱う
     """
-    endpoints = [
-        "https://stooq.com",
-        "https://stooq.pl",
-    ]
+    symbol = str(symbol).strip()
+    if not symbol:
+        return pd.DataFrame()
+
+    bases = ("https://stooq.pl", "https://stooq.com")
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; ai-stock-analyzer/1.0; +https://stooq.com)",
-        "Accept": "text/csv,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (compatible; ai-stock-analyzer/1.0)",
+        "Accept": "text/csv,text/plain;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,ja;q=0.8",
+        "Connection": "keep-alive",
     }
+    retry_status = {429, 500, 502, 503, 504}
+    last_err: Optional[Exception] = None
 
-    for base in endpoints:
+    for base in bases:
         url = f"{base}/q/d/l/?s={symbol}&i=d"
-        for attempt in range(1, 4):
+        for attempt in range(4):
             try:
-                r: Response = requests.get(url, headers=headers, timeout=15)
-                if r.status_code == 429:
-                    time.sleep(min(2.0 * attempt, 6.0))
-                    continue
+                r = requests.get(url, headers=headers, timeout=(6, 30))
+                if r.status_code in retry_status:
+                    raise RuntimeError(f"stooq HTTP {r.status_code}")
                 r.raise_for_status()
-
-                df = pd.read_csv(io.StringIO(r.text))
-                if df is None or df.empty or "Date" not in df.columns:
+                text = r.text or ""
+                # quick sanity: must include header line with Date
+                head = text.lstrip()[:200].lower()
+                if "date" not in head or "," not in head:
+                    raise ValueError("stooq response is not CSV")
+                df = pd.read_csv(io.StringIO(text))
+                if df.empty or ("Date" not in df.columns):
                     return pd.DataFrame()
-
                 df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
                 df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-
                 if "Adj Close" not in df.columns and "Close" in df.columns:
                     df["Adj Close"] = df["Close"]
-
                 cols = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
-                return df[cols]
-            except Exception:
-                time.sleep(min(0.6 * attempt, 2.0))
-                continue
+                out = df[cols].copy()
+                # numeric coerce
+                for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+                    if c in out.columns:
+                        out[c] = pd.to_numeric(out[c], errors="coerce")
+                out = out.dropna(subset=["Close"]).sort_index()
+                return out
+            except Exception as e:
+                last_err = e
+                # backoff with jitter
+                time.sleep(min(2.0, 0.3 * (2 ** attempt)) + random.random() * 0.2)
 
+    # fail
     return pd.DataFrame()
 
 import pytz
 import streamlit as st
 import requests
 import io
+import time
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 
 TOKYO = pytz.timezone("Asia/Tokyo")
@@ -793,19 +806,41 @@ def _chunk(lst: List[str], n: int) -> List[List[str]]:
 def _download_chunk_ohlcv(tickers: Tuple[str, ...], period: str = "6mo") -> pd.DataFrame:
     """Download OHLCV for multiple tickers via Stooq and return MultiIndex columns.
     Columns: level0=ticker, level1=field.
+
+    直列取得だと全銘柄スキャンで時間切れになりやすいので、
+    “軽い並列”で取得を短縮（最大8本まで同時）。
     """
+    if not tickers:
+        return pd.DataFrame()
+
     frames: Dict[str, pd.DataFrame] = {}
-    for t in tickers:
-        df = get_market_data(t, period=period)
-        if df is None or df.empty:
-            continue
-        frames[t] = df
+
+    max_workers = int(min(8, max(1, len(tickers))))
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(get_market_data, t, period=period): t for t in tickers}
+            for fut in as_completed(futs):
+                t = futs[fut]
+                try:
+                    df = fut.result()
+                except Exception:
+                    continue
+                if df is None or df.empty:
+                    continue
+                frames[t] = df
+    except Exception:
+        # fallback
+        for t in tickers:
+            df = get_market_data(t, period=period)
+            if df is None or df.empty:
+                continue
+            frames[t] = df
 
     if not frames:
         return pd.DataFrame()
 
     all_idx = sorted(set().union(*[set(df.index) for df in frames.values()]))
-    out = {}
+    out: Dict[Tuple[str, str], np.ndarray] = {}
     for t, df in frames.items():
         df2 = df.reindex(all_idx)
         for field in df2.columns:
@@ -1402,7 +1437,7 @@ def scan_swing_candidates(
         "universe": len(tickers),
         "chunks": 0,
         "chunk_empty": 0,
-        "symbols_in_empty_chunks": 0,
+        "chunk_empty_tickers": 0,
         "data_ok": 0,
         "budget_ok": 0,
         "trend_ok": 0,
@@ -1436,7 +1471,8 @@ def scan_swing_candidates(
         df_multi = _download_chunk_ohlcv(tuple(c), period="6mo")
         if df_multi is None or df_multi.empty:
             stats["chunk_empty"] += 1
-            stats["symbols_in_empty_chunks"] += len(c)
+            stats["chunk_empty_tickers"] += len(c)
+            stats["fail_data_short"] += len(c)
             continue
 
         for t in c:
@@ -1757,13 +1793,12 @@ def scan_swing_candidates(
         reverse=True,
     )
 
-
-
-    # --- Error hinting (for diagnostics) ---
+    # --- summarize error for UI (sidebar diagnostics) ---
     error_msg = ""
-    if int(stats.get("data_ok", 0)) == 0 and int(stats.get("symbols_in_empty_chunks", 0)) > 0:
-        error_msg = "価格データ取得が全滅しました（Stooq側のブロック/通信/シンボル変換の可能性）。時間をおいて再実行、セクター絞り込みON、またはスキャン対象数を減らしてください。"
-
+    if int(stats.get("data_ok", 0)) == 0:
+        error_msg = "OHLCVデータを取得できませんでした（data_ok=0）。Stooqへのアクセス制限/ネットワーク/ティッカー形式をご確認ください。"
+    elif not ranked:
+        error_msg = "条件クリア銘柄が0件でした（データ取得は成功）。フィルタが厳しすぎる可能性があります。"
 
     return {
         "regime_ok": regime_ok,
