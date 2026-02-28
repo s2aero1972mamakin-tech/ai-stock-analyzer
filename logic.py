@@ -1,17 +1,17 @@
 # logic.py
 # -*- coding: utf-8 -*-
 """
-JPX Swing Auto Scanner logic — FIXED2
-- JPX公式 data_j.xls を「xlrd無しでも」読み取れるようにフォールバック（read_html）を実装
+JPX Swing Auto Scanner logic — FIXED3
+- JPX公式 data_j.xls を read_excel 失敗時に read_html でフォールバック
 - Stooq CSV取得はタイムアウト/リトライ/バックオフ付き
-- 診断用 filter_stats を維持（後方互換）+ fail_budget 追加
+- filter_stats 後方互換維持 + fail_budget 追加
 """
 
 from __future__ import annotations
 
 import dataclasses
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from io import BytesIO, StringIO
 from typing import Callable, Dict, List, Optional
 
@@ -20,7 +20,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-LOGIC_BUILD = "STABLE5d-2026-02-28-FIXED2"
+LOGIC_BUILD = "STABLE5d-2026-02-28-FIXED3"
 
 JPX_XLS_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
 STOOQ_URLS = [
@@ -28,9 +28,9 @@ STOOQ_URLS = [
     "https://stooq.com/q/d/l/?s={sym}&i=d",
 ]
 
+
 @dataclass(frozen=True)
 class SwingParams:
-    # 後方互換：mainがSwingParams()で呼ぶだけでも動くよう最小限を保持
     entry_mode: str = "pullback"
     require_sma25_over_sma75: bool = True
     rsi_low: float = 40.0
@@ -47,10 +47,6 @@ class SwingParams:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_jpx_master() -> pd.DataFrame:
-    """
-    JPX公式 data_j.xls を取得して ticker/name/sector を返す。
-    Streamlit Cloudで xlrd が無いケースがあるため、read_excel 失敗時は read_html でフォールバックする。
-    """
     try:
         r = requests.get(JPX_XLS_URL, timeout=30)
         r.raise_for_status()
@@ -58,20 +54,17 @@ def get_jpx_master() -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-    # 1) read_excel を試す（xlrdがある環境では最も確実）
     try:
         df = pd.read_excel(BytesIO(content))
         return _normalize_jpx(df)
     except Exception:
         pass
 
-    # 2) フォールバック：実体がHTMLテーブルとして配布される/解釈できる環境向け
     try:
         html = content.decode("cp932", errors="ignore")
         tables = pd.read_html(StringIO(html))
         if not tables:
             return pd.DataFrame()
-        # 先頭テーブルが本体であることが多い
         df = tables[0]
         return _normalize_jpx(df)
     except Exception:
@@ -81,9 +74,6 @@ def get_jpx_master() -> pd.DataFrame:
 def _normalize_jpx(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
-
-    # 期待列
-    # 日本語列: コード, 銘柄名, 33業種区分
     cols = set(df.columns.astype(str).tolist())
     need = {"コード", "銘柄名", "33業種区分"}
     if not need.issubset(cols):
@@ -163,7 +153,6 @@ def _slice_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
     return df.tail(730)
 
 
-# --- indicators (minimal stable set) ---
 def sma(s: pd.Series, n: int) -> pd.Series:
     return s.rolling(n).mean()
 
@@ -204,7 +193,6 @@ def _passes_filters(ind: pd.DataFrame, params: SwingParams, stats: Dict[str, int
     if ind is None or ind.empty:
         stats["fail_data"] += 1
         return False
-
     latest = ind.iloc[-1]
 
     if params.require_sma25_over_sma75 and not (float(latest["SMA_25"]) > float(latest["SMA_75"])):
@@ -226,15 +214,12 @@ def _passes_filters(ind: pd.DataFrame, params: SwingParams, stats: Dict[str, int
         stats["fail_vol"] += 1
         return False
 
-    # setup: pullback の簡易版（厳しすぎて0件にならないよう、triggerを緩める）
+    sma_diff = float(latest["SMA_DIFF"])
     if params.entry_mode == "pullback":
-        sma_diff = float(latest["SMA_DIFF"])
-        pb_ok = params.pullback_low <= sma_diff <= params.pullback_high
-        if not pb_ok:
+        if not (params.pullback_low <= sma_diff <= params.pullback_high):
             stats["fail_setup"] += 1
             return False
     else:
-        # breakout簡易
         lb = int(params.breakout_lookback)
         if len(ind) < lb + 2:
             stats["fail_setup"] += 1
@@ -280,7 +265,7 @@ def scan_swing_candidates(
             "filter_stats": stats,
             "auto_relax_trace": auto_relax_trace,
             "params_effective": dataclasses.asdict(params),
-            "error": "JPXマスター取得に失敗（xlrd無し環境の場合はread_htmlフォールバックを使用しますが、それでも失敗しました）",
+            "error": "JPXマスター取得に失敗（ネットワーク/JPX側仕様/HTML解釈）",
         }
 
     selected_sectors: List[str] = []
@@ -307,11 +292,9 @@ def scan_swing_candidates(
             continue
 
         price = float(ind.iloc[-1]["Close"])
-        # 後方互換：100株想定
         if price * 100 > float(budget_yen):
             stats["fail_budget"] += 1
             continue
-
         stats["budget_ok"] += 1
 
         row = master[master["ticker"] == t].iloc[0]
@@ -324,9 +307,7 @@ def scan_swing_candidates(
             "atr_pct": float(ind.iloc[-1]["ATR_PCT"]),
         }
         prelim.append(item)
-        partial_top = prelim[:]
-        if len(partial_top) > partial_limit:
-            partial_top = partial_top[:partial_limit]
+        partial_top = prelim[:partial_limit]
 
     prelim = sorted(prelim, key=lambda x: x["atr_pct"], reverse=True)
     return {
