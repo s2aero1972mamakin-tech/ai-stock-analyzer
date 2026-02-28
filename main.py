@@ -1,10 +1,11 @@
 # main.py
 # -*- coding: utf-8 -*-
 """
-JPX Swing Auto Scanner (Stooq) — STABLE5d FIXED FULL
-- インデント崩れを根絶（IndentationError対策）
-- 診断JSONを常時DL可能（途中/中断も含む）
-- 中断検知（一定時間progress更新が無い場合は interrupted 扱い）
+JPX Swing Auto Scanner（Fixed3）
+- 初期表示で「候補なし」と出さない（"スキャン開始してください" に変更）
+- 前回の/tmp診断JSONが残っていても、初回は「未実行」扱いを優先
+- 診断JSONはスキャン開始後に生成（途中DL可）
+- 中断検知（無更新3分で interrupted）
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ import dataclasses
 import datetime as dt
 import json
 import os
-import time
 import traceback
 
 import pandas as pd
@@ -21,10 +21,11 @@ import streamlit as st
 
 import logic
 
-APP_BUILD = "STABLE5d-2026-02-28-FIXED2"
+APP_BUILD = "STABLE5d-2026-02-28-FIXED3"
 TMP_DIAG_PATH = "/tmp/ai_stock_scan_diag_latest.json"
+STALL_SECONDS = 180  # 3 minutes
 
-# ----- helpers -----
+
 def _json_dumps(obj) -> str:
     def default(o):
         if dataclasses.is_dataclass(o):
@@ -66,7 +67,7 @@ def _ensure_state():
         "partial_candidates": [],
         "scan_meta": {},
         "last_scan_diag": None,
-        "last_progress_ts": None,
+        "has_scanned_once": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -90,9 +91,44 @@ def _init_diag(mode: str, params: dict) -> dict:
     }
 
 
+def _maybe_mark_interrupted(diag: dict) -> dict:
+    if not diag or diag.get("status") != "running":
+        return diag
+    try:
+        updated_at = diag.get("updated_at")
+        if not updated_at:
+            return diag
+        last = dt.datetime.fromisoformat(updated_at)
+        if (dt.datetime.now() - last).total_seconds() > STALL_SECONDS:
+            diag["status"] = "interrupted"
+            diag["stage"] = "stalled"
+            diag["error"] = diag.get("error") or "progress更新が一定時間止まったため interrupted 扱い"
+            diag["updated_at"] = str(dt.datetime.now())
+            _save_diag(diag)
+        return diag
+    except Exception:
+        return diag
+
+
 def _diag_sidebar(diag: dict | None):
     st.sidebar.caption(f"build: {APP_BUILD}")
     st.sidebar.subheader("🧾 診断JSON")
+
+    if (not st.session_state.get("has_scanned_once")) and (diag is None):
+        st.sidebar.info("未実行です。左の「🔥 スキャン開始」を押してください。")
+        if st.sidebar.button("📦 /tmp の診断JSONを読み込む（必要時）"):
+            d = _load_diag()
+            if d:
+                st.session_state["last_scan_diag"] = d
+                st.rerun()
+        if st.sidebar.button("🧹 /tmp の診断JSONを削除"):
+            try:
+                if os.path.exists(TMP_DIAG_PATH):
+                    os.remove(TMP_DIAG_PATH)
+            except Exception:
+                pass
+            st.sidebar.success("削除しました。")
+        return
 
     if not diag:
         diag = _load_diag()
@@ -103,24 +139,29 @@ def _diag_sidebar(diag: dict | None):
         st.sidebar.info("スキャン開始後に診断JSONが生成されます（途中でもDL可）。")
         return
 
-    # 中断判定（watchdog）
-    # running/scanning のまま一定時間更新が無ければ interrupted 扱いにしてUIが固まらないようにする
-    if diag.get("status") == "running":
+    diag = _maybe_mark_interrupted(diag)
+    ts = str(diag.get("timestamp", "diag")).replace(":", "-").replace(" ", "_")
+
+    cols = st.sidebar.columns([1, 1])
+    if cols[0].button("🧹 クリア"):
+        st.session_state["last_scan_diag"] = None
+        st.session_state["auto_candidates"] = []
+        st.session_state["partial_candidates"] = []
+        st.session_state["scan_meta"] = {}
+        st.session_state["has_scanned_once"] = False
         try:
-            updated_at = diag.get("updated_at")
-            if updated_at:
-                last = dt.datetime.fromisoformat(updated_at)
-                if (dt.datetime.now() - last).total_seconds() > 180:  # 3分無更新
-                    diag["status"] = "interrupted"
-                    diag["stage"] = "stalled"
-                    diag["error"] = diag.get("error") or "progress更新が一定時間止まったため interrupted 扱い"
-                    diag["updated_at"] = str(dt.datetime.now())
-                    st.session_state["last_scan_diag"] = diag
-                    _save_diag(diag)
+            if os.path.exists(TMP_DIAG_PATH):
+                os.remove(TMP_DIAG_PATH)
         except Exception:
             pass
+        st.rerun()
 
-    ts = str(diag.get("timestamp", "diag")).replace(":", "-").replace(" ", "_")
+    if cols[1].button("📦 再読込"):
+        d = _load_diag()
+        if d:
+            st.session_state["last_scan_diag"] = d
+        st.rerun()
+
     st.sidebar.download_button(
         "⬇️ 診断JSONをダウンロード",
         data=_json_dumps(diag),
@@ -137,41 +178,36 @@ def _diag_sidebar(diag: dict | None):
         st.json(diag, expanded=False)
 
 
-# ----- UI -----
 st.set_page_config(page_title="JPX Swing Auto Scanner", layout="wide")
 _ensure_state()
 
-st.title("📈 JPX Swing Auto Scanner（Fixed2）")
-st.caption("JPX銘柄ユニバースはJPX公式XLSから生成。診断JSONは常時DL可。")
+st.title("📈 JPX Swing Auto Scanner（Fixed3）")
+st.caption("初期表示は『未実行』。スキャン開始後に結果/診断が表示されます。")
 
-diag = st.session_state.get("last_scan_diag")
-_diag_sidebar(diag)
+_diag_sidebar(st.session_state.get("last_scan_diag"))
 
 st.sidebar.header("⚙️ スキャン設定")
 budget = st.sidebar.number_input("想定資金（円）", min_value=50_000, max_value=10_000_000, value=300_000, step=50_000)
 top_n = st.sidebar.slider("表示候補数", 1, 10, 3, step=1)
-bt_period = st.sidebar.selectbox("期間（簡易）", ["1y", "2y", "3y", "5y"], index=1)
+period = st.sidebar.selectbox("期間（簡易）", ["1y", "2y", "3y", "5y"], index=1)
 sector_prefilter = st.sidebar.checkbox("セクター事前絞り込み（高速化）", value=True)
 sector_top_n = st.sidebar.slider("上位セクター数", 2, 12, 6, step=1)
-
-st.sidebar.markdown("---")
 scan_btn = st.sidebar.button("🔥 スキャン開始", type="primary")
 
-params = logic.SwingParams()  # UI拡張は後で（後方互換）
+params = logic.SwingParams()
 
 if scan_btn:
     st.session_state["pending_scan"] = True
     st.session_state["auto_candidates"] = []
     st.session_state["partial_candidates"] = []
     st.session_state["scan_meta"] = {}
-    st.session_state["last_progress_ts"] = time.time()
+    st.session_state["has_scanned_once"] = True
 
     diag = _init_diag(mode=params.entry_mode, params=dataclasses.asdict(params))
     st.session_state["last_scan_diag"] = diag
     _save_diag(diag)
     st.rerun()
 
-# ---- Two-phase execution ----
 if st.session_state.get("pending_scan"):
     st.session_state["pending_scan"] = False
 
@@ -182,7 +218,6 @@ if st.session_state.get("pending_scan"):
         pct = int((current / max(1, total)) * 100)
         progress_bar.progress(min(100, max(0, pct)))
         status_text.text(f"🔍 {info} ({current}/{total})")
-        st.session_state["last_progress_ts"] = time.time()
 
         d = st.session_state.get("last_scan_diag") or {}
         d["updated_at"] = str(dt.datetime.now())
@@ -204,7 +239,7 @@ if st.session_state.get("pending_scan"):
                 top_n=int(top_n),
                 params=params,
                 progress_callback=update_progress,
-                period=bt_period,
+                period=period,
                 sector_prefilter=bool(sector_prefilter),
                 sector_top_n=int(sector_top_n),
             )
@@ -239,18 +274,20 @@ if st.session_state.get("pending_scan"):
         _save_diag(d)
         st.exception(e)
 
-# ----- results -----
 st.markdown("## 🎯 スキャン結果")
 
-diag = st.session_state.get("last_scan_diag") or {}
-if diag.get("status") in ("running",) and diag.get("stage") in ("queued", "scanning"):
-    st.warning("スキャン進行中です。途中候補を表示します。")
-    partial = st.session_state.get("partial_candidates") or []
-    if partial:
-        st.dataframe(pd.DataFrame(partial), use_container_width=True)
+if not st.session_state.get("has_scanned_once"):
+    st.info("未実行です。左の「🔥 スキャン開始」を押してください。")
 else:
-    cands = st.session_state.get("auto_candidates") or []
-    if not cands:
-        st.info("候補なし。サイドバーの診断JSONの filter_stats を確認してください。")
+    diag = st.session_state.get("last_scan_diag") or {}
+    if diag.get("status") == "running" and diag.get("stage") in ("queued", "scanning"):
+        st.warning("スキャン進行中です。途中候補を表示します。")
+        partial = st.session_state.get("partial_candidates") or []
+        if partial:
+            st.dataframe(pd.DataFrame(partial), use_container_width=True)
     else:
-        st.dataframe(pd.DataFrame(cands), use_container_width=True)
+        cands = st.session_state.get("auto_candidates") or []
+        if not cands:
+            st.info("候補なし。サイドバーの診断JSONの filter_stats を確認してください。")
+        else:
+            st.dataframe(pd.DataFrame(cands), use_container_width=True)
