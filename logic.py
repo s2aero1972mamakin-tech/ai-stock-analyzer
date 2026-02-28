@@ -1,35 +1,33 @@
 # logic.py
 # -*- coding: utf-8 -*-
 """
-JPX Swing Auto Scanner logic — STABLE5b-2026-02-28 (FULL)
-- Stooq daily data
-- Indicator calc (SMA/RSI/ATR/Volume/Turnover)
-- Scan with filters + prelim score + topK backtest
-- Always returns diagnostic fields so main can show JSON.
+JPX Swing Auto Scanner logic — STABLE5c-2026-02-28 (FULL)
+- JPXユニバース: JPX公式の「東証上場銘柄一覧（33業種）」Excelから生成（CSV不要）
+- データ: Stooq（日足CSV）
+- 指標: SMA/RSI/ATR/出来高/売買代金
+- フィルタ→Prelimスコア→TopK簡易バックテスト→ランキング
+- 0件時 auto-relax（pullback→breakout + 条件緩和 + sector OFF 再スキャン）
 """
 
 from __future__ import annotations
 
 import dataclasses
 import math
-import os
 import time
 import traceback
 from dataclasses import dataclass, replace
-from typing import Callable, Dict, List, Optional, Tuple
+from io import BytesIO
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import requests
+import streamlit as st
 
-
-LOGIC_BUILD = "STABLE5b-2026-02-28"
+LOGIC_BUILD = "STABLE5c-2026-02-28"
 _STOOQ_DOMAINS = ["stooq.pl", "stooq.com"]
 
 
-# -------------------------
-# Params / Result types
-# -------------------------
 @dataclass(frozen=True)
 class SwingParams:
     require_sma25_over_sma75: bool = True
@@ -71,7 +69,50 @@ class BacktestResult:
 
 
 # -------------------------
-# Data access (Stooq)
+# JPX master (no CSV)
+# -------------------------
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_jpx_master() -> pd.DataFrame:
+    """
+    JPX公式の「東証上場銘柄一覧（33業種）」Excelを取得して ticker,name,sector を返す。
+    取得失敗時は空DataFrameを返す（呼び出し側でエラー処理）。
+    """
+    url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
+    try:
+        df = pd.read_excel(url)
+    except Exception:
+        try:
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            # xlrd は requirements に入っている前提（あなたの環境ログにあり）
+            df = pd.read_excel(BytesIO(r.content), engine="xlrd")
+        except Exception:
+            return pd.DataFrame()
+
+    needed = {"コード", "銘柄名", "33業種区分"}
+    if not needed.issubset(set(df.columns)):
+        return pd.DataFrame()
+
+    df = df.copy()
+    df = df[df["33業種区分"].notna()]
+    df = df[df["33業種区分"] != "-"]
+    df["ticker"] = df["コード"].astype(str).str.zfill(4) + ".T"
+    df = df.rename(columns={"銘柄名": "name", "33業種区分": "sector"})
+    return df[["ticker", "name", "sector"]].drop_duplicates().reset_index(drop=True)
+
+
+def get_company_name(ticker: str) -> str:
+    m = get_jpx_master()
+    if m.empty:
+        return ticker
+    row = m[m["ticker"] == ticker]
+    if row.empty:
+        return ticker
+    return str(row.iloc[0]["name"])
+
+
+# -------------------------
+# Data (Stooq)
 # -------------------------
 def _stooq_symbol(ticker: str) -> str:
     t = str(ticker).strip()
@@ -79,12 +120,12 @@ def _stooq_symbol(ticker: str) -> str:
         code = t[:-2]
         if code.isdigit():
             return f"{code}.jp"
-    if re_match := __import__("re").match(r"^\d{4}$", t):
+    if len(t) == 4 and t.isdigit():
         return f"{t}.jp"
     return t
 
 
-def _http_get_csv(url: str, timeout: int = 20, retries: int = 3) -> Optional[str]:
+def _http_get_csv(url: str, timeout: int = 25, retries: int = 3) -> Optional[str]:
     headers = {"User-Agent": "Mozilla/5.0 (compatible; ai-stock-analyzer/1.0)"}
     backoff = 1.0
     for _ in range(retries):
@@ -97,7 +138,6 @@ def _http_get_csv(url: str, timeout: int = 20, retries: int = 3) -> Optional[str
             if r.status_code != 200:
                 return None
             text = r.text
-            # quick sanity
             if "Date,Open,High,Low,Close" not in text[:200]:
                 return None
             return text
@@ -107,9 +147,8 @@ def _http_get_csv(url: str, timeout: int = 20, retries: int = 3) -> Optional[str
     return None
 
 
-def get_market_data(ticker: str, period: str = "2y") -> pd.DataFrame:
+def get_market_data(ticker: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
     sym = _stooq_symbol(ticker)
-    # Stooq daily data API (CSV). We keep it simple: fetch and slice client-side.
     for dom in _STOOQ_DOMAINS:
         url = f"https://{dom}/q/d/l/?s={sym}&i=d"
         text = _http_get_csv(url)
@@ -117,15 +156,13 @@ def get_market_data(ticker: str, period: str = "2y") -> pd.DataFrame:
             continue
         try:
             from io import StringIO
+
             df = pd.read_csv(StringIO(text))
             if df.empty:
                 continue
             df.columns = [c.strip().capitalize() for c in df.columns]
             df["Date"] = pd.to_datetime(df["Date"])
             df = df.set_index("Date").sort_index()
-            for c in ["Open", "High", "Low", "Close"]:
-                if c not in df.columns:
-                    return pd.DataFrame()
             if "Volume" not in df.columns:
                 df["Volume"] = np.nan
             df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
@@ -179,7 +216,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     out = df.copy()
-    out["SMA_5"] = sma(out["Close"], 5)
     out["SMA_25"] = sma(out["Close"], 25)
     out["SMA_75"] = sma(out["Close"], 75)
     out["RSI"] = rsi(out["Close"], 14)
@@ -192,35 +228,6 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["TURNOVER_AVG_20"] = out["TURNOVER"].rolling(20).mean()
     out = out.dropna()
     return out
-
-
-# -------------------------
-# Master list (JPX)
-# -------------------------
-def load_jpx_master() -> pd.DataFrame:
-    """
-    期待: repoに以下いずれかを置く
-      - jpx_master.csv  (columns: ticker,name,sector)
-      - data/jpx_master.csv
-    tickerは "8306.T" 形式推奨。なければエラーを返す。
-    """
-    candidates = ["jpx_master.csv", os.path.join("data", "jpx_master.csv")]
-    for p in candidates:
-        if os.path.exists(p):
-            df = pd.read_csv(p)
-            # normalize
-            cols = {c.lower(): c for c in df.columns}
-            need = ["ticker"]
-            if not all(k in cols for k in need):
-                continue
-            if "name" not in cols:
-                df["name"] = ""
-            if "sector" not in cols:
-                df["sector"] = "UNKNOWN"
-            df = df.rename(columns={cols["ticker"]: "ticker", cols.get("name", "name"): "name", cols.get("sector", "sector"): "sector"})
-            df["ticker"] = df["ticker"].astype(str)
-            return df[["ticker", "name", "sector"]].copy()
-    return pd.DataFrame()
 
 
 # -------------------------
@@ -259,7 +266,7 @@ def _score_prelim(latest: pd.Series, params: SwingParams) -> float:
         vr = float(latest.get("VOL_RATIO", 1.0))
         setup = min(1.0, max(0.0, (vr - 1.0) / (params.breakout_vol_ratio - 1.0 + 1e-9)))
 
-    return float(35*trend + 25*liq + 15*setup + 15*rsi_s + 10*atr_s)
+    return float(35 * trend + 25 * liq + 15 * setup + 15 * rsi_s + 10 * atr_s)
 
 
 def _passes_filters(ind: pd.DataFrame, params: SwingParams, stats: Dict[str, int]) -> bool:
@@ -295,7 +302,6 @@ def _passes_filters(ind: pd.DataFrame, params: SwingParams, stats: Dict[str, int
             stats["fail_turnover"] += 1
             return False
 
-    # setup
     if params.entry_mode == "pullback":
         sma_diff = float(latest["SMA_DIFF"])
         pb_ok = params.pullback_low <= sma_diff <= params.pullback_high
@@ -308,7 +314,7 @@ def _passes_filters(ind: pd.DataFrame, params: SwingParams, stats: Dict[str, int
         if len(ind) < lb + 2:
             stats["fail_setup"] += 1
             return False
-        prev_high = float(ind["High"].iloc[-lb-1:-1].max())
+        prev_high = float(ind["High"].iloc[-lb - 1 : -1].max())
         breakout = float(latest["Close"]) > prev_high
         vr = float(latest["VOL_RATIO"])
         if not (breakout and vr >= params.breakout_vol_ratio):
@@ -320,7 +326,7 @@ def _passes_filters(ind: pd.DataFrame, params: SwingParams, stats: Dict[str, int
 
 
 # -------------------------
-# Backtest (simple R model)
+# Backtest (same as previous)
 # -------------------------
 def _max_drawdown(equity: pd.Series) -> float:
     if equity is None or equity.empty:
@@ -346,10 +352,9 @@ def backtest_swing(df_ind: pd.DataFrame, params: SwingParams) -> BacktestResult:
 
     for i in range(1, len(df)):
         row = df.iloc[i]
-        prev = df.iloc[i-1]
+        prev = df.iloc[i - 1]
 
         if not in_pos:
-            # Entry signal
             if params.entry_mode == "pullback":
                 sma_diff = float(row["SMA_DIFF"])
                 pb_ok = params.pullback_low <= sma_diff <= params.pullback_high
@@ -362,7 +367,7 @@ def backtest_swing(df_ind: pd.DataFrame, params: SwingParams) -> BacktestResult:
                 if i <= lb + 1:
                     equity.append(eq)
                     continue
-                prev_high = float(df["High"].iloc[i-lb:i].max())
+                prev_high = float(df["High"].iloc[i - lb : i].max())
                 breakout = float(row["Close"]) > prev_high
                 vr = float(row["VOL_RATIO"])
                 if not (breakout and vr >= params.breakout_vol_ratio):
@@ -384,7 +389,6 @@ def backtest_swing(df_ind: pd.DataFrame, params: SwingParams) -> BacktestResult:
             equity.append(eq)
             continue
 
-        # In position
         low = float(row["Low"])
         high = float(row["High"])
         close = float(row["Close"])
@@ -392,8 +396,7 @@ def backtest_swing(df_ind: pd.DataFrame, params: SwingParams) -> BacktestResult:
         held = i - entry_i
 
         if low <= stop:
-            # stop-out
-            r = -1.0 if not tp1_hit else 0.0  # after tp1, stop moved to entry (BE)
+            r = -1.0 if not tp1_hit else 0.0
             eq += r
             trades.append({"entry_i": entry_i, "exit_i": i, "r": r, "reason": "stop"})
             in_pos = False
@@ -401,7 +404,7 @@ def backtest_swing(df_ind: pd.DataFrame, params: SwingParams) -> BacktestResult:
             continue
 
         if high >= tp2:
-            r = float(params.tp2_r) if not tp1_hit else (float(params.tp1_r)*0.5 + float(params.tp2_r)*0.5)
+            r = float(params.tp2_r) if not tp1_hit else (float(params.tp1_r) * 0.5 + float(params.tp2_r) * 0.5)
             eq += r
             trades.append({"entry_i": entry_i, "exit_i": i, "r": r, "reason": "tp2"})
             in_pos = False
@@ -409,7 +412,6 @@ def backtest_swing(df_ind: pd.DataFrame, params: SwingParams) -> BacktestResult:
             continue
 
         if (not tp1_hit) and high >= tp1:
-            # realize half at tp1, move stop to BE
             eq += float(params.tp1_r) * 0.5
             stop = entry
             tp1_hit = True
@@ -426,7 +428,7 @@ def backtest_swing(df_ind: pd.DataFrame, params: SwingParams) -> BacktestResult:
 
         equity.append(eq)
 
-    equity_curve = pd.Series(equity, index=df.index[:len(equity)])
+    equity_curve = pd.Series(equity, index=df.index[: len(equity)])
     trades_df = pd.DataFrame(trades)
 
     if trades_df.empty:
@@ -434,10 +436,10 @@ def backtest_swing(df_ind: pd.DataFrame, params: SwingParams) -> BacktestResult:
 
     wins = trades_df[trades_df["r"] > 0]
     losses = trades_df[trades_df["r"] < 0]
-    win_rate = float(len(wins)/len(trades_df))
+    win_rate = float(len(wins) / len(trades_df))
     gross_profit = float(wins["r"].sum()) if not wins.empty else 0.0
     gross_loss = float(-losses["r"].sum()) if not losses.empty else 0.0
-    profit_factor = float(gross_profit/gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+    profit_factor = float(gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
     expectancy = float(trades_df["r"].mean())
     avg_win = float(wins["r"].mean()) if not wins.empty else 0.0
     avg_loss = float(losses["r"].mean()) if not losses.empty else 0.0
@@ -464,13 +466,13 @@ def _rank_score(bt: BacktestResult, years: float) -> float:
     if not np.isfinite(pf):
         pf = 5.0
     pf = float(min(5.0, max(0.0, pf)))
-    dd = float(bt.max_drawdown)  # negative
-    dd_pen = math.exp(-abs(dd) / 0.25)  # dd_ref=25%
-    return float((bt.expectancy_r * 120.0) * sample_pen * (1.0 + freq) * (0.5 + 0.1*pf) * dd_pen)
+    dd = float(bt.max_drawdown)
+    dd_pen = math.exp(-abs(dd) / 0.25)
+    return float((bt.expectancy_r * 120.0) * sample_pen * (1.0 + freq) * (0.5 + 0.1 * pf) * dd_pen)
 
 
 # -------------------------
-# Scan
+# Scan with auto-relax
 # -------------------------
 def scan_swing_candidates(
     budget_yen: int,
@@ -483,13 +485,6 @@ def scan_swing_candidates(
     sector_top_n: int = 6,
     relax_level: int = 0,
 ) -> Dict[str, object]:
-    """
-    Returns:
-      - candidates: list
-      - filter_stats: dict
-      - params_effective: dict
-      - error: optional
-    """
     stats = {
         "universe": 0,
         "pass": 0,
@@ -500,10 +495,11 @@ def scan_swing_candidates(
         "fail_vol": 0,
         "fail_turnover": 0,
         "fail_setup": 0,
+        "budget_ok": 0,
     }
     auto_relax_trace: List[dict] = []
 
-    master = load_jpx_master()
+    master = get_jpx_master()
     if master.empty:
         return {
             "mode": params.entry_mode,
@@ -513,12 +509,11 @@ def scan_swing_candidates(
             "relax_level": relax_level,
             "params_effective": dataclasses.asdict(params),
             "auto_relax_trace": auto_relax_trace,
-            "error": "JPX masterが見つかりません（jpx_master.csv を配置してください）。",
+            "error": "JPXマスター（JPX公式Excel）の取得に失敗しました。ネットワーク/JPX側変更を確認してください。",
         }
 
-    # sector prefilter (simple by frequency)
     selected_sectors: List[str] = []
-    if sector_prefilter and "sector" in master.columns:
+    if sector_prefilter:
         vc = master["sector"].astype(str).value_counts()
         selected_sectors = vc.head(int(sector_top_n)).index.tolist()
         master = master[master["sector"].astype(str).isin(selected_sectors)].copy()
@@ -541,10 +536,9 @@ def scan_swing_candidates(
         latest = ind.iloc[-1]
         price = float(latest["Close"])
         if price * 100 > float(budget_yen):
-            # budget gate (100 shares)
             continue
+        stats["budget_ok"] += 1
 
-        score = _score_prelim(latest, params)
         row = master[master["ticker"] == t].iloc[0]
         prelim.append(
             {
@@ -557,27 +551,26 @@ def scan_swing_candidates(
                 "atr_pct": float(latest["ATR_PCT"]),
                 "vol_avg20": float(latest["VOL_AVG_20"]),
                 "turnover_avg20": float(latest.get("TURNOVER_AVG_20", 0.0)),
-                "score_pre": float(score),
+                "score_pre": float(_score_prelim(latest, params)),
             }
         )
 
     if not prelim:
-        # auto relax once
         if relax_level == 0:
             relaxed = replace(
                 params,
                 require_sma25_over_sma75=False,
-                rsi_low=max(20.0, params.rsi_low - 5.0),
-                rsi_high=min(85.0, params.rsi_high + 5.0),
+                rsi_low=max(20.0, params.rsi_low - 7.0),
+                rsi_high=min(85.0, params.rsi_high + 7.0),
                 atr_pct_min=max(0.5, params.atr_pct_min - 0.5),
-                atr_pct_max=min(25.0, params.atr_pct_max + 4.0),
+                atr_pct_max=min(25.0, params.atr_pct_max + 5.0),
                 vol_avg20_min=max(20_000.0, params.vol_avg20_min * 0.5),
                 turnover_avg20_min_yen=0.0,
             )
             if params.entry_mode == "pullback":
-                relaxed = replace(relaxed, entry_mode="breakout", breakout_vol_ratio=max(1.2, params.breakout_vol_ratio - 0.3))
+                relaxed = replace(relaxed, entry_mode="breakout", breakout_vol_ratio=max(1.15, params.breakout_vol_ratio - 0.35))
 
-            auto_relax_trace.append({"from": dataclasses.asdict(params), "to": dataclasses.asdict(relaxed), "sector_prefilter_relaxed": False})
+            auto_relax_trace.append({"step": "auto_relax", "reason": "prelim_zero", "from": dataclasses.asdict(params), "to": dataclasses.asdict(relaxed)})
 
             return scan_swing_candidates(
                 budget_yen=budget_yen,
@@ -599,7 +592,7 @@ def scan_swing_candidates(
             "relax_level": relax_level,
             "params_effective": dataclasses.asdict(params),
             "auto_relax_trace": auto_relax_trace,
-            "error": "候補0件（データ取得失敗 or 条件厳しすぎの可能性）。filter_stats参照。",
+            "error": "候補0件（データ取得失敗 or 条件厳しすぎ）。filter_stats参照。",
         }
 
     prelim = sorted(prelim, key=lambda x: float(x["score_pre"]), reverse=True)[: max(int(backtest_topk), int(top_n))]
@@ -625,7 +618,6 @@ def scan_swing_candidates(
         )
 
     ranked = sorted(ranked, key=lambda x: float(x.get("bt_score", -1e9)), reverse=True)
-
     return {
         "mode": params.entry_mode,
         "candidates": ranked[: int(top_n)],
@@ -637,9 +629,6 @@ def scan_swing_candidates(
     }
 
 
-# -------------------------
-# Trade plan
-# -------------------------
 def build_trade_plan(df_ind: pd.DataFrame, params: SwingParams, capital_yen: int, risk_pct: float) -> Dict[str, object]:
     if df_ind is None or df_ind.empty:
         return {}
