@@ -66,6 +66,7 @@ def _ensure_state_defaults():
     defaults = {
         "pending_scan": False,
         "auto_candidates": [],
+        "partial_candidates": [],
         "scan_meta": {},
         "target_ticker": "",
         "pair_label": "",
@@ -243,10 +244,11 @@ if st.session_state.get("pending_scan"):
     _save_diag_tmp(diag)
     _render_scan_diag_sidebar(diag_slot, expanded=False, title="🧾 診断JSON（呼び出し直前）")
 
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    
+    progress_bar = st.empty()
+status_text = st.empty()
 
-    def update_progress(current: int, total: int, info: str):
+def update_progress(current: int, total: int, info: str, partial=None, stats=None):
         pct = int((current / max(1, total)) * 100)
         progress_bar.progress(min(100, max(0, pct)))
         status_text.text(f"🔍 {info} ({current}/{total})")
@@ -257,6 +259,12 @@ if st.session_state.get("pending_scan"):
         d["progress"] = {"current": int(current), "total": int(total), "info": str(info)}
         st.session_state["last_scan_diag"] = d
         _save_diag_tmp(d)
+        if stats is not None:
+            d["filter_stats"] = stats
+            st.session_state["last_scan_diag"] = d
+            _save_diag_tmp(d)
+        if partial is not None:
+            st.session_state["partial_candidates"] = partial
 
     try:
         with st.status("スキャン＆バックテスト中…", expanded=True) as status:
@@ -319,21 +327,33 @@ if st.session_state.get("pending_scan"):
 # Results
 # -----------------------------
 st.markdown("## 🎯 スキャン結果")
-cands = st.session_state.get("auto_candidates") or []
-if not cands:
-    st.info("候補がまだありません。左の「スキャン開始」を押してください。")
+st.markdown("## 🎯 スキャン結果")
+
+diag = st.session_state.get("last_scan_diag") or {}
+stage = diag.get("stage")
+status = diag.get("status")
+
+if status == "running" and stage in ("queued", "calling_scan", "scanning"):
+    st.warning("スキャン進行中です。完了すると候補がここに出ます。")
+    partial = st.session_state.get("partial_candidates") or []
+    if partial:
+        st.markdown("### ⏳ 暫定候補（スキャン途中の上位）")
+        st.dataframe(pd.DataFrame(partial), use_container_width=True)
 else:
-    df = pd.DataFrame(cands)
-    st.dataframe(df, use_container_width=True)
+    cands = st.session_state.get("auto_candidates") or []
+    if not cands:
+        st.info("完了しましたが候補は0件でした。サイドバーの診断JSONで fail_* を確認してください。")
+    else:
+        df = pd.DataFrame(cands)
+        st.dataframe(df, use_container_width=True)
 
-    st.markdown("### 候補の選択")
-    for c in cands:
-        label = f"{c.get('ticker','')} {c.get('name','')}".strip()
-        if st.button(f"分析: {label}", key=f"pick_{c.get('ticker','')}"):
-            st.session_state["target_ticker"] = c.get("ticker", "")
-            st.session_state["pair_label"] = label
-            st.rerun()
-
+        st.markdown("### 候補の選択")
+        for c in cands:
+            label = f"{c.get('ticker','')} {c.get('name','')}".strip()
+            if st.button(f"分析: {label}", key=f"pick_{c.get('ticker','')}"):
+                st.session_state["target_ticker"] = c.get("ticker", "")
+                st.session_state["pair_label"] = label
+                st.rerun()
 ticker = st.session_state.get("target_ticker", "")
 if ticker:
     st.markdown(f"## 🔎 個別分析: {st.session_state.get('pair_label','')}")
