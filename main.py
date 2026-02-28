@@ -1,7 +1,7 @@
 # main.py
 # -*- coding: utf-8 -*-
 """
-JPX Swing Auto Scanner (Stooq) — STABLE5c-2026-02-28 (FULL)
+JPX Swing Auto Scanner (Stooq) — STABLE5d-2026-02-28 (FULL)
 - 診断JSONを「スキャン開始時点」で生成し、途中でも必ずDL可能
 - Streamlitの描画順/再実行の罠を回避：queued → calling_scan → done/error の二段階実行
 - JPX銘柄ユニバースは、JPX公式の「東証上場銘柄一覧（33業種）」Excelを取得して生成（CSV不要）
@@ -21,7 +21,7 @@ import streamlit as st
 
 import logic
 
-APP_BUILD = "STABLE5c-2026-02-28"
+APP_BUILD = "STABLE5d-2026-02-28"
 TMP_DIAG_PATH = "/tmp/ai_stock_scan_diag_latest.json"
 
 
@@ -244,25 +244,25 @@ if st.session_state.get("pending_scan"):
     _save_diag_tmp(diag)
     _render_scan_diag_sidebar(diag_slot, expanded=False, title="🧾 診断JSON（呼び出し直前）")
 
-    
     progress_bar = st.empty()
-status_text = st.empty()
+    status_text = st.empty()
 
-def update_progress(current: int, total: int, info: str, partial=None, stats=None):
+    def update_progress(current: int, total: int, info: str, partial=None, stats=None):
         pct = int((current / max(1, total)) * 100)
         progress_bar.progress(min(100, max(0, pct)))
         status_text.text(f"🔍 {info} ({current}/{total})")
+
         d = st.session_state.get("last_scan_diag") or {}
         d["updated_at"] = str(_dt.datetime.now())
         d["status"] = "running"
         d["stage"] = "scanning"
         d["progress"] = {"current": int(current), "total": int(total), "info": str(info)}
-        st.session_state["last_scan_diag"] = d
-        _save_diag_tmp(d)
+
         if stats is not None:
             d["filter_stats"] = stats
-            st.session_state["last_scan_diag"] = d
-            _save_diag_tmp(d)
+        st.session_state["last_scan_diag"] = d
+        _save_diag_tmp(d)
+
         if partial is not None:
             st.session_state["partial_candidates"] = partial
 
@@ -327,7 +327,6 @@ def update_progress(current: int, total: int, info: str, partial=None, stats=Non
 # Results
 # -----------------------------
 st.markdown("## 🎯 スキャン結果")
-st.markdown("## 🎯 スキャン結果")
 
 diag = st.session_state.get("last_scan_diag") or {}
 stage = diag.get("stage")
@@ -354,12 +353,14 @@ else:
                 st.session_state["target_ticker"] = c.get("ticker", "")
                 st.session_state["pair_label"] = label
                 st.rerun()
+
 ticker = st.session_state.get("target_ticker", "")
 if ticker:
     st.markdown(f"## 🔎 個別分析: {st.session_state.get('pair_label','')}")
     with st.spinner("データ取得＆指標計算中…"):
         df_raw = logic.get_market_data(ticker, period=max(bt_period, "2y"), interval="1d")
         df_ind = logic.calculate_indicators(df_raw)
+
     if df_ind.empty:
         st.error("データ取得に失敗しました。")
     else:
