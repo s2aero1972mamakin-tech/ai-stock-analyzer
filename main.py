@@ -28,16 +28,17 @@ import time
 
 TOKYO = pytz.timezone("Asia/Tokyo")
 
-APP_BUILD = "STABLE5-2026-02-28"
+APP_BUILD = "STABLE5b-2026-02-28"
 DIAG_FILE = Path("/tmp/ai_stock_last_diag.json")
 
 import inspect
+import hashlib
 
 def _st_plotly(fig, **kwargs):
     """plotly_chart wrapper for Streamlit versions without use_container_width."""
     try:
         if "use_container_width" in inspect.signature(st.plotly_chart).parameters:
-            return st.plotly_chart(fig, width='stretch', **kwargs)
+            return st.plotly_chart(fig, use_container_width=True, **kwargs)
     except Exception:
         pass
     return st.plotly_chart(fig, **kwargs)
@@ -152,6 +153,11 @@ def _diag_set(diag: dict) -> None:
 def _diag_update(patch: dict) -> None:
     """Merge patch into last_scan_diag and persist. Nested dicts (progress/filter_stats) are merged shallowly."""
     diag = _ensure_diag_loaded()
+
+    # Unique widget keys per render call (StreamlitDuplicateElementKey対策)
+    seq = int(st.session_state.get("_diag_render_seq", 0)) + 1
+    st.session_state["_diag_render_seq"] = seq
+    tag = hashlib.md5(f"{title}|{seq}".encode("utf-8")).hexdigest()[:8]
     if not isinstance(diag, dict):
         diag = {}
 
@@ -176,6 +182,11 @@ def _render_scan_diag_sidebar(slot, *, expanded: bool = False, title: str = "�
     """
     diag = _ensure_diag_loaded()
 
+    # Unique widget keys per render call (StreamlitDuplicateElementKey対策)
+    seq = int(st.session_state.get("_diag_render_seq", 0)) + 1
+    st.session_state["_diag_render_seq"] = seq
+    tag = hashlib.md5(f"{title}|{seq}".encode("utf-8")).hexdigest()[:8]
+
     # Render into sidebar placeholder (slot)
     try:
         slot.empty()
@@ -199,13 +210,13 @@ def _render_scan_diag_sidebar(slot, *, expanded: bool = False, title: str = "�
                 data=_safe_json_dumps(diag),
                 file_name=f"scan_diag_{safe_ts}.json",
                 mime="application/json",
-                key="dl_diag_current",
+                key=f"dl_diag_current_{tag}",
             )
         except Exception as e:
             st.caption(f"download_button 生成失敗: {e}")
 
         cols = st.columns(2)
-        if cols[0].button("🧹 診断をクリア", key="btn_clear_diag"):
+        if cols[0].button("🧹 診断をクリア", key=f"btn_clear_diag_{tag}"):
             try:
                 if DIAG_FILE.exists():
                     DIAG_FILE.unlink(missing_ok=True)
@@ -222,7 +233,7 @@ def _render_scan_diag_sidebar(slot, *, expanded: bool = False, title: str = "�
             _diag_write_to_disk(st.session_state["last_scan_diag"])
             st.rerun()
 
-        if cols[1].button("📦 /tmp の最終診断を再読込", key="btn_reload_diag"):
+        if cols[1].button("📦 /tmp の最終診断を再読込", key=f"btn_reload_diag_{tag}"):
             d = _diag_read_from_disk()
             if d:
                 st.session_state["last_scan_diag"] = d
