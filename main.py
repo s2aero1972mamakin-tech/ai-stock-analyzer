@@ -1,12 +1,10 @@
 # main.py
 # -*- coding: utf-8 -*-
 """
-JPX Swing Auto Scanner (Stooq) — STABLE5b-2026-02-28 (FULL)
-目的:
-- スキャンが途中で止まっても「診断JSON」を必ず回収できる
-- サイドバーに診断JSONのDLボタンを常時表示（スキャン前から）
-- Streamlitの描画順/再実行の罠を回避するため「queued → calling_scan → done/error」の二段階実行
-- 例外が出たら traceback を診断JSONに残す
+JPX Swing Auto Scanner (Stooq) — STABLE5c-2026-02-28 (FULL)
+- 診断JSONを「スキャン開始時点」で生成し、途中でも必ずDL可能
+- Streamlitの描画順/再実行の罠を回避：queued → calling_scan → done/error の二段階実行
+- JPX銘柄ユニバースは、JPX公式の「東証上場銘柄一覧（33業種）」Excelを取得して生成（CSV不要）
 """
 
 from __future__ import annotations
@@ -15,7 +13,6 @@ import dataclasses
 import datetime as _dt
 import hashlib
 import json
-import math
 import os
 import traceback
 
@@ -24,13 +21,10 @@ import streamlit as st
 
 import logic
 
-APP_BUILD = "STABLE5b-2026-02-28"
+APP_BUILD = "STABLE5c-2026-02-28"
 TMP_DIAG_PATH = "/tmp/ai_stock_scan_diag_latest.json"
 
 
-# -----------------------------
-# Utils
-# -----------------------------
 def _json_dumps(obj) -> str:
     def default(o):
         try:
@@ -55,7 +49,6 @@ def _save_diag_tmp(diag: dict) -> None:
         with open(TMP_DIAG_PATH, "w", encoding="utf-8") as f:
             f.write(_json_dumps(diag))
     except Exception:
-        # ignore filesystem issues
         pass
 
 
@@ -85,7 +78,6 @@ def _ensure_state_defaults():
 
 
 def build_swing_params_safe(**kwargs) -> logic.SwingParams:
-    # main/logic mismatchで落ちないように、SwingParamsのフィールドだけ通す
     allowed = {f.name for f in dataclasses.fields(logic.SwingParams)}
     safe = {k: v for k, v in kwargs.items() if k in allowed}
     dropped = sorted([k for k in kwargs.keys() if k not in safe])
@@ -94,7 +86,6 @@ def build_swing_params_safe(**kwargs) -> logic.SwingParams:
 
 
 def _render_scan_diag_sidebar(slot, *, expanded: bool, title: str):
-    # 複数回呼んでも DuplicateElementKey にならないように、title由来のtagでキーをユニーク化
     tag = hashlib.md5(title.encode("utf-8")).hexdigest()[:10]
 
     diag = st.session_state.get("last_scan_diag")
@@ -105,7 +96,6 @@ def _render_scan_diag_sidebar(slot, *, expanded: bool, title: str):
 
     with slot.container():
         st.sidebar.caption(f"build: {APP_BUILD}")
-
         st.sidebar.subheader(title)
 
         cols = st.sidebar.columns([1, 1, 2])
@@ -121,30 +111,24 @@ def _render_scan_diag_sidebar(slot, *, expanded: bool, title: str):
             st.rerun()
 
         if not diag:
-            st.sidebar.info("診断JSONはスキャン開始時点で生成されます（落ちても回収可）。")
+            st.sidebar.info("診断JSONはスキャン開始時点で生成されます（途中でもDL可）。")
             return
 
-        # Download is ALWAYS available when diag exists
-        try:
-            ts = str(diag.get("timestamp", "diag")).replace(":", "-").replace(" ", "_")
-            st.sidebar.download_button(
-                "⬇️ 診断JSONをダウンロード（途中でも可）",
-                data=_json_dumps(diag),
-                file_name=f"scan_diag_{ts}.json",
-                mime="application/json",
-                key=f"dl_diag_{tag}",
-            )
-        except Exception:
-            pass
+        ts = str(diag.get("timestamp", "diag")).replace(":", "-").replace(" ", "_")
+        st.sidebar.download_button(
+            "⬇️ 診断JSONをダウンロード（途中でも可）",
+            data=_json_dumps(diag),
+            file_name=f"scan_diag_{ts}.json",
+            mime="application/json",
+            key=f"dl_diag_{tag}",
+        )
 
-        # Summary
         st.sidebar.markdown(
             f"- status: **{diag.get('status','')}**\n"
             f"- stage: **{diag.get('stage','')}**\n"
             f"- mode: **{diag.get('mode','')}**\n"
             f"- updated_at: **{diag.get('updated_at','')}**"
         )
-
         dropped = st.session_state.get("_dropped_param_keys")
         if dropped:
             st.sidebar.warning("main/logicの不一致で無視したパラメータ: " + ", ".join(dropped))
@@ -154,21 +138,18 @@ def _render_scan_diag_sidebar(slot, *, expanded: bool, title: str):
 
 
 # -----------------------------
-# UI setup
+# UI
 # -----------------------------
 st.set_page_config(page_title="JPX Swing Auto Scanner", layout="wide")
 _ensure_state_defaults()
 
 st.title("📈 日本株スイング自動スキャン（Stooq）")
-st.caption("診断JSONはスキャン開始時点で生成し、途中で落ちても必ずDLできる設計です。")
+st.caption("JPXユニバースはJPX公式Excelから生成（CSV不要）。診断JSONは常時DL可。")
 
-# Sidebar: diag (ALWAYS)
 diag_slot = st.sidebar.empty()
 _render_scan_diag_sidebar(diag_slot, expanded=False, title="🧾 診断JSON（常時表示）")
 
-# Sidebar: settings
 st.sidebar.header("⚙️ スキャン設定")
-
 budget = st.sidebar.number_input("想定資金（円）", min_value=50_000, max_value=5_000_000, value=300_000, step=50_000)
 capital = st.sidebar.number_input("運用資金（円）", min_value=50_000, max_value=20_000_000, value=300_000, step=50_000)
 risk_pct = st.sidebar.slider("許容損失（1トレード）%", 0.1, 3.0, 1.0, step=0.1) / 100.0
@@ -177,7 +158,6 @@ entry_mode_label = st.sidebar.selectbox("モード", ["押し目（pullback）",
 entry_mode = "pullback" if entry_mode_label.startswith("押し目") else "breakout"
 
 require_trend = st.sidebar.checkbox("SMA25 > SMA75 を必須", value=True)
-
 rsi_low = st.sidebar.slider("RSI下限", 10.0, 60.0, 40.0, step=1.0)
 rsi_high = st.sidebar.slider("RSI上限", 40.0, 90.0, 70.0, step=1.0)
 
@@ -201,7 +181,7 @@ time_stop_days = st.sidebar.slider("時間切れ（日）", 3, 20, 10, step=1)
 bt_period = st.sidebar.selectbox("バックテスト期間", ["1y", "2y", "3y", "5y"], index=1)
 bt_topk = st.sidebar.slider("バックテスト対象（上位K）", 5, 60, 20, step=5)
 
-sector_prefilter = st.sidebar.checkbox("セクター事前絞り込み", value=True)
+sector_prefilter = st.sidebar.checkbox("セクター事前絞り込み（推奨）", value=True)
 sector_top_n = st.sidebar.slider("上位セクター数", 2, 12, 6, step=1)
 
 st.sidebar.markdown("---")
@@ -227,11 +207,7 @@ params = build_swing_params_safe(
     risk_pct=float(risk_pct),
 )
 
-# -----------------------------
-# Two-phase execution:
-#   Phase A: button -> queue and rerun
-#   Phase B: pending_scan -> execute scan
-# -----------------------------
+# -------- Two-phase execution --------
 if scan_btn:
     st.session_state["pending_scan"] = True
     st.session_state["last_scan_diag"] = {
@@ -254,7 +230,6 @@ if scan_btn:
 if st.session_state.get("pending_scan"):
     st.session_state["pending_scan"] = False
 
-    # mark before calling scan
     diag = st.session_state.get("last_scan_diag") or {}
     diag.update(
         {
@@ -282,11 +257,6 @@ if st.session_state.get("pending_scan"):
         d["progress"] = {"current": int(current), "total": int(total), "info": str(info)}
         st.session_state["last_scan_diag"] = d
         _save_diag_tmp(d)
-        # sidebar update (safe)
-        try:
-            _render_scan_diag_sidebar(diag_slot, expanded=False, title="🧾 診断JSON（進捗更新）")
-        except Exception:
-            pass
 
     try:
         with st.status("スキャン＆バックテスト中…", expanded=True) as status:
@@ -346,7 +316,7 @@ if st.session_state.get("pending_scan"):
         st.exception(e)
 
 # -----------------------------
-# Results UI
+# Results
 # -----------------------------
 st.markdown("## 🎯 スキャン結果")
 cands = st.session_state.get("auto_candidates") or []
@@ -368,7 +338,7 @@ ticker = st.session_state.get("target_ticker", "")
 if ticker:
     st.markdown(f"## 🔎 個別分析: {st.session_state.get('pair_label','')}")
     with st.spinner("データ取得＆指標計算中…"):
-        df_raw = logic.get_market_data(ticker, period=max(bt_period, "2y"))
+        df_raw = logic.get_market_data(ticker, period=max(bt_period, "2y"), interval="1d")
         df_ind = logic.calculate_indicators(df_raw)
     if df_ind.empty:
         st.error("データ取得に失敗しました。")
