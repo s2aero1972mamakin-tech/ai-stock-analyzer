@@ -1,7 +1,7 @@
 # logic.py
 # -*- coding: utf-8 -*-
 """
-JPX Swing Auto Scanner logic — STABLE5c-2026-02-28 (FULL)
+JPX Swing Auto Scanner logic — STABLE5d-2026-02-28 (FULL)
 - JPXユニバース: JPX公式の「東証上場銘柄一覧（33業種）」Excelから生成（CSV不要）
 - データ: Stooq（日足CSV）
 - 指標: SMA/RSI/ATR/出来高/売買代金
@@ -14,7 +14,6 @@ from __future__ import annotations
 import dataclasses
 import math
 import time
-import traceback
 from dataclasses import dataclass, replace
 from io import BytesIO
 from typing import Callable, Dict, List, Optional
@@ -24,7 +23,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-LOGIC_BUILD = "STABLE5c-2026-02-28"
+LOGIC_BUILD = "STABLE5d-2026-02-28"
 _STOOQ_DOMAINS = ["stooq.pl", "stooq.com"]
 
 
@@ -84,7 +83,6 @@ def get_jpx_master() -> pd.DataFrame:
         try:
             r = requests.get(url, timeout=30)
             r.raise_for_status()
-            # xlrd は requirements に入っている前提（あなたの環境ログにあり）
             df = pd.read_excel(BytesIO(r.content), engine="xlrd")
         except Exception:
             return pd.DataFrame()
@@ -326,7 +324,7 @@ def _passes_filters(ind: pd.DataFrame, params: SwingParams, stats: Dict[str, int
 
 
 # -------------------------
-# Backtest (same as previous)
+# Backtest
 # -------------------------
 def _max_drawdown(equity: pd.Series) -> float:
     if equity is None or equity.empty:
@@ -485,6 +483,7 @@ def scan_swing_candidates(
     sector_top_n: int = 6,
     relax_level: int = 0,
 ) -> Dict[str, object]:
+    # 既存キーは維持（後方互換）。追加キーのみ増やす。
     stats = {
         "universe": 0,
         "pass": 0,
@@ -496,7 +495,7 @@ def scan_swing_candidates(
         "fail_turnover": 0,
         "fail_setup": 0,
         "budget_ok": 0,
-        "budget_ok": 0,
+        "fail_budget": 0,  # 追加：予算で落ちた数（100株前提）
     }
     auto_relax_trace: List[dict] = []
 
@@ -530,6 +529,7 @@ def scan_swing_candidates(
 
     for i, t in enumerate(tickers, start=1):
         if progress_callback and (i % 10 == 0 or i == 1):
+            # main側のコールバックは拡張引数も受ける想定
             progress_callback(i, total, f"fetch+indicators {t}", partial=partial_top, stats=stats)
 
         df = get_market_data(t, period=backtest_period)
@@ -539,26 +539,29 @@ def scan_swing_candidates(
 
         latest = ind.iloc[-1]
         price = float(latest["Close"])
+
+        # NOTE: 単元は銘柄で異なるが、現仕様は100株前提（後方互換維持）
         if price * 100 > float(budget_yen):
+            stats["fail_budget"] += 1
             continue
-        stats["budget_ok"] += 1
+
         stats["budget_ok"] += 1
 
         row = master[master["ticker"] == t].iloc[0]
         item = {
-                "ticker": t,
-                "name": str(row.get("name", "")),
-                "sector": str(row.get("sector", "")),
-                "price": price,
-                "rsi": float(latest["RSI"]),
-                "atr": float(latest["ATR"]),
-                "atr_pct": float(latest["ATR_PCT"]),
-                "vol_avg20": float(latest["VOL_AVG_20"]),
-                "turnover_avg20": float(latest.get("TURNOVER_AVG_20", 0.0)),
-                "score_pre": float(_score_prelim(latest, params)),
+            "ticker": t,
+            "name": str(row.get("name", "")),
+            "sector": str(row.get("sector", "")),
+            "price": price,
+            "rsi": float(latest["RSI"]),
+            "atr": float(latest["ATR"]),
+            "atr_pct": float(latest["ATR_PCT"]),
+            "vol_avg20": float(latest["VOL_AVG_20"]),
+            "turnover_avg20": float(latest.get("TURNOVER_AVG_20", 0.0)),
+            "score_pre": float(_score_prelim(latest, params)),
         }
         prelim.append(item)
-        partial_top = sorted(prelim, key=lambda x: float(x.get("score_pre",0.0)), reverse=True)[:partial_limit]
+        partial_top = sorted(prelim, key=lambda x: float(x.get("score_pre", 0.0)), reverse=True)[:partial_limit]
 
     if not prelim:
         if relax_level == 0:
@@ -575,7 +578,9 @@ def scan_swing_candidates(
             if params.entry_mode == "pullback":
                 relaxed = replace(relaxed, entry_mode="breakout", breakout_vol_ratio=max(1.15, params.breakout_vol_ratio - 0.35))
 
-            auto_relax_trace.append({"step": "auto_relax", "reason": "prelim_zero", "from": dataclasses.asdict(params), "to": dataclasses.asdict(relaxed)})
+            auto_relax_trace.append(
+                {"step": "auto_relax", "reason": "prelim_zero", "from": dataclasses.asdict(params), "to": dataclasses.asdict(relaxed)}
+            )
 
             return scan_swing_candidates(
                 budget_yen=budget_yen,
@@ -597,7 +602,7 @@ def scan_swing_candidates(
             "relax_level": relax_level,
             "params_effective": dataclasses.asdict(params),
             "auto_relax_trace": auto_relax_trace,
-            "error": "候補0件（データ取得失敗 or 条件厳しすぎ）。filter_stats参照。",
+            "error": "候補0件（データ取得失敗 or 条件厳しすぎ or 予算フィルタ）。filter_stats参照。",
         }
 
     prelim = sorted(prelim, key=lambda x: float(x["score_pre"]), reverse=True)[: max(int(backtest_topk), int(top_n))]
