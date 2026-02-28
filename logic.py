@@ -496,6 +496,7 @@ def scan_swing_candidates(
         "fail_turnover": 0,
         "fail_setup": 0,
         "budget_ok": 0,
+        "budget_ok": 0,
     }
     auto_relax_trace: List[dict] = []
 
@@ -524,9 +525,12 @@ def scan_swing_candidates(
     prelim: List[dict] = []
     total = len(tickers)
 
+    partial_top: List[dict] = []
+    partial_limit = max(8, int(top_n) * 3)
+
     for i, t in enumerate(tickers, start=1):
         if progress_callback and (i % 10 == 0 or i == 1):
-            progress_callback(i, total, f"fetch+indicators {t}")
+            progress_callback(i, total, f"fetch+indicators {t}", partial=partial_top, stats=stats)
 
         df = get_market_data(t, period=backtest_period)
         ind = calculate_indicators(df)
@@ -538,10 +542,10 @@ def scan_swing_candidates(
         if price * 100 > float(budget_yen):
             continue
         stats["budget_ok"] += 1
+        stats["budget_ok"] += 1
 
         row = master[master["ticker"] == t].iloc[0]
-        prelim.append(
-            {
+        item = {
                 "ticker": t,
                 "name": str(row.get("name", "")),
                 "sector": str(row.get("sector", "")),
@@ -552,8 +556,9 @@ def scan_swing_candidates(
                 "vol_avg20": float(latest["VOL_AVG_20"]),
                 "turnover_avg20": float(latest.get("TURNOVER_AVG_20", 0.0)),
                 "score_pre": float(_score_prelim(latest, params)),
-            }
-        )
+        }
+        prelim.append(item)
+        partial_top = sorted(prelim, key=lambda x: float(x.get("score_pre",0.0)), reverse=True)[:partial_limit]
 
     if not prelim:
         if relax_level == 0:
@@ -601,7 +606,7 @@ def scan_swing_candidates(
     ranked: List[dict] = []
     for j, item in enumerate(prelim, start=1):
         if progress_callback:
-            progress_callback(j, len(prelim), f"backtest {item['ticker']}")
+            progress_callback(j, len(prelim), f"backtest {item['ticker']}", partial=prelim[: min(len(prelim), 12)], stats=stats)
         df = get_market_data(item["ticker"], period=backtest_period)
         ind = calculate_indicators(df)
         bt = backtest_swing(ind, params)
