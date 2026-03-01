@@ -1,10 +1,12 @@
 # main.py
 # -*- coding: utf-8 -*-
 """
-JPX Swing Auto Scanner (Stooq) — STABLE5c-2026-02-28 (FULL)
-- 診断JSONを「スキャン開始時点」で生成し、途中でも必ずDL可能
-- Streamlitの描画順/再実行の罠を回避：queued → calling_scan → done/error の二段階実行
-- JPX銘柄ユニバースは、JPX公式の「東証上場銘柄一覧（33業種）」Excelを取得して生成（CSV不要）
+JPX Swing Auto Scanner (Stooq) — FIXED6 (FULL)
+- 元のSTABLE5cの機能/構造を維持しつつ、構文エラー（インデント崩れ）を完全修正
+- 診断JSON強化: fail_data_reason / timing / cursor_index / last_ticker / error_ring
+- 中断検知: updated_atが一定時間更新されないrunning診断を interrupted 扱い
+- 中断再開: cursor_index+1 から再開（スキャン上限などは一切追加しない）
+- データソースは Stooq のまま（変更しない）
 """
 
 from __future__ import annotations
@@ -21,8 +23,9 @@ import streamlit as st
 
 import logic
 
-APP_BUILD = "STABLE5c-2026-02-28"
+APP_BUILD = "STABLE5c-2026-02-28-FIXED6"
 TMP_DIAG_PATH = "/tmp/ai_stock_scan_diag_latest.json"
+STALL_SECONDS = 180  # 中断判定（秒）
 
 
 def _json_dumps(obj) -> str:
@@ -62,6 +65,27 @@ def _load_diag_tmp() -> dict | None:
     return None
 
 
+def _maybe_mark_interrupted(diag: dict) -> dict:
+    try:
+        if not diag:
+            return diag
+        if diag.get("status") != "running":
+            return diag
+        ua = diag.get("updated_at")
+        if not ua:
+            return diag
+        last = _dt.datetime.fromisoformat(ua)
+        if (_dt.datetime.now() - last).total_seconds() > STALL_SECONDS:
+            diag["status"] = "interrupted"
+            diag["stage"] = "stalled"
+            diag["error"] = diag.get("error") or "progress更新が一定時間止まったため interrupted 扱い"
+            diag["updated_at"] = str(_dt.datetime.now())
+            _save_diag_tmp(diag)
+        return diag
+    except Exception:
+        return diag
+
+
 def _ensure_state_defaults():
     defaults = {
         "pending_scan": False,
@@ -72,9 +96,7 @@ def _ensure_state_defaults():
         "pair_label": "",
         "last_scan_diag": None,
         "_dropped_param_keys": None,
-        "resume_index": 0,
-        "resume_requested": False,
-        "has_scanned_once": False,
+        "resume_start_index": 0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -98,6 +120,10 @@ def _render_scan_diag_sidebar(slot, *, expanded: bool, title: str):
         if diag:
             st.session_state["last_scan_diag"] = diag
 
+    if diag:
+        diag = _maybe_mark_interrupted(diag)
+        st.session_state["last_scan_diag"] = diag
+
     with slot.container():
         st.sidebar.caption(f"build: {APP_BUILD}")
         st.sidebar.subheader(title)
@@ -105,6 +131,7 @@ def _render_scan_diag_sidebar(slot, *, expanded: bool, title: str):
         cols = st.sidebar.columns([1, 1, 2])
         if cols[0].button("🧹 診断をクリア", key=f"btn_clear_diag_{tag}"):
             st.session_state["last_scan_diag"] = None
+            st.session_state["resume_start_index"] = 0
             _save_diag_tmp({})
             st.rerun()
 
@@ -131,7 +158,9 @@ def _render_scan_diag_sidebar(slot, *, expanded: bool, title: str):
             f"- status: **{diag.get('status','')}**\n"
             f"- stage: **{diag.get('stage','')}**\n"
             f"- mode: **{diag.get('mode','')}**\n"
-            f"- updated_at: **{diag.get('updated_at','')}**"
+            f"- updated_at: **{diag.get('updated_at','')}**\n"
+            f"- cursor_index: **{diag.get('cursor_index','')}**\n"
+            f"- last_ticker: **{diag.get('last_ticker','')}**"
         )
         dropped = st.session_state.get("_dropped_param_keys")
         if dropped:
@@ -147,18 +176,25 @@ def _render_scan_diag_sidebar(slot, *, expanded: bool, title: str):
 st.set_page_config(page_title="JPX Swing Auto Scanner", layout="wide")
 _ensure_state_defaults()
 
-st.title("📈 日本株スイング自動スキャン（Stooq）")
-st.caption("JPXユニバースはJPX公式Excelから生成（CSV不要）。診断JSONは常時DL可。")
+st.title("📈 JPX Swing Auto Scanner（FIXED6）")
+st.caption("東証銘柄をセクター現況で絞り込み → スイング候補抽出（Stooqデータ）")
 
 diag_slot = st.sidebar.empty()
-_render_scan_diag_sidebar(diag_slot, expanded=False, title="🧾 診断JSON（常時表示）")
+_render_scan_diag_sidebar(diag_slot, expanded=False, title="🧾 診断JSON")
 
 st.sidebar.header("⚙️ スキャン設定")
-budget = st.sidebar.number_input("想定資金（円）", min_value=50_000, max_value=5_000_000, value=300_000, step=50_000)
-capital = st.sidebar.number_input("運用資金（円）", min_value=50_000, max_value=20_000_000, value=300_000, step=50_000)
+
+budget = st.sidebar.number_input(
+    "想定資金（円）", min_value=50_000, max_value=5_000_000, value=300_000, step=50_000
+)
+capital = st.sidebar.number_input(
+    "運用資金（円）", min_value=50_000, max_value=20_000_000, value=300_000, step=50_000
+)
 risk_pct = st.sidebar.slider("許容損失（1トレード）%", 0.1, 3.0, 1.0, step=0.1) / 100.0
 
-entry_mode_label = st.sidebar.selectbox("モード", ["押し目（pullback）", "ブレイクアウト（breakout）"], index=0)
+entry_mode_label = st.sidebar.selectbox(
+    "モード", ["押し目（pullback）", "ブレイクアウト（breakout）"], index=0
+)
 entry_mode = "pullback" if entry_mode_label.startswith("押し目") else "breakout"
 
 require_trend = st.sidebar.checkbox("SMA25 > SMA75 を必須", value=True)
@@ -171,8 +207,12 @@ pb_high = st.sidebar.slider("押し目上限（SMA25乖離%）", -15.0, 5.0, -3.
 atr_min = st.sidebar.slider("ATR%下限", 0.5, 12.0, 1.5, step=0.5)
 atr_max = st.sidebar.slider("ATR%上限", 1.0, 25.0, 10.0, step=0.5)
 
-vol_min = st.sidebar.number_input("平均出来高(20日) 下限", min_value=0, max_value=10_000_000, value=50_000, step=10_000)
-turnover_min_yen = st.sidebar.number_input("平均売買代金(20日) 下限（円）", min_value=0, max_value=50_000_000_000, value=0, step=10_000_000)
+vol_min = st.sidebar.number_input(
+    "平均出来高(20日) 下限", min_value=0, max_value=10_000_000, value=50_000, step=10_000
+)
+turnover_min_yen = st.sidebar.number_input(
+    "平均売買代金(20日) 下限（円）", min_value=0, max_value=50_000_000_000, value=0, step=10_000_000
+)
 
 breakout_lookback = st.sidebar.slider("高値更新参照日数", 5, 60, 20, step=1)
 breakout_vol_ratio = st.sidebar.slider("出来高倍率（当日/20日平均）", 1.0, 5.0, 1.6, step=0.1)
@@ -183,29 +223,15 @@ tp2_r = st.sidebar.slider("利確2: +何Rを狙う", 1.5, 6.0, 3.0, step=0.5)
 time_stop_days = st.sidebar.slider("時間切れ（日）", 3, 20, 10, step=1)
 
 bt_period = st.sidebar.selectbox("バックテスト期間", ["1y", "2y", "3y", "5y"], index=1)
-bt_topk = st.sidebar.slider("バックテスト対象（上位K）", 5, 60, 20, step=5)
+bt_topk = st.sidebar.slider("バックテスト候補数（上位K）", 5, 80, 20, step=5)
 
 sector_prefilter = st.sidebar.checkbox("セクター事前絞り込み（推奨）", value=True)
 sector_top_n = st.sidebar.slider("上位セクター数", 2, 12, 6, step=1)
 
 st.sidebar.markdown("---")
-scan_btn = st.sidebar.button("🔥 スキャン開始", type="primary")
-
-resume_btn = st.sidebar.button("▶️ 中断から再開（診断JSONの cursor_index から）")
-if resume_btn:
-    d = st.session_state.get("last_scan_diag") or _load_diag_tmp() or {}
-    cur = int(d.get("cursor_index", -1))
-    if cur >= 0:
-        st.session_state["resume_index"] = cur + 1
-        st.session_state["resume_requested"] = True
-        st.session_state["pending_scan"] = True
-        # running/ interrupted のままでもOK（進捗更新されます）
-        if not st.session_state.get("last_scan_diag"):
-            st.session_state["last_scan_diag"] = d
-        st.rerun()
-    else:
-        st.sidebar.warning("再開に必要な cursor_index がありません（まず通常スキャンを実行してください）")
-
+cols_scan = st.sidebar.columns([1, 1])
+scan_btn = cols_scan[0].button("🔥 スキャン開始", type="primary")
+resume_btn = cols_scan[1].button("▶️ 中断から再開")
 
 params = build_swing_params_safe(
     require_sma25_over_sma75=bool(require_trend),
@@ -220,19 +246,19 @@ params = build_swing_params_safe(
     turnover_avg20_min_yen=float(turnover_min_yen),
     breakout_lookback=int(breakout_lookback),
     breakout_vol_ratio=float(breakout_vol_ratio),
-    atr_mult_stop=float(atr_mult),
+    atr_mult=float(atr_mult),
     tp1_r=float(tp1_r),
     tp2_r=float(tp2_r),
     time_stop_days=int(time_stop_days),
-    risk_pct=float(risk_pct),
 )
 
-# -------- Two-phase execution --------
 if scan_btn:
+    st.session_state["resume_start_index"] = 0
     st.session_state["pending_scan"] = True
-    st.session_state["resume_index"] = 0
-    st.session_state["resume_requested"] = False
-    st.session_state["has_scanned_once"] = True
+    st.session_state["auto_candidates"] = []
+    st.session_state["partial_candidates"] = []
+    st.session_state["scan_meta"] = {}
+
     st.session_state["last_scan_diag"] = {
         "timestamp": str(_dt.datetime.now()),
         "updated_at": str(_dt.datetime.now()),
@@ -244,16 +270,39 @@ if scan_btn:
         "filter_stats": {},
         "params_effective": dataclasses.asdict(params),
         "auto_relax_trace": [],
-        "cursor_index": -1,
-        "last_ticker": "",
+        "cursor_index": 0,
         "fail_data_reason": {},
-        "timing": {"fetch_sec": 0.0, "indicators_sec": 0.0, "total_sec": 0.0},
+        "timing": {"fetch_sec": 0.0, "parse_sec": 0.0, "ind_sec": 0.0, "total_sec": 0.0},
+        "last_ticker": None,
+        "error_ring": [],
         "progress": {"current": 0, "total": 0, "info": "queued"},
     }
     _save_diag_tmp(st.session_state["last_scan_diag"])
-    _render_scan_diag_sidebar(diag_slot, expanded=False, title="🧾 診断JSON（実行開始）")
     st.rerun()
 
+if resume_btn:
+    d = st.session_state.get("last_scan_diag") or _load_diag_tmp() or {}
+    d = _maybe_mark_interrupted(d)
+    if d and d.get("status") in ("interrupted", "running"):
+        try:
+            st.session_state["resume_start_index"] = int(d.get("cursor_index", 0)) + 1
+        except Exception:
+            st.session_state["resume_start_index"] = 0
+        st.session_state["pending_scan"] = True
+        d["updated_at"] = str(_dt.datetime.now())
+        d["status"] = "running"
+        d["stage"] = "queued_resume"
+        d["progress"] = d.get("progress") or {"current": 0, "total": 0, "info": "queued_resume"}
+        d["progress"]["info"] = "queued_resume"
+        st.session_state["last_scan_diag"] = d
+        _save_diag_tmp(d)
+        st.rerun()
+    else:
+        st.sidebar.warning("再開できる診断がありません（running/interrupted ではありません）。")
+
+# -----------------------------
+# Scan execution (two-stage)
+# -----------------------------
 if st.session_state.get("pending_scan"):
     st.session_state["pending_scan"] = False
 
@@ -270,25 +319,35 @@ if st.session_state.get("pending_scan"):
     _save_diag_tmp(diag)
     _render_scan_diag_sidebar(diag_slot, expanded=False, title="🧾 診断JSON（呼び出し直前）")
 
-    
     progress_bar = st.empty()
-status_text = st.empty()
+    status_text = st.empty()
 
-def update_progress(current: int, total: int, info: str, partial=None, stats=None):
+    def update_progress(current: int, total: int, info: str, partial=None, stats=None):
         pct = int((current / max(1, total)) * 100)
         progress_bar.progress(min(100, max(0, pct)))
         status_text.text(f"🔍 {info} ({current}/{total})")
+
         d = st.session_state.get("last_scan_diag") or {}
         d["updated_at"] = str(_dt.datetime.now())
         d["status"] = "running"
         d["stage"] = "scanning"
         d["progress"] = {"current": int(current), "total": int(total), "info": str(info)}
+
+        # statsの拡張情報を反映
+        if isinstance(stats, dict):
+            d["filter_stats"] = {k: v for k, v in stats.items() if k not in ("timing", "fail_data_reason")}
+            if "fail_data_reason" in stats:
+                d["fail_data_reason"] = stats.get("fail_data_reason") or d.get("fail_data_reason") or {}
+            if "timing" in stats:
+                d["timing"] = stats.get("timing") or d.get("timing") or {}
+            if "cursor_index" in stats:
+                d["cursor_index"] = stats.get("cursor_index")
+            if "last_ticker" in stats:
+                d["last_ticker"] = stats.get("last_ticker")
+
         st.session_state["last_scan_diag"] = d
         _save_diag_tmp(d)
-        if stats is not None:
-            d["filter_stats"] = stats
-            st.session_state["last_scan_diag"] = d
-            _save_diag_tmp(d)
+
         if partial is not None:
             st.session_state["partial_candidates"] = partial
 
@@ -296,8 +355,6 @@ def update_progress(current: int, total: int, info: str, partial=None, stats=Non
         with st.status("スキャン＆バックテスト中…", expanded=True) as status:
             res = logic.scan_swing_candidates(
                 budget_yen=int(budget),
-                start_index=int(st.session_state.get('resume_index', 0)),
-                diag=st.session_state.get('last_scan_diag'),
                 top_n=3,
                 params=params,
                 progress_callback=update_progress,
@@ -305,6 +362,8 @@ def update_progress(current: int, total: int, info: str, partial=None, stats=Non
                 backtest_topk=int(bt_topk),
                 sector_prefilter=bool(sector_prefilter),
                 sector_top_n=int(sector_top_n),
+                start_index=int(st.session_state.get("resume_start_index", 0)),
+                diag=st.session_state.get("last_scan_diag"),
             )
 
             candidates = res.get("candidates", []) or []
@@ -337,6 +396,13 @@ def update_progress(current: int, total: int, info: str, partial=None, stats=Non
 
     except Exception as e:
         diag = st.session_state.get("last_scan_diag") or {}
+        # error_ringに追記
+        try:
+            ring = diag.get("error_ring") or []
+            ring.append({"ts": str(_dt.datetime.now()), "err": f"{type(e).__name__}: {e}"})
+            diag["error_ring"] = ring[-20:]
+        except Exception:
+            pass
         diag.update(
             {
                 "updated_at": str(_dt.datetime.now()),
@@ -355,22 +421,23 @@ def update_progress(current: int, total: int, info: str, partial=None, stats=Non
 # Results
 # -----------------------------
 st.markdown("## 🎯 スキャン結果")
-st.markdown("## 🎯 スキャン結果")
 
 diag = st.session_state.get("last_scan_diag") or {}
 stage = diag.get("stage")
 status = diag.get("status")
 
-if status == "running" and stage in ("queued", "calling_scan", "scanning"):
+if status == "running" and stage in ("queued", "queued_resume", "calling_scan", "scanning"):
     st.warning("スキャン進行中です。完了すると候補がここに出ます。")
     partial = st.session_state.get("partial_candidates") or []
     if partial:
         st.markdown("### ⏳ 暫定候補（スキャン途中の上位）")
         st.dataframe(pd.DataFrame(partial), use_container_width=True)
+elif status == "interrupted":
+    st.error("スキャンが中断状態です。サイドバーの「▶️ 中断から再開」を押してください。")
 else:
     cands = st.session_state.get("auto_candidates") or []
     if not cands:
-        st.info("完了しましたが候補は0件でした。サイドバーの診断JSONで fail_* を確認してください。")
+        st.info("完了しましたが候補は0件でした。サイドバーの診断JSONで fail_* / fail_data_reason を確認してください。")
     else:
         df = pd.DataFrame(cands)
         st.dataframe(df, use_container_width=True)
@@ -382,12 +449,14 @@ else:
                 st.session_state["target_ticker"] = c.get("ticker", "")
                 st.session_state["pair_label"] = label
                 st.rerun()
+
 ticker = st.session_state.get("target_ticker", "")
 if ticker:
     st.markdown(f"## 🔎 個別分析: {st.session_state.get('pair_label','')}")
     with st.spinner("データ取得＆指標計算中…"):
         df_raw = logic.get_market_data(ticker, period=max(bt_period, "2y"), interval="1d")
         df_ind = logic.calculate_indicators(df_raw)
+
     if df_ind.empty:
         st.error("データ取得に失敗しました。")
     else:
