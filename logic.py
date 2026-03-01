@@ -27,82 +27,6 @@ import streamlit as st
 LOGIC_BUILD = "STABLE5c-2026-02-28"
 _STOOQ_DOMAINS = ["stooq.pl", "stooq.com"]
 
-def _http_get_csv_r(url: str, timeout: int = 25, retries: int = 3):
-    \"\"\"Return (text, reason). reason is one of:
-    ok / http_{code} / rate_limited / timeout / bad_header / exception
-    \"\"\"
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; ai-stock-analyzer/1.0)"}
-    backoff = 1.0
-    last_reason = None
-    for _ in range(retries):
-        try:
-            r = requests.get(url, headers=headers, timeout=timeout)
-            if r.status_code in (429, 503, 502):
-                last_reason = "rate_limited" if r.status_code == 429 else f"http_{r.status_code}"
-                time.sleep(backoff)
-                backoff = min(8.0, backoff * 2)
-                continue
-            if r.status_code != 200:
-                return None, f"http_{r.status_code}"
-            text = r.text
-            # Some stooq responses can be HTML or have different headers
-            head = text[:300]
-            if "Date,Open,High,Low,Close" not in head and "Date,Open,High,Low,Close,Volume" not in head:
-                return None, "bad_header"
-            return text, "ok"
-        except requests.exceptions.Timeout:
-            last_reason = "timeout"
-            time.sleep(backoff)
-            backoff = min(8.0, backoff * 2)
-        except Exception:
-            last_reason = "exception"
-            time.sleep(backoff)
-            backoff = min(8.0, backoff * 2)
-    return None, last_reason or "exception"
-
-
-def get_market_data_reasoned(ticker: str, period: str = "2y", interval: str = "1d"):
-    \"\"\"Return (df, reason). reason is ok / ... / empty_df / parse_error / missing_close\"\"\"
-    sym = _stooq_symbol(ticker)
-    last_reason = None
-    for dom in _STOOQ_DOMAINS:
-        url = f"https://{dom}/q/d/l/?s={sym}&i=d"
-        text, rreason = _http_get_csv_r(url)
-        if not text:
-            last_reason = rreason
-            continue
-        try:
-            from io import StringIO
-            df = pd.read_csv(StringIO(text))
-            if df is None or df.empty:
-                last_reason = "empty_df"
-                continue
-            df.columns = [str(c).strip().capitalize() for c in df.columns]
-            if "Close" not in df.columns:
-                last_reason = "missing_close"
-                continue
-            if "Date" not in df.columns:
-                last_reason = "parse_error"
-                continue
-            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-            df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
-            # Ensure required cols exist
-            for c in ["Open", "High", "Low", "Close"]:
-                if c not in df.columns:
-                    last_reason = f"missing_{c.lower()}"
-                    raise KeyError(c)
-            if "Volume" not in df.columns:
-                df["Volume"] = np.nan
-            df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-            df = df.dropna(subset=["Open", "High", "Low", "Close"])
-            if df.empty:
-                last_reason = "empty_df"
-                continue
-            return _slice_period(df, period), "ok"
-        except Exception:
-            last_reason = "parse_error"
-            continue
-    return pd.DataFrame(), last_reason or "empty_df"
 
 @dataclass(frozen=True)
 class SwingParams:
@@ -201,7 +125,43 @@ def _stooq_symbol(ticker: str) -> str:
     return t
 
 
+def _http_get_csv_ex(url: str, timeout: int = 25, retries: int = 3):
+    """Return (text, reason, status_code).
+    reason in: ok, timeout, http_429, http_5xx, http_non200, bad_header, exception
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; ai-stock-analyzer/1.0)"}
+    backoff = 1.0
+    last_status = None
+    for _ in range(retries):
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+            last_status = getattr(r, "status_code", None)
+            if r.status_code == 429:
+                time.sleep(backoff); backoff = min(8.0, backoff * 2)
+                continue
+            if r.status_code in (502, 503, 504):
+                time.sleep(backoff); backoff = min(8.0, backoff * 2)
+                continue
+            if r.status_code != 200:
+                return None, "http_non200", r.status_code
+            text = r.text or ""
+            if "Date,Open,High,Low,Close" not in text[:300]:
+                # HTMLやエラー文の可能性
+                return None, "bad_header", r.status_code
+            return text, "ok", r.status_code
+        except requests.exceptions.Timeout:
+            time.sleep(backoff); backoff = min(8.0, backoff * 2)
+            continue
+        except Exception:
+            time.sleep(backoff); backoff = min(8.0, backoff * 2)
+            continue
+    # retries exhausted
+    if last_status == 429:
+        return None, "http_429", last_status
+    return None, "timeout", last_status
+
 def _http_get_csv(url: str, timeout: int = 25, retries: int = 3) -> Optional[str]:
+
     headers = {"User-Agent": "Mozilla/5.0 (compatible; ai-stock-analyzer/1.0)"}
     backoff = 1.0
     for _ in range(retries):
@@ -248,6 +208,43 @@ def get_market_data(ticker: str, period: str = "2y", interval: str = "1d") -> pd
         except Exception:
             continue
     return pd.DataFrame()
+
+def get_market_data_ex(ticker: str, period: str = "2y"):
+    """Return (df, reason). reason is None when ok."""
+    sym = _stooq_symbol(ticker)
+    for dom in _STOOQ_DOMAINS:
+        url = f"https://{dom}/q/d/l/?s={sym}&i=d"
+        text, reason, status = _http_get_csv_ex(url)
+        if not text:
+            # keep trying other domains unless reason is bad_header on 200 (still try others)
+            last_reason = reason or "unknown"
+            continue
+        try:
+            from io import StringIO
+            df = pd.read_csv(StringIO(text))
+            if df is None or df.empty:
+                return pd.DataFrame(), "empty_data"
+            df.columns = [c.strip().capitalize() for c in df.columns]
+            if "Date" not in df.columns:
+                return pd.DataFrame(), "missing_date"
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+            # 必須列
+            need = {"Open","High","Low","Close"}
+            if not need.issubset(set(df.columns)):
+                return pd.DataFrame(), "missing_ohlc"
+            if "Volume" not in df.columns:
+                df["Volume"] = np.nan
+            df = df[["Open","High","Low","Close","Volume"]].copy()
+            df = df.dropna(subset=["Open","High","Low","Close"])
+            df = _slice_period(df, period)
+            if df.empty:
+                return pd.DataFrame(), "too_short"
+            return df, None
+        except Exception:
+            return pd.DataFrame(), "parse_error"
+    return pd.DataFrame(), last_reason if "last_reason" in locals() else "no_response"
+
 
 
 def _slice_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
@@ -561,7 +558,7 @@ def scan_swing_candidates(
     sector_top_n: int = 6,
     relax_level: int = 0,
     start_index: int = 0,
-    diag: Optional[dict] = None,
+    diag: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     stats = {
         "universe": 0,
@@ -574,10 +571,10 @@ def scan_swing_candidates(
         "fail_turnover": 0,
         "fail_setup": 0,
         "budget_ok": 0,
-        "budget_ok": 0,
-    }    scan_start_ts = time.time()
-
+        "fail_budget": 0,
+    }
     auto_relax_trace: List[dict] = []
+    _t_total0 = time.time()
 
     master = get_jpx_master()
     if master.empty:
@@ -607,18 +604,45 @@ def scan_swing_candidates(
     partial_top: List[dict] = []
     partial_limit = max(8, int(top_n) * 3)
 
-    for i, t in enumerate(tickers[int(start_index):], start=1):
+    for i, t in enumerate(tickers[int(start_index):], start=int(start_index)+1):
         if progress_callback and (i % 10 == 0 or i == 1):
-            progress_callback(int(start_index)+i, total, f"fetch+indicators {t}", partial=partial_top, stats=stats)
+            progress_callback(i, total, f"fetch+indicators {t}", partial=partial_top, stats=stats)
+        _t0 = time.time()
+        df, data_reason = get_market_data_ex(t, period=backtest_period)
+        _t_fetch = time.time() - _t0
 
-        df = get_market_data(t, period=backtest_period)
-        
-_t_ind0 = time.time()
-ind = calculate_indicators(df)
-_t_ind1 = time.time()
-if diag is not None:
-    diag.setdefault("timing", {}).setdefault("indicators_sec", 0.0)
-    diag["timing"]["indicators_sec"] += float(_t_ind1 - _t_ind0)
+        # 拡張診断（diagへ）
+        if diag is not None:
+            try:
+                diag["cursor_index"] = int(i)
+                diag["last_ticker"] = str(t)
+                timing = diag.get("timing") or {}
+                timing["fetch_sec"] = float(timing.get("fetch_sec", 0.0)) + float(_t_fetch)
+                diag["timing"] = timing
+                if data_reason:
+                    fr = diag.get("fail_data_reason") or {}
+                    fr[str(data_reason)] = int(fr.get(str(data_reason), 0)) + 1
+                    diag["fail_data_reason"] = fr
+            except Exception:
+                pass
+
+        if data_reason:
+            stats["fail_data"] += 1
+            # statsにも理由別を載せる（main側で表示/保存）
+            try:
+                stats_reason = stats.get("fail_data_reason") or {}
+                stats_reason[str(data_reason)] = int(stats_reason.get(str(data_reason), 0)) + 1
+                stats["fail_data_reason"] = stats_reason
+                stats["cursor_index"] = int(i)
+                stats["last_ticker"] = str(t)
+                stats_timing = stats.get("timing") or {}
+                stats_timing["fetch_sec"] = float(stats_timing.get("fetch_sec", 0.0)) + float(_t_fetch)
+                stats["timing"] = stats_timing
+            except Exception:
+                pass
+            continue
+
+        ind = calculate_indicators(df)
         if not _passes_filters(ind, params, stats):
             continue
 
@@ -693,13 +717,7 @@ if diag is not None:
         if progress_callback:
             progress_callback(j, len(prelim), f"backtest {item['ticker']}", partial=prelim[: min(len(prelim), 12)], stats=stats)
         df = get_market_data(item["ticker"], period=backtest_period)
-        
-_t_ind0 = time.time()
-ind = calculate_indicators(df)
-_t_ind1 = time.time()
-if diag is not None:
-    diag.setdefault("timing", {}).setdefault("indicators_sec", 0.0)
-    diag["timing"]["indicators_sec"] += float(_t_ind1 - _t_ind0)
+        ind = calculate_indicators(df)
         bt = backtest_swing(ind, params)
         ranked.append(
             {
@@ -714,11 +732,6 @@ if diag is not None:
         )
 
     ranked = sorted(ranked, key=lambda x: float(x.get("bt_score", -1e9)), reverse=True)
-
-if diag is not None:
-    diag.setdefault("timing", {}).setdefault("total_sec", 0.0)
-    diag["timing"]["total_sec"] = float(time.time() - scan_start_ts)
-
     return {
         "mode": params.entry_mode,
         "candidates": ranked[: int(top_n)],
@@ -749,7 +762,20 @@ def build_trade_plan(df_ind: pd.DataFrame, params: SwingParams, capital_yen: int
     warning = None
     if shares <= 0:
         warning = "推奨株数が0（単元制約）。損切幅/資金/銘柄単価を調整してください。"
-    return {
+        # total timing
+    try:
+        _t_total = time.time() - _t_total0
+        stats_timing = stats.get("timing") or {}
+        stats_timing["total_sec"] = float(stats_timing.get("total_sec", 0.0)) + float(_t_total)
+        stats["timing"] = stats_timing
+        if diag is not None:
+            timing = diag.get("timing") or {}
+            timing["total_sec"] = float(timing.get("total_sec", 0.0)) + float(_t_total)
+            diag["timing"] = timing
+    except Exception:
+        pass
+
+return {
         "entry_price": entry,
         "stop_price": stop,
         "tp1_price": tp1,
