@@ -1,11 +1,27 @@
 # -*- coding: utf-8 -*-
+"""
+JPX × SBI 半自動トレード（2ファイル完全版）
+- main.py : Streamlit UI / もしくは --batch で日次OHLC更新（DB作成）
+- logic.py: データ層（SQLite）＋スキャン/最適化/発注CSV生成
+
+実行例:
+  1) 日次バッチ（毎朝1回）
+     python main.py --batch --db ./jpx_ohlc.sqlite --days 730 --max-workers 6
+
+  2) 運用（Streamlit）
+     streamlit run main.py
+"""
+from __future__ import annotations
+
+import sys
 import json
+import argparse
 import datetime as _dt
-import streamlit as st
+
 import pandas as pd
 import logic
 
-APP_BUILD = "ULTIMATE14-2026-03-02"
+APP_BUILD = "2FILE-COMPLETE-2026-03-02"
 
 def _json_dumps(obj) -> str:
     def default(o):
@@ -19,12 +35,47 @@ def _json_dumps(obj) -> str:
         return str(o)
     return json.dumps(obj, ensure_ascii=False, indent=2, default=default)
 
-# ---------------- UI ----------------
-st.set_page_config(page_title="SBI 半自動プロ仕様（機関レベル）", layout="wide")
-st.title("📈 SBI 半自動プロ仕様（機関レベル）")
+def _run_batch(args: argparse.Namespace) -> int:
+    rep = logic.daily_batch_update(
+        db_path=args.db,
+        days=int(args.days),
+        max_workers=int(args.max_workers),
+        chunk_size=int(args.chunk_size),
+        prefer_provider=str(args.provider),
+        min_rows=int(args.min_rows),
+        sleep_sec=float(args.sleep_sec),
+    )
+    print(_json_dumps(rep))
+    return 0 if rep.get("ok") else 2
+
+def _maybe_run_batch_from_cli() -> None:
+    # NOTE: streamlit run では通常 __name__ != "__main__"
+    if __name__ != "__main__":
+        return
+    p = argparse.ArgumentParser(add_help=True)
+    p.add_argument("--batch", action="store_true", help="日次バッチを実行（全銘柄OHLCをDBに保存）")
+    p.add_argument("--db", default=logic.DEFAULT_DB_PATH, help="SQLite DBパス")
+    p.add_argument("--days", type=int, default=730, help="取得する過去日数（例: 730=約2年）")
+    p.add_argument("--max-workers", type=int, default=6, help="並列数（上げすぎ注意）")
+    p.add_argument("--chunk-size", type=int, default=120, help="yfinance multi-download のチャンクサイズ")
+    p.add_argument("--provider", default="yfinance", choices=["yfinance","stooq","auto"], help="優先データ元")
+    p.add_argument("--min-rows", type=int, default=260, help="最低必要本数（不足は失敗扱い）")
+    p.add_argument("--sleep-sec", type=float, default=0.0, help="チャンクごとのスリープ（BAN回避）")
+    args = p.parse_args()
+
+    if args.batch:
+        sys.exit(_run_batch(args))
+
+# ---- CLI batch (must run BEFORE streamlit imports/execution) ----
+_maybe_run_batch_from_cli()
+
+# ---- Streamlit UI ----
+import streamlit as st  # noqa: E402
+
+st.set_page_config(page_title="SBI 半自動プロ仕様（2ファイル完全版）", layout="wide")
+st.title("📈 SBI 半自動プロ仕様（2ファイル完全版）")
 st.caption("スキャン→セクター強度→銘柄選択→WF/MC→RoR→DD/市場ボラ制御→注文書CSV。 build: " + APP_BUILD)
 
-# Always-visible progress area (top)
 prog = st.progress(0)
 status = st.empty()
 detail = st.empty()
@@ -42,9 +93,10 @@ def progress_cb(stage: str, payload: dict):
         done = payload.get("done", 0); total = payload.get("total", 1)
         ok = payload.get("ok", 0); fail = payload.get("fail", 0)
         prefer_yf = payload.get("prefer_yf", False)
+        used_db = payload.get("db_hit", 0)
         frac = 0.10 + 0.40 * (done / max(1, total))
         prog.progress(int(frac * 100))
-        status.write(f"📡 取得中: {done}/{total}  OK={ok} / FAIL={fail}  prefer_yfinance={prefer_yf}")
+        status.write(f"📡 取得中: {done}/{total}  OK={ok} / FAIL={fail} / DB_HIT={used_db}  prefer_yfinance={prefer_yf}")
         if payload:
             detail.write(payload)
         return
@@ -62,39 +114,27 @@ def progress_cb(stage: str, payload: dict):
     if payload:
         detail.write(payload)
 
-# Session state for diag (robust)
 if "diag_obj" not in st.session_state:
     st.session_state["diag_obj"] = {}
 if "diag_text" not in st.session_state:
     st.session_state["diag_text"] = ""
 
-# Sidebar: full explanations (RESTORED)
 with st.sidebar.expander("🧭 使い方 / 設定の意味（必読）", expanded=True):
-    st.markdown("""
+    st.markdown(f"""
 ### 目的
-日経（JPXマスター）から銘柄を取り、**セクター強度**で上位セクターを絞り込み、
-その中から **WF（ウォークフォワード）最適化**・**モンテカルロDD推定**・**RoR（Risk of Ruin）** を使って
-「半自動でSBI発注できる注文書CSV」を出します。
+JPX全銘柄を前提に、**スキャン→セクター強度→銘柄選択→WF/MC→RoR→DD/市場ボラ制御→SBI注文書CSV** を出します。
 
-### よくある失敗の原因
-- **Stooqがアクセス制限**：`Exceeded the daily hits limit` が出たら Stooq は当日使えません。  
-  → ULT11は **Stooq→yfinance自動フォールバック** します。
+### スキャンが止まらない設計（重要）
+- 日中の Streamlit は **ローカルDB（SQLite）を優先**してOHLCを読むため、外部制限で止まりにくいです。
+- それでもDBに無い銘柄は自動取得（yfinance優先）しますが、失敗しても **部分結果で必ず診断JSON** を出します。
 
-### 各設定の意味
-- **スキャン対象上限**：最初に見る銘柄数。Cloudは 600〜900 が現実的
-- **上位セクター数**：セクターランキングの上位いくつを採用するか
-- **事前候補M（重い計算対象）**：ここから先でWF/MCを回す銘柄数（25〜40推奨）
-- **最終採用銘柄数**：発注候補（相関フィルタ後）
-- **相関除外**：似た値動きを除外（0.65〜0.80推奨）
-- **並列数**：上げすぎるとBAN/失敗が増える（6〜10推奨）
-- **タイムバジェット**：超えたら部分結果で返す（止まらない）
+### 推奨運用
+- 毎朝1回: `python main.py --batch` でDB更新（4000銘柄でも安定）
+- 日中: `streamlit run main.py` でスキャン/発注
 
-### 出力
-- **診断JSON**：失敗しても必ず出します（原因解析用）
-- **注文書CSV**：SBI向けに「銘柄・株数・ストップ・TP」を出力
+build: `{APP_BUILD}`
 """)
 
-# Sidebar: controls inside a form (scan button ALWAYS appears)
 st.sidebar.header("⚙️ 設定")
 with st.sidebar.form("scan_form", clear_on_submit=False):
     universe_limit = st.slider("スキャン対象上限", 200, 2500, 800, step=100)
@@ -105,7 +145,7 @@ with st.sidebar.form("scan_form", clear_on_submit=False):
 
     min_price = st.number_input("最低株価フィルタ（円）", 0.0, 100000.0, 200.0, step=50.0)
     min_avg_volume = st.number_input("最低出来高（20日平均）", 0.0, 50000000.0, 50000.0, step=10000.0)
-    cache_days = st.slider("OHLCキャッシュ保持（日）", 0, 14, 2)
+    cache_days = st.slider("OHLCキャッシュ/DB鮮度（日）", 0, 14, 2)
 
     sector_top_n = st.slider("上位セクター数", 2, 12, 6)
     pre_top_m = st.slider("重い計算対象（事前候補M）", 10, 120, 35, step=5)
@@ -119,11 +159,10 @@ with st.sidebar.form("scan_form", clear_on_submit=False):
 
     st.markdown("---")
     max_workers = st.slider("並列数（多すぎ注意）", 3, 16, 8)
-    time_budget_sec = st.slider("タイムバジェット（秒）", 20, 120, 70, step=1)
+    time_budget_sec = st.slider("タイムバジェット（秒）", 20, 180, 70, step=1)
 
     run = st.form_submit_button("🔥 スキャン開始", type="primary")
 
-# Market vol cached
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_market_vol():
     return logic.compute_market_vol_ratio(progress_cb=None)
@@ -134,7 +173,6 @@ with st.sidebar.expander("📉 市場ボラ（自動: 1306.T）", expanded=False
     vol_ratio, vol_meta = _cached_market_vol()
     st.write({"vol_ratio": vol_ratio, "meta": vol_meta})
 
-# Download diag (sidebar + main)
 st.sidebar.subheader("🧾 診断JSON")
 if st.session_state["diag_text"]:
     st.sidebar.download_button(
@@ -157,7 +195,6 @@ if st.session_state["diag_text"]:
 else:
     st.caption("未生成（スキャン後に出ます）")
 
-# ---------------- Run scan ----------------
 if run:
     prog.progress(1)
     status.write("開始...")
