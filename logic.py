@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-ULTIMATE12
+ULTIMATE13
 - 根因: Stooq の daily hits limit (Exceeded the daily hits limit / Przekroczony dzienny limit wywolan) で fetch が壊れ、heavy_sims が全滅する
 - 対策:
   1) データ取得は stooq -> yfinance のフォールバック（同じ OHLC を作る）
@@ -28,6 +28,44 @@ import yfinance as yf
 
 _STOOQ_DOMAINS = ["stooq.pl", "stooq.com"]
 _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ai-stock-analyzer/ULT10)"}
+
+
+import os
+
+_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache_ohlc")
+os.makedirs(_CACHE_DIR, exist_ok=True)
+
+def _cache_path(ticker: str) -> str:
+    safe = str(ticker).replace("/", "_")
+    return os.path.join(_CACHE_DIR, f"{safe}.parquet")
+
+def _load_cache(ticker: str, max_age_days: int = 2) -> Optional[pd.DataFrame]:
+    p = _cache_path(ticker)
+    try:
+        if not os.path.exists(p):
+            return None
+        mtime = os.path.getmtime(p)
+        age_days = (time.time() - mtime) / (24*3600)
+        if age_days > float(max_age_days):
+            return None
+        df = pd.read_parquet(p)
+        if df is None or df.empty:
+            return None
+        # ensure index datetime
+        df.index = pd.to_datetime(df.index)
+        return df
+    except Exception:
+        return None
+
+def _save_cache(ticker: str, df: pd.DataFrame) -> None:
+    try:
+        if df is None or df.empty:
+            return
+        p = _cache_path(ticker)
+        df.to_parquet(p, index=True)
+    except Exception:
+        pass
+
 
 
 def get_jpx_master() -> pd.DataFrame:
@@ -196,7 +234,9 @@ def fetch_daily_stooq(ticker: str, *, min_rows: int = 260) -> Tuple[Optional[pd.
                 last_meta.update({"note": "too_short", "rows": int(len(df))})
                 return None, last_meta
             df = df.set_index("Date")
-            return df[["Open", "High", "Low", "Close", "Volume"]].copy(), last_meta
+            out = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+            _save_cache(ticker, out)
+            return out, last_meta
         except Exception as e:
             last_meta.update({"note": "csv_parse_error", "exc": f"{type(e).__name__}: {e}"})
             return None, last_meta
@@ -219,12 +259,19 @@ def fetch_daily_yf(ticker: str, *, min_rows: int = 260) -> Tuple[Optional[pd.Dat
             meta.update({"note": "too_short", "rows": int(len(df))})
             return None, meta
         df.index = pd.to_datetime(df.index)
-        return df[["Open","High","Low","Close","Volume"]].copy(), meta
+        out = df[["Open","High","Low","Close","Volume"]].copy()
+        _save_cache(ticker, out)
+        return out, meta
     except Exception as e:
         meta["exc"] = f"{type(e).__name__}: {e}"
         return None, meta
 
-def fetch_daily(ticker: str, *, min_rows: int = 260, prefer_yf: bool = False) -> Tuple[Optional[pd.DataFrame], dict, bool]:
+def fetch_daily(ticker: str, *, min_rows: int = 260, prefer_yf: bool = False, cache_days: int = 2) -> Tuple[Optional[pd.DataFrame], dict, bool]:
+    # Disk cache（Streamlit Cloudでもセッション中の再取得を激減）
+    cached = _load_cache(ticker, max_age_days=int(cache_days))
+    if cached is not None and not cached.empty:
+        return cached, {"provider": "cache", "ticker": ticker, "note": "cache_hit"}, False
+
     if prefer_yf:
         df, meta = fetch_daily_yf(ticker, min_rows=min_rows)
         if df is not None and not df.empty:
@@ -449,133 +496,34 @@ def compute_market_vol_ratio(progress_cb: Optional[Callable[[str, dict], None]] 
     meta = {"proxy": "1306.T", "ok": False}
     if progress_cb:
         progress_cb("market_vol_fetch", {"proxy": meta["proxy"]})
-    df, m, _ = fetch_daily("1306.T", min_rows=260, prefer_yf=False)
+    df, m, _ = fetch_daily("1306.T", min_rows=260, prefer_yf=False, cache_days=2)
     meta["fetch_meta"] = m
     if df is None or df.empty:
         meta["note"] = "fetch_failed"
         return 1.0, meta
     ind = add_indicators(df)
-    if ind.empty:
-        meta["note"] = "ind_empty"
-        return 1.0, meta
-    atrp = ind["ATR_PCT"]
-    cur = float(atrp.iloc[-1]); med = float(atrp.tail(260).median())
-    if not (np.isfinite(cur) and np.isfinite(med) and med > 0):
-        meta["note"] = "atr_nan"
-        return 1.0, meta
-    meta.update({"ok": True, "current_atr_pct": cur, "median_atr_pct_1y": med})
-    return float(cur / med), meta
-
-def correlation_filter(price_dict: Dict[str, pd.Series], symbols: List[str], threshold: float = 0.7) -> List[str]:
-    final: List[str] = []
-    for sym in symbols:
-        if sym not in price_dict:
-            continue
-        keep = True
-        for f in final:
-            if f not in price_dict:
-                continue
-            c = price_dict[sym].pct_change().corr(price_dict[f].pct_change())
-            if np.isfinite(c) and abs(float(c)) >= float(threshold):
-                keep = False
-                break
-        if keep:
-            final.append(sym)
-    return final
-
-def scan_engine(
-    *,
-    universe_limit: int = 700,
-    market_filter: str = "ALL",
-    size_filter: str = "ALL",
-    universe_mode: str = "RANDOM_STRATIFIED",
-    sector_top_n: int = 6,
-    pre_top_m: int = 35,
-    top_n: int = 6,
-    corr_threshold: float = 0.7,
-    max_workers: int = 8,
-    time_budget_sec: int = 55,
-    progress_cb: Optional[Callable[[str, dict], None]] = None,
-) -> Dict[str, object]:
-    t0 = time.time()
-    diag: dict = {
-        "timestamp_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
-        "stage": "init",
-        "stats": {},
-        "errors": [],
-        "sample_failures": [],
-        "timings_sec": {},
-        "provider_stats": {"stooq_rate_limited": False, "prefer_yfinance": False},
-    }
-
-    def tick(stage: str, extra: Optional[dict] = None):
-        diag["stage"] = stage
-        diag["timings_sec"][stage] = float(time.time() - t0)
-        if progress_cb:
-            progress_cb(stage, extra or {})
-
-    try:
-        master = get_jpx_master()
-        if master.empty:
-            tick("error", {"reason": "jpx_master_empty"})
-            diag["errors"].append("JPXマスター取得失敗")
-            return {"ok": False, "error": "JPXマスター取得失敗", "diag": diag, "sector_ranking": pd.DataFrame(), "candidates": pd.DataFrame()}
-
-        tick("universe")
-        master_f = filter_master(master, market_filter=market_filter, size_filter=size_filter)
-        diag["stats"]["master_total"] = int(len(master))
-        diag["stats"]["master_after_filter"] = int(len(master_f))
-        seed = int(time.time() // (24*3600))
-        tickers = pick_universe_tickers(master_f, int(universe_limit), mode=universe_mode, seed=seed)
-        diag["stats"]["universe"] = int(len(tickers))
-        diag["stats"]["market_filter"] = str(market_filter)
-        diag["stats"]["size_filter"] = str(size_filter)
-        diag["stats"]["universe_mode"] = str(universe_mode)
-
-        tick("fetch")
-        rows_latest: List[dict] = []
-        price_dict: Dict[str, pd.Series] = {}
-        fail_count = 0
-        prefer_yf = False
-
-        def _one(t: str, prefer_yf_local: bool):
-            df, meta, rl = fetch_daily(t, min_rows=260, prefer_yf=prefer_yf_local)
-            return t, df, meta, rl
-
-        futures = []
-        with ThreadPoolExecutor(max_workers=int(max_workers)) as ex:
-            for t in tickers:
-                futures.append(ex.submit(_one, t, prefer_yf))
-
-            done = 0
-            for fut in as_completed(futures):
-                done += 1
-                if (time.time() - t0) > float(time_budget_sec):
-                    diag["errors"].append("time_budget_exceeded_fetch_partial")
-                    break
-
-                t, df, meta, rl = fut.result()
-                if rl:
-                    prefer_yf = True
-                    diag["provider_stats"]["stooq_rate_limited"] = True
-                    diag["provider_stats"]["prefer_yfinance"] = True
-
-                if df is None or df.empty:
-                    fail_count += 1
-                    if len(diag["sample_failures"]) < 25:
-                        diag["sample_failures"].append({"ticker": t, "meta": meta})
-                else:
-                    ind = add_indicators(df)
                     if ind.empty:
                         fail_count += 1
                         if len(diag["sample_failures"]) < 25:
                             diag["sample_failures"].append({"ticker": t, "meta": {**(meta or {}), "note": "ind_empty"}})
                     else:
-                        latest = ind.iloc[-1].to_dict()
-                        latest["Symbol"] = t
-                        latest["pre_score"] = pre_score(ind.iloc[-1])
-                        rows_latest.append(latest)
-                        price_dict[t] = ind["Close"].tail(260)
+                        last = ind.iloc[-1]
+                        # Liquidity/price filters（精度改善：取りこぼしではなく“ノイズ銘柄”を先に落とす）
+                        try:
+                            px = float(last.get("Close", np.nan))
+                            v20 = float(last.get("VOL_AVG20", np.nan))
+                        except Exception:
+                            px, v20 = np.nan, np.nan
+                        if (np.isfinite(px) and px < float(min_price)) or (np.isfinite(v20) and v20 < float(min_avg_volume)):
+                            fail_count += 1
+                            if len(diag["sample_failures"]) < 25:
+                                diag["sample_failures"].append({\"ticker\": t, \"meta\": {**(meta or {}), \"note\": \"filtered_low_liquidity_or_price\", \"close\": px, \"vol_avg20\": v20}})
+                        else:
+                            latest = last.to_dict()
+                            latest["Symbol"] = t
+                            latest["pre_score"] = pre_score(last)
+                            rows_latest.append(latest)
+                            price_dict[t] = ind["Close"].tail(260)
 
                 if progress_cb and (done % 20 == 0 or done == 1):
                     progress_cb("fetch_progress", {"done": done, "total": len(tickers), "ok": len(rows_latest), "fail": fail_count, "prefer_yf": prefer_yf})
@@ -611,7 +559,7 @@ def scan_engine(
                 diag["errors"].append("time_budget_exceeded_heavy_partial")
                 break
 
-            df, meta, _ = fetch_daily(sym, min_rows=260, prefer_yf=diag["provider_stats"]["prefer_yfinance"])
+            df, meta, _ = fetch_daily(sym, min_rows=260, prefer_yf=diag["provider_stats"]["prefer_yfinance"], cache_days=int(cache_days))
             if df is None or df.empty:
                 heavy_fail += 1
                 continue
