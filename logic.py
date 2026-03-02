@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-ULTIMATE10
+ULTIMATE12
 - 根因: Stooq の daily hits limit (Exceeded the daily hits limit / Przekroczony dzienny limit wywolan) で fetch が壊れ、heavy_sims が全滅する
 - 対策:
   1) データ取得は stooq -> yfinance のフォールバック（同じ OHLC を作る）
@@ -29,7 +29,12 @@ import yfinance as yf
 _STOOQ_DOMAINS = ["stooq.pl", "stooq.com"]
 _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ai-stock-analyzer/ULT10)"}
 
+
 def get_jpx_master() -> pd.DataFrame:
+    """
+    JPXが提供するマスター（Excel）を取得。
+    できるだけ多くの列を保持し、後段で「市場区分（プライム等）」や「規模区分」があればフィルタできるようにする。
+    """
     url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
     try:
         df = pd.read_excel(url)
@@ -48,9 +53,84 @@ def get_jpx_master() -> pd.DataFrame:
     df = df.copy()
     df = df[df["33業種区分"].notna()]
     df = df[df["33業種区分"] != "-"]
+
     df["ticker"] = df["コード"].astype(str).str.zfill(4) + ".T"
     df = df.rename(columns={"銘柄名": "name", "33業種区分": "sector"})
-    return df[["ticker", "name", "sector"]].drop_duplicates().reset_index(drop=True)
+
+    market_cols = ["市場・商品区分", "市場区分", "市場・商品区分（詳細）", "市場商品区分"]
+    found_market = next((c for c in market_cols if c in df.columns), None)
+    df["market"] = df[found_market].astype(str) if found_market else np.nan
+
+    size_cols = ["規模区分", "規模", "Size", "規模区分（TOPIX）"]
+    found_size = next((c for c in size_cols if c in df.columns), None)
+    df["size"] = df[found_size].astype(str) if found_size else np.nan
+
+    keep = ["ticker", "name", "sector", "market", "size"]
+    return df[keep].drop_duplicates().reset_index(drop=True)
+
+
+def _normalize_market(m: str) -> str:
+    s = (m or "").strip().lower().replace("　", " ")
+    return s
+
+def filter_master(master: pd.DataFrame, market_filter: str = "ALL", size_filter: str = "ALL") -> pd.DataFrame:
+    df = master.copy()
+    mf = (market_filter or "ALL").upper()
+    sf = (size_filter or "ALL").upper()
+
+    if "market" in df.columns and mf != "ALL":
+        mk = df["market"].astype(str).apply(_normalize_market)
+        if mf == "PRIME":
+            df = df[mk.str.contains("プライム|prime", regex=True, na=False)]
+        elif mf == "STANDARD":
+            df = df[mk.str.contains("スタンダード|standard", regex=True, na=False)]
+        elif mf == "GROWTH":
+            df = df[mk.str.contains("グロース|growth", regex=True, na=False)]
+
+    if "size" in df.columns and sf != "ALL":
+        sz = df["size"].astype(str).apply(_normalize_market)
+        if sf == "LARGE":
+            df = df[sz.str.contains("大型|large", regex=True, na=False)]
+        elif sf == "MID":
+            df = df[sz.str.contains("中型|mid", regex=True, na=False)]
+        elif sf == "SMALL":
+            df = df[sz.str.contains("小型|small", regex=True, na=False)]
+
+    return df.reset_index(drop=True)
+
+def pick_universe_tickers(master_filtered: pd.DataFrame, universe_limit: int, mode: str = "RANDOM_STRATIFIED", seed: int = 0):
+    df = master_filtered.copy()
+    ticks = df["ticker"].astype(str).tolist()
+    if universe_limit <= 0 or len(ticks) <= universe_limit:
+        return ticks
+
+    mode = (mode or "RANDOM_STRATIFIED").upper()
+    if mode == "HEAD":
+        return ticks[: int(universe_limit)]
+
+    rng = np.random.default_rng(int(seed))
+    out = []
+    total = len(df)
+    for sec, g in df.groupby("sector", dropna=False):
+        k = max(1, int(round(len(g) / max(1, total) * universe_limit)))
+        cand = g["ticker"].astype(str).tolist()
+        if len(cand) <= k:
+            out.extend(cand)
+        else:
+            out.extend(list(rng.choice(cand, size=k, replace=False)))
+        if len(out) >= universe_limit:
+            break
+
+    if len(out) < universe_limit:
+        remain = list(set(ticks) - set(out))
+        if remain:
+            out.extend(list(rng.choice(remain, size=min(len(remain), universe_limit - len(out)), replace=False)))
+
+    if len(out) > universe_limit:
+        out = list(rng.choice(out, size=universe_limit, replace=False))
+
+    return out
+
 
 def _stooq_symbol(ticker: str) -> str:
     t = str(ticker).strip()
@@ -406,6 +486,9 @@ def correlation_filter(price_dict: Dict[str, pd.Series], symbols: List[str], thr
 def scan_engine(
     *,
     universe_limit: int = 700,
+    market_filter: str = "ALL",
+    size_filter: str = "ALL",
+    universe_mode: str = "RANDOM_STRATIFIED",
     sector_top_n: int = 6,
     pre_top_m: int = 35,
     top_n: int = 6,
@@ -439,8 +522,15 @@ def scan_engine(
             return {"ok": False, "error": "JPXマスター取得失敗", "diag": diag, "sector_ranking": pd.DataFrame(), "candidates": pd.DataFrame()}
 
         tick("universe")
-        tickers = master["ticker"].astype(str).tolist()[: int(universe_limit)]
+        master_f = filter_master(master, market_filter=market_filter, size_filter=size_filter)
+        diag["stats"]["master_total"] = int(len(master))
+        diag["stats"]["master_after_filter"] = int(len(master_f))
+        seed = int(time.time() // (24*3600))
+        tickers = pick_universe_tickers(master_f, int(universe_limit), mode=universe_mode, seed=seed)
         diag["stats"]["universe"] = int(len(tickers))
+        diag["stats"]["market_filter"] = str(market_filter)
+        diag["stats"]["size_filter"] = str(size_filter)
+        diag["stats"]["universe_mode"] = str(universe_mode)
 
         tick("fetch")
         rows_latest: List[dict] = []
@@ -572,10 +662,12 @@ def scan_engine(
         heavy_df = pd.DataFrame(heavy_rows)
         sample_pen = np.clip(heavy_df.get("wf_oos_trades", 0).fillna(0).astype(float) / 8.0, 0.2, 1.0)
         heavy_df["final_score"] = (
-            heavy_df.get("wf_oos_mean_exp", 0).fillna(0).astype(float) * 120.0 * sample_pen
-            + heavy_df["RET_3M"].fillna(0).astype(float) * 35.0
+            heavy_df.get("wf_oos_mean_exp", 0).fillna(0).astype(float) * 150.0 * sample_pen
+            + heavy_df.get("wf_oos_wr", 0).fillna(0).astype(float) * 50.0
+            + np.clip(heavy_df.get("wf_oos_rr", 1.0).fillna(1.0).astype(float), 0.5, 4.0) * 20.0
+            + heavy_df["RET_3M"].fillna(0).astype(float) * 15.0
             + heavy_df["pre_score"].fillna(0).astype(float) * 10.0
-            - np.abs(heavy_df["mc_dd_p05"].fillna(0).astype(float)) * 10.0
+            - np.abs(heavy_df["mc_dd_p05"].fillna(0).astype(float)) * 15.0
         )
 
         ranked = heavy_df.sort_values("final_score", ascending=False).reset_index(drop=True)
