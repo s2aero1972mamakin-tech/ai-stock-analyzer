@@ -5,7 +5,7 @@ import streamlit as st
 import pandas as pd
 import logic
 
-APP_BUILD = "ULTIMATE12-2026-03-02"
+APP_BUILD = "ULTIMATE13-2026-03-02"
 
 def _json_dumps(obj) -> str:
     def default(o):
@@ -76,8 +76,9 @@ with st.sidebar.expander("🧭 使い方 / 設定の意味（必読）", expande
 その中から **WF（ウォークフォワード）最適化**・**モンテカルロDD推定**・**RoR（Risk of Ruin）** を使って
 「半自動でSBI発注できる注文書CSV」を出します。
 
-### よくある失敗の原因
-- **Stooqがアクセス制限**：`Exceeded the daily hits limit` が出たら Stooq は当日使えません。  
+### よくある失敗の原因（＋精度が伸びない原因）
+- **Stooqがアクセス制限**：`Exceeded the daily hits limit` が出たら Stooq は当日使えません。
+- **母集団の偏り/ノイズ銘柄**：低流動性・低位株はノイズが増え、WF/MCの精度を落とします（ULT13は最低株価/出来高で先に除外）。  
   → ULT11は **Stooq→yfinance自動フォールバック** します。
 
 ### 各設定の意味
@@ -102,6 +103,10 @@ with st.sidebar.form("scan_form", clear_on_submit=False):
     market_filter = st.selectbox("市場フィルタ（JPXマスターに列がある場合のみ有効）", ["ALL","PRIME","STANDARD","GROWTH"], index=1)
     size_filter = st.selectbox("規模フィルタ（列がある場合のみ有効）", ["ALL","LARGE","MID","SMALL"], index=0)
     universe_mode = st.selectbox("ユニバース抽出方式", ["RANDOM_STRATIFIED","HEAD"], index=0)
+
+    min_price = st.number_input("最低株価フィルタ（円）", 0.0, 100000.0, 200.0, step=50.0)
+    min_avg_volume = st.number_input("最低出来高（20日平均）", 0.0, 50000000.0, 50000.0, step=10000.0)
+    cache_days = st.slider("OHLCキャッシュ保持（日）", 0, 14, 2)
 
     sector_top_n = st.slider("上位セクター数", 2, 12, 6)
     pre_top_m = st.slider("重い計算対象（事前候補M）", 10, 120, 35, step=5)
@@ -166,6 +171,9 @@ if run:
                 market_filter=str(market_filter),
                 size_filter=str(size_filter),
                 universe_mode=str(universe_mode),
+                min_price=float(min_price),
+                min_avg_volume=float(min_avg_volume),
+                cache_days=int(cache_days),
                 sector_top_n=int(sector_top_n),
                 pre_top_m=int(pre_top_m),
                 top_n=int(top_n),
