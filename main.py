@@ -5,7 +5,7 @@ import streamlit as st
 import pandas as pd
 import logic
 
-APP_BUILD = "ULTIMATE13-2026-03-02"
+APP_BUILD = "ULTIMATE14-2026-03-02"
 
 def _json_dumps(obj) -> str:
     def default(o):
@@ -76,9 +76,8 @@ with st.sidebar.expander("🧭 使い方 / 設定の意味（必読）", expande
 その中から **WF（ウォークフォワード）最適化**・**モンテカルロDD推定**・**RoR（Risk of Ruin）** を使って
 「半自動でSBI発注できる注文書CSV」を出します。
 
-### よくある失敗の原因（＋精度が伸びない原因）
-- **Stooqがアクセス制限**：`Exceeded the daily hits limit` が出たら Stooq は当日使えません。
-- **母集団の偏り/ノイズ銘柄**：低流動性・低位株はノイズが増え、WF/MCの精度を落とします（ULT13は最低株価/出来高で先に除外）。  
+### よくある失敗の原因
+- **Stooqがアクセス制限**：`Exceeded the daily hits limit` が出たら Stooq は当日使えません。  
   → ULT11は **Stooq→yfinance自動フォールバック** します。
 
 ### 各設定の意味
