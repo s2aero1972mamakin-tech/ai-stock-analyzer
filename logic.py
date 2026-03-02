@@ -1,24 +1,33 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import math, time
+
+"""
+ULTIMATE10
+- 根因: Stooq の daily hits limit (Exceeded the daily hits limit / Przekroczony dzienny limit wywolan) で fetch が壊れ、heavy_sims が全滅する
+- 対策:
+  1) データ取得は stooq -> yfinance のフォールバック（同じ OHLC を作る）
+  2) "daily hits limit" を検出したら即座に「stooqブロック中」フラグを立て、残りは yfinance を優先
+  3) 取得失敗が多い場合も部分結果で返す（止まらない）
+- UI側の診断JSONダウンロード不具合:
+  - サイドバーに加えてメインにも download_button を常設
+  - diag を「文字列」でも session_state に保存し、ボタンに直接渡す（pickle/大型dict問題回避）
+"""
+
+import math
+import time
 from dataclasses import dataclass
 from io import BytesIO, StringIO
 from typing import Callable, Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-"""
-ULTIMATE9 (Streamlit Cloud安定版)
-ログの根因を潰す:
-- NameError: ThreadPoolExecutor 未定義 → import 済み
-- TypeError: compute_market_vol_ratio(progress_cb=...) 不一致 → progress_cb で統一
-- Cloud 60s health-check timeout 対策: time_budget_sec で部分終了し、diag を必ず返す
-"""
+import yfinance as yf
 
 _STOOQ_DOMAINS = ["stooq.pl", "stooq.com"]
-_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ai-stock-analyzer/ULT9)"}
+_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ai-stock-analyzer/ULT10)"}
 
 def get_jpx_master() -> pd.DataFrame:
     url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
@@ -31,9 +40,11 @@ def get_jpx_master() -> pd.DataFrame:
             df = pd.read_excel(BytesIO(r.content), engine="xlrd")
         except Exception:
             return pd.DataFrame()
+
     needed = {"コード", "銘柄名", "33業種区分"}
     if not needed.issubset(set(df.columns)):
         return pd.DataFrame()
+
     df = df.copy()
     df = df[df["33業種区分"].notna()]
     df = df[df["33業種区分"] != "-"]
@@ -51,33 +62,39 @@ def _stooq_symbol(ticker: str) -> str:
         return f"{t}.jp"
     return t
 
+def _looks_like_rate_limit(text: str) -> bool:
+    if not text:
+        return False
+    s = text.strip().lower()
+    return ("exceeded the daily hits limit" in s) or ("przekroczony dzienny limit" in s) or ("limit wywolan" in s)
+
 def _http_get_csv(url: str, timeout: int = 10, retries: int = 2) -> Tuple[Optional[str], dict]:
     backoff = 0.8
     meta: dict = {"url": url}
     for _ in range(retries):
         try:
             r = requests.get(url, headers=_HEADERS, timeout=timeout)
-            meta.update({"status_code": int(r.status_code), "len": int(len(r.text or ""))})
+            text = r.text or ""
+            meta.update({"status_code": int(r.status_code), "len": int(len(text))})
             if r.status_code in (429, 500, 502, 503, 504):
-                time.sleep(backoff)
-                backoff = min(3.0, backoff * 1.7)
-                continue
+                time.sleep(backoff); backoff = min(3.0, backoff * 1.7); continue
             if r.status_code != 200:
                 return None, meta
-            text = r.text or ""
+            if _looks_like_rate_limit(text):
+                meta.update({"note": "stooq_rate_limited", "head": text[:120]})
+                return None, meta
             if "Date,Open,High,Low,Close" not in text[:400]:
                 meta.update({"note": "non_csv_or_blocked", "head": text[:120]})
                 return None, meta
             return text, meta
         except Exception as e:
             meta.update({"exc": f"{type(e).__name__}: {e}"})
-            time.sleep(backoff)
-            backoff = min(3.0, backoff * 1.7)
+            time.sleep(backoff); backoff = min(3.0, backoff * 1.7)
     return None, meta
 
 def fetch_daily_stooq(ticker: str, *, min_rows: int = 260) -> Tuple[Optional[pd.DataFrame], dict]:
     sym = _stooq_symbol(ticker)
-    last_meta: dict = {"ticker": ticker, "sym": sym}
+    last_meta: dict = {"provider": "stooq", "ticker": ticker, "sym": sym}
     for dom in _STOOQ_DOMAINS:
         url = f"https://{dom}/q/d/l/?s={sym}&i=d"
         text, meta = _http_get_csv(url)
@@ -104,6 +121,44 @@ def fetch_daily_stooq(ticker: str, *, min_rows: int = 260) -> Tuple[Optional[pd.
             last_meta.update({"note": "csv_parse_error", "exc": f"{type(e).__name__}: {e}"})
             return None, last_meta
     return None, last_meta
+
+def fetch_daily_yf(ticker: str, *, min_rows: int = 260) -> Tuple[Optional[pd.DataFrame], dict]:
+    meta = {"provider": "yfinance", "ticker": ticker}
+    try:
+        df = yf.download(ticker, period="5y", interval="1d", auto_adjust=False, progress=False, threads=False)
+        if df is None or df.empty:
+            meta["note"] = "empty"
+            return None, meta
+        df = df.rename(columns={c: c.capitalize() for c in df.columns})
+        if "Adj close" in df.columns:
+            df = df.rename(columns={"Adj close": "AdjClose"})
+        if "Volume" not in df.columns:
+            df["Volume"] = np.nan
+        df = df.dropna(subset=["Open","High","Low","Close"])
+        if len(df) < int(min_rows):
+            meta.update({"note": "too_short", "rows": int(len(df))})
+            return None, meta
+        df.index = pd.to_datetime(df.index)
+        return df[["Open","High","Low","Close","Volume"]].copy(), meta
+    except Exception as e:
+        meta["exc"] = f"{type(e).__name__}: {e}"
+        return None, meta
+
+def fetch_daily(ticker: str, *, min_rows: int = 260, prefer_yf: bool = False) -> Tuple[Optional[pd.DataFrame], dict, bool]:
+    if prefer_yf:
+        df, meta = fetch_daily_yf(ticker, min_rows=min_rows)
+        if df is not None and not df.empty:
+            return df, meta, False
+
+    df, meta = fetch_daily_stooq(ticker, min_rows=min_rows)
+    if df is not None and not df.empty:
+        return df, meta, False
+
+    rate_limited = (meta or {}).get("note") == "stooq_rate_limited"
+    df2, meta2 = fetch_daily_yf(ticker, min_rows=min_rows)
+    if df2 is not None and not df2.empty:
+        return df2, meta2, rate_limited
+    return None, (meta2 or meta), rate_limited
 
 def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
     delta = close.diff()
@@ -273,7 +328,7 @@ def walk_forward_optimize(df_ind: pd.DataFrame) -> Tuple[WFParams, dict]:
             best_sum = {"wf_oos_mean_exp": mean_exp, "wf_oos_wr": mean_wr, "wf_oos_rr": mean_rr, "wf_oos_trades": mean_n}
     return best_p, best_sum
 
-def monte_carlo_maxdd_from_daily_returns(daily_returns: np.ndarray, n_sim: int = 250) -> float:
+def monte_carlo_maxdd_from_daily_returns(daily_returns: np.ndarray, n_sim: int = 200) -> float:
     r = np.array(daily_returns, dtype=float)
     r = r[np.isfinite(r)]
     if r.size < 80:
@@ -288,8 +343,7 @@ def monte_carlo_maxdd_from_daily_returns(daily_returns: np.ndarray, n_sim: int =
     return float(np.percentile(max_dds, 5))
 
 def portfolio_ror(win_rate: float, rr: float, capital_units: float) -> float:
-    p = float(win_rate)
-    rr = max(1e-6, float(rr))
+    p = float(win_rate); rr = max(1e-6, float(rr))
     edge = p - (1.0 - p) / rr
     if not np.isfinite(edge) or edge <= 0:
         return 1.0
@@ -315,7 +369,7 @@ def compute_market_vol_ratio(progress_cb: Optional[Callable[[str, dict], None]] 
     meta = {"proxy": "1306.T", "ok": False}
     if progress_cb:
         progress_cb("market_vol_fetch", {"proxy": meta["proxy"]})
-    df, m = fetch_daily_stooq("1306.T", min_rows=260)
+    df, m, _ = fetch_daily("1306.T", min_rows=260, prefer_yf=False)
     meta["fetch_meta"] = m
     if df is None or df.empty:
         meta["note"] = "fetch_failed"
@@ -325,8 +379,7 @@ def compute_market_vol_ratio(progress_cb: Optional[Callable[[str, dict], None]] 
         meta["note"] = "ind_empty"
         return 1.0, meta
     atrp = ind["ATR_PCT"]
-    cur = float(atrp.iloc[-1])
-    med = float(atrp.tail(260).median())
+    cur = float(atrp.iloc[-1]); med = float(atrp.tail(260).median())
     if not (np.isfinite(cur) and np.isfinite(med) and med > 0):
         meta["note"] = "atr_nan"
         return 1.0, meta
@@ -350,86 +403,125 @@ def correlation_filter(price_dict: Dict[str, pd.Series], symbols: List[str], thr
             final.append(sym)
     return final
 
-def scan_engine(*, universe_limit:int=700, sector_top_n:int=6, pre_top_m:int=35, top_n:int=6,
-               corr_threshold:float=0.7, max_workers:int=9, time_budget_sec:int=50,
-               progress_cb:Optional[Callable[[str,dict],None]]=None) -> Dict[str, object]:
+def scan_engine(
+    *,
+    universe_limit: int = 700,
+    sector_top_n: int = 6,
+    pre_top_m: int = 35,
+    top_n: int = 6,
+    corr_threshold: float = 0.7,
+    max_workers: int = 8,
+    time_budget_sec: int = 55,
+    progress_cb: Optional[Callable[[str, dict], None]] = None,
+) -> Dict[str, object]:
     t0 = time.time()
-    diag: dict = {"timestamp_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
-                  "stage":"init","stats":{},"errors":[], "sample_failures":[], "timings_sec":{}}
-    def tick(stage:str, extra:Optional[dict]=None):
-        diag["stage"]=stage
-        diag["timings_sec"][stage]=float(time.time()-t0)
-        if progress_cb: progress_cb(stage, extra or {})
+    diag: dict = {
+        "timestamp_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        "stage": "init",
+        "stats": {},
+        "errors": [],
+        "sample_failures": [],
+        "timings_sec": {},
+        "provider_stats": {"stooq_rate_limited": False, "prefer_yfinance": False},
+    }
+
+    def tick(stage: str, extra: Optional[dict] = None):
+        diag["stage"] = stage
+        diag["timings_sec"][stage] = float(time.time() - t0)
+        if progress_cb:
+            progress_cb(stage, extra or {})
+
     try:
         master = get_jpx_master()
         if master.empty:
-            tick("error", {"reason":"jpx_master_empty"})
+            tick("error", {"reason": "jpx_master_empty"})
             diag["errors"].append("JPXマスター取得失敗")
-            return {"ok":False,"error":"JPXマスター取得失敗","diag":diag,"sector_ranking":pd.DataFrame(),"candidates":pd.DataFrame()}
+            return {"ok": False, "error": "JPXマスター取得失敗", "diag": diag, "sector_ranking": pd.DataFrame(), "candidates": pd.DataFrame()}
+
         tick("universe")
-        tickers = master["ticker"].astype(str).tolist()[:int(universe_limit)]
-        diag["stats"]["universe"]=int(len(tickers))
+        tickers = master["ticker"].astype(str).tolist()[: int(universe_limit)]
+        diag["stats"]["universe"] = int(len(tickers))
+
         tick("fetch")
-        rows_latest=[]
-        price_dict={}
-        fail_count=0
-        def _one(t:str):
-            df, meta = fetch_daily_stooq(t, min_rows=260)
-            return t, df, meta
-        futures=[]
+        rows_latest: List[dict] = []
+        price_dict: Dict[str, pd.Series] = {}
+        fail_count = 0
+        prefer_yf = False
+
+        def _one(t: str, prefer_yf_local: bool):
+            df, meta, rl = fetch_daily(t, min_rows=260, prefer_yf=prefer_yf_local)
+            return t, df, meta, rl
+
+        futures = []
         with ThreadPoolExecutor(max_workers=int(max_workers)) as ex:
             for t in tickers:
-                futures.append(ex.submit(_one, t))
-            done=0
+                futures.append(ex.submit(_one, t, prefer_yf))
+
+            done = 0
             for fut in as_completed(futures):
                 done += 1
-                if (time.time()-t0) > float(time_budget_sec):
+                if (time.time() - t0) > float(time_budget_sec):
                     diag["errors"].append("time_budget_exceeded_fetch_partial")
                     break
-                t, df, meta = fut.result()
+
+                t, df, meta, rl = fut.result()
+                if rl:
+                    prefer_yf = True
+                    diag["provider_stats"]["stooq_rate_limited"] = True
+                    diag["provider_stats"]["prefer_yfinance"] = True
+
                 if df is None or df.empty:
                     fail_count += 1
-                    if len(diag["sample_failures"])<25:
-                        diag["sample_failures"].append({"ticker":t, "meta":meta})
+                    if len(diag["sample_failures"]) < 25:
+                        diag["sample_failures"].append({"ticker": t, "meta": meta})
                 else:
                     ind = add_indicators(df)
                     if ind.empty:
                         fail_count += 1
-                        if len(diag["sample_failures"])<25:
-                            diag["sample_failures"].append({"ticker":t, "meta":{**(meta or {}), "note":"ind_empty"}})
+                        if len(diag["sample_failures"]) < 25:
+                            diag["sample_failures"].append({"ticker": t, "meta": {**(meta or {}), "note": "ind_empty"}})
                     else:
                         latest = ind.iloc[-1].to_dict()
-                        latest["Symbol"]=t
-                        latest["pre_score"]=pre_score(ind.iloc[-1])
+                        latest["Symbol"] = t
+                        latest["pre_score"] = pre_score(ind.iloc[-1])
                         rows_latest.append(latest)
-                        price_dict[t]=ind["Close"].tail(260)
+                        price_dict[t] = ind["Close"].tail(260)
+
                 if progress_cb and (done % 20 == 0 or done == 1):
-                    progress_cb("fetch_progress", {"done":done, "total":len(tickers), "ok":len(rows_latest), "fail":fail_count})
-        diag["stats"]["fetched_ok"]=int(len(rows_latest))
-        diag["stats"]["fetch_failed"]=int(fail_count)
+                    progress_cb("fetch_progress", {"done": done, "total": len(tickers), "ok": len(rows_latest), "fail": fail_count, "prefer_yf": prefer_yf})
+
+        diag["stats"]["fetched_ok"] = int(len(rows_latest))
+        diag["stats"]["fetch_failed"] = int(fail_count)
+
         if not rows_latest:
-            tick("error", {"reason":"all_fetch_failed"})
-            diag["errors"].append("Stooq取得が全滅（IPブロック/レート制限/ネットワーク）")
-            return {"ok":False,"error":"Stooq取得が全滅","diag":diag,"sector_ranking":pd.DataFrame(),"candidates":pd.DataFrame()}
+            tick("error", {"reason": "all_fetch_failed"})
+            diag["errors"].append("データ取得が全滅（Stooq/外部制限）")
+            return {"ok": False, "error": "データ取得が全滅", "diag": diag, "sector_ranking": pd.DataFrame(), "candidates": pd.DataFrame()}
+
         tick("merge")
         latest_df = pd.DataFrame(rows_latest).merge(master, left_on="Symbol", right_on="ticker", how="left")
+
         tick("sector_strength")
-        sec_rank = calc_sector_strength(latest_df[["Symbol","sector","RET_3M","RSI","ATR_PCT","VOL_AVG20"]].copy())
+        sec_rank = calc_sector_strength(latest_df[["Symbol", "sector", "RET_3M", "RSI", "ATR_PCT", "VOL_AVG20"]].copy())
         top_sectors = sec_rank.head(int(sector_top_n))["sector"].astype(str).tolist()
-        diag["stats"]["top_sectors"]=top_sectors
+        diag["stats"]["top_sectors"] = top_sectors
+
         tick("preselect")
         cand0 = latest_df[latest_df["sector"].astype(str).isin(top_sectors)].copy()
         cand0 = cand0.sort_values("pre_score", ascending=False).head(int(pre_top_m)).copy()
-        diag["stats"]["pre_top_m_actual"]=int(len(cand0))
+        diag["stats"]["pre_top_m_actual"] = int(len(cand0))
+
         tick("heavy_sims")
-        heavy_rows=[]
-        heavy_fail=0
+        heavy_rows = []
+        heavy_fail = 0
         syms = cand0["Symbol"].astype(str).tolist()
+
         for idx, sym in enumerate(syms, start=1):
-            if (time.time()-t0) > float(time_budget_sec):
+            if (time.time() - t0) > float(time_budget_sec):
                 diag["errors"].append("time_budget_exceeded_heavy_partial")
                 break
-            df, meta = fetch_daily_stooq(sym, min_rows=260)
+
+            df, meta, _ = fetch_daily(sym, min_rows=260, prefer_yf=diag["provider_stats"]["prefer_yfinance"])
             if df is None or df.empty:
                 heavy_fail += 1
                 continue
@@ -437,74 +529,108 @@ def scan_engine(*, universe_limit:int=700, sector_top_n:int=6, pre_top_m:int=35,
             if ind.empty:
                 heavy_fail += 1
                 continue
+
             p_best, wf_sum = walk_forward_optimize(ind)
             daily_ret = ind["Close"].pct_change().dropna().values
-            mc_dd = monte_carlo_maxdd_from_daily_returns(daily_ret, n_sim=200)
+            mc_dd = monte_carlo_maxdd_from_daily_returns(daily_ret, n_sim=180)
             exp_full, wr_full, rr_full, n_full = _backtest_r(ind, p_best)
+
             last = ind.iloc[-1]
-            rname = str(cand0[cand0["Symbol"]==sym].iloc[0].get("name",""))
-            rsec  = str(cand0[cand0["Symbol"]==sym].iloc[0].get("sector",""))
+            rname = str(cand0[cand0["Symbol"] == sym].iloc[0].get("name", ""))
+            rsec = str(cand0[cand0["Symbol"] == sym].iloc[0].get("sector", ""))
+
             heavy_rows.append({
-                "Symbol":sym,"name":rname,"sector":rsec,
-                "Close":float(last["Close"]), "ATR":float(last["ATR"]),
-                "RSI":float(last["RSI"]), "RET_3M":float(last["RET_3M"]),
-                "pre_score":float(cand0[cand0["Symbol"]==sym].iloc[0]["pre_score"]),
-                "wf_best":{"atr_mult_stop":p_best.atr_mult_stop,"tp2_r":p_best.tp2_r,"time_stop_days":p_best.time_stop_days},
+                "Symbol": sym,
+                "name": rname,
+                "sector": rsec,
+                "Close": float(last["Close"]),
+                "ATR": float(last["ATR"]),
+                "RSI": float(last["RSI"]),
+                "RET_3M": float(last["RET_3M"]),
+                "pre_score": float(cand0[cand0["Symbol"] == sym].iloc[0]["pre_score"]),
+                "wf_best": {"atr_mult_stop": p_best.atr_mult_stop, "tp2_r": p_best.tp2_r, "time_stop_days": p_best.time_stop_days},
                 **wf_sum,
-                "mc_dd_p05":float(mc_dd),
-                "exp_full":float(exp_full),"wr_full":float(wr_full),"rr_full":float(rr_full),"n_full":int(n_full),
+                "mc_dd_p05": float(mc_dd),
+                "exp_full": float(exp_full),
+                "wr_full": float(wr_full),
+                "rr_full": float(rr_full),
+                "n_full": int(n_full),
             })
+
             if progress_cb and (idx % 4 == 0 or idx == 1):
-                progress_cb("heavy_progress", {"done":idx,"total":len(syms),"heavy_ok":len(heavy_rows),"heavy_fail":heavy_fail})
-        diag["stats"]["heavy_ok"]=int(len(heavy_rows))
-        diag["stats"]["heavy_fail"]=int(heavy_fail)
+                progress_cb("heavy_progress", {"done": idx, "total": len(syms), "heavy_ok": len(heavy_rows), "heavy_fail": heavy_fail})
+
+        diag["stats"]["heavy_ok"] = int(len(heavy_rows))
+        diag["stats"]["heavy_fail"] = int(heavy_fail)
+
         if not heavy_rows:
-            tick("error", {"reason":"heavy_failed"})
-            diag["errors"].append("WF/MCが全滅（Stooq断続ブロックの可能性）")
-            return {"ok":False,"error":"heavy_sims失敗","diag":diag,"sector_ranking":sec_rank,"candidates":pd.DataFrame()}
+            tick("error", {"reason": "heavy_failed"})
+            diag["errors"].append("heavy_failed: 最適化対象のデータ取得が不足（Stooq制限/ネット）")
+            return {"ok": False, "error": "heavy_sims失敗", "diag": diag, "sector_ranking": sec_rank, "candidates": pd.DataFrame()}
+
         tick("final_rank")
         heavy_df = pd.DataFrame(heavy_rows)
-        sample_pen = np.clip(heavy_df.get("wf_oos_trades",0).fillna(0).astype(float)/8.0, 0.2, 1.0)
+        sample_pen = np.clip(heavy_df.get("wf_oos_trades", 0).fillna(0).astype(float) / 8.0, 0.2, 1.0)
         heavy_df["final_score"] = (
-            heavy_df.get("wf_oos_mean_exp",0).fillna(0).astype(float)*120.0*sample_pen
-            + heavy_df["RET_3M"].fillna(0).astype(float)*35.0
-            + heavy_df["pre_score"].fillna(0).astype(float)*10.0
-            - np.abs(heavy_df["mc_dd_p05"].fillna(0).astype(float))*10.0
+            heavy_df.get("wf_oos_mean_exp", 0).fillna(0).astype(float) * 120.0 * sample_pen
+            + heavy_df["RET_3M"].fillna(0).astype(float) * 35.0
+            + heavy_df["pre_score"].fillna(0).astype(float) * 10.0
+            - np.abs(heavy_df["mc_dd_p05"].fillna(0).astype(float)) * 10.0
         )
+
         ranked = heavy_df.sort_values("final_score", ascending=False).reset_index(drop=True)
         symbols_ranked = ranked["Symbol"].astype(str).tolist()
-        final_syms = correlation_filter(price_dict, symbols_ranked, threshold=float(corr_threshold))[:int(top_n)]
-        final_df = ranked[ranked["Symbol"].astype(str).isin(final_syms)].copy().sort_values("final_score", ascending=False).reset_index(drop=True)
-        diag["stats"]["selected"]=final_syms
-        tick("done")
-        return {"ok":True,"diag":diag,"sector_ranking":sec_rank,"candidates":final_df}
-    except Exception as e:
-        tick("error", {"reason":"exception"})
-        diag["errors"].append(f"exception: {type(e).__name__}: {e}")
-        return {"ok":False,"error":f"例外: {type(e).__name__}","diag":diag,"sector_ranking":pd.DataFrame(),"candidates":pd.DataFrame()}
+        symbols_div = correlation_filter(price_dict, symbols_ranked, threshold=float(corr_threshold))
+        final_syms = symbols_div[: int(top_n)]
+        final_df = ranked[ranked["Symbol"].astype(str).isin(final_syms)].copy()
+        final_df = final_df.sort_values("final_score", ascending=False).reset_index(drop=True)
 
-def build_orders(candidates: pd.DataFrame, *, capital_yen:int, risk_pct_per_trade:float, current_dd:float, vol_ratio:float) -> Dict[str, object]:
+        diag["stats"]["selected"] = final_syms
+        tick("done")
+        return {"ok": True, "diag": diag, "sector_ranking": sec_rank, "candidates": final_df}
+
+    except Exception as e:
+        tick("error", {"reason": "exception"})
+        diag["errors"].append(f"exception: {type(e).__name__}: {e}")
+        return {"ok": False, "error": f"例外: {type(e).__name__}", "diag": diag, "sector_ranking": pd.DataFrame(), "candidates": pd.DataFrame()}
+
+def build_orders(
+    candidates: pd.DataFrame,
+    *,
+    capital_yen: int,
+    risk_pct_per_trade: float,
+    current_dd: float,
+    vol_ratio: float,
+) -> Dict[str, object]:
     if candidates is None or candidates.empty:
         return {"orders": pd.DataFrame(), "portfolio": {}, "ror": 1.0}
+
     df = candidates.copy()
     w = df.get("n_full", 0).fillna(0).astype(float).values
     w = np.maximum(1.0, w)
-    wr = float(np.average(df.get("wr_full",0.0).fillna(0.0).astype(float).values, weights=w))
-    rr = float(np.average(df.get("rr_full",1.0).fillna(1.0).astype(float).values, weights=w))
+    wr = float(np.average(df.get("wr_full", 0.0).fillna(0.0).astype(float).values, weights=w))
+    rr = float(np.average(df.get("rr_full", 1.0).fillna(1.0).astype(float).values, weights=w))
     rr = max(0.5, rr)
+
     units = float(1.0 / max(1e-6, risk_pct_per_trade))
     ror = portfolio_ror(wr, rr, units)
+
     ror_factor = 1.0 if ror <= 0.02 else (0.8 if ror <= 0.05 else (0.6 if ror <= 0.10 else 0.3))
     ddf = dd_factor(current_dd)
     mvf = market_vol_factor(vol_ratio)
     base_risk_budget = float(capital_yen) * float(risk_pct_per_trade) * float(ddf) * float(mvf) * float(ror_factor)
-    orders=[]
+
+    orders = []
     for _, row in df.iterrows():
-        price = float(row["Close"]); atr = float(row["ATR"])
+        price = float(row["Close"])
+        atr = float(row["ATR"])
         p = row.get("wf_best", {}) or {}
-        atr_mult = float(p.get("atr_mult_stop", 2.0)); tp2_r = float(p.get("tp2_r", 3.0))
+        atr_mult = float(p.get("atr_mult_stop", 2.0))
+        tp2_r = float(p.get("tp2_r", 3.0))
+
         stop = price - atr * atr_mult
         r_unit = price - stop
+
         if r_unit <= 0:
             shares = 0
         else:
@@ -512,16 +638,30 @@ def build_orders(candidates: pd.DataFrame, *, capital_yen:int, risk_pct_per_trad
             shares = int(math.floor(risk_budget / r_unit))
             shares = int((shares // 100) * 100)
             shares = max(0, shares)
+
         orders.append({
-            "Symbol": str(row["Symbol"]), "name": str(row.get("name","")), "sector": str(row.get("sector","")),
-            "entry": price, "stop": stop,
-            "tp1": price + r_unit * 1.0, "tp2": price + r_unit * tp2_r,
-            "shares": shares, "atr_mult": atr_mult, "tp2_r": tp2_r,
+            "Symbol": str(row["Symbol"]),
+            "name": str(row.get("name", "")),
+            "sector": str(row.get("sector", "")),
+            "entry": price,
+            "stop": stop,
+            "tp1": price + r_unit * 1.0,
+            "tp2": price + r_unit * tp2_r,
+            "shares": shares,
+            "atr_mult": atr_mult,
+            "tp2_r": tp2_r,
             "note": "" if shares > 0 else "shares=0（単元/リスク不足）",
         })
+
     portfolio = {
-        "win_rate_est": wr, "rr_est": rr, "capital_units": units, "ror": ror,
-        "dd_factor": ddf, "market_vol_ratio": float(vol_ratio), "market_vol_factor": mvf,
-        "ror_factor": ror_factor, "risk_budget_total_yen": base_risk_budget,
+        "win_rate_est": wr,
+        "rr_est": rr,
+        "capital_units": units,
+        "ror": ror,
+        "dd_factor": ddf,
+        "market_vol_ratio": float(vol_ratio),
+        "market_vol_factor": mvf,
+        "ror_factor": ror_factor,
+        "risk_budget_total_yen": base_risk_budget,
     }
     return {"orders": pd.DataFrame(orders), "portfolio": portfolio, "ror": ror}
