@@ -1,53 +1,36 @@
-
 # -*- coding: utf-8 -*-
-"""
-SBI 半自動プロ仕様 — 機関レベルコア（Resilient + Diagnostics）
-
-主目的:
-- Streamlit Cloud等でも「データ取得失敗で止まらない」
-- 失敗要因を診断JSONで可視化してダウンロード可能
-- B運用: 上位候補だけに Walk-Forward / MonteCarlo を適用
-- ポートフォリオ単位 Risk of Ruin（RoR）
-- 市場ボラ連動ロット、DD制御、相関除外、セクター分散
-
-データ:
-- JPXマスター: JPX公式Excel
-- 株価: Stooq 日足CSV（stooq.pl / stooq.com）
-"""
-
 from __future__ import annotations
+
+"""
+SBI 半自動プロ仕様（機関レベル）ULTIMATE8
+- 進捗(progress)を main.py に逐次返す
+- 診断JSONを session_state で保持しDL可能
+- fetch は as_completed で進捗可視化
+- タイムバジェット超過時は部分結果で終了（止まらない）
+"""
 
 import math
 import time
-import json
-import traceback
 from dataclasses import dataclass
 from io import BytesIO, StringIO
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import requests
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-
-# -----------------------------
-# Settings
-# -----------------------------
 _STOOQ_DOMAINS = ["stooq.pl", "stooq.com"]
-_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ai-stock-analyzer/2.0)"}
+_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ai-stock-analyzer/3.0)"}
 
 
-# -----------------------------
-# JPX master
-# -----------------------------
 def get_jpx_master() -> pd.DataFrame:
     url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
     try:
         df = pd.read_excel(url)
     except Exception:
         try:
-            r = requests.get(url, headers=_HEADERS, timeout=30)
+            r = requests.get(url, headers=_HEADERS, timeout=20)
             r.raise_for_status()
             df = pd.read_excel(BytesIO(r.content), engine="xlrd")
         except Exception:
@@ -65,9 +48,6 @@ def get_jpx_master() -> pd.DataFrame:
     return df[["ticker", "name", "sector"]].drop_duplicates().reset_index(drop=True)
 
 
-# -----------------------------
-# Stooq fetch (single)
-# -----------------------------
 def _stooq_symbol(ticker: str) -> str:
     t = str(ticker).strip()
     if t.endswith(".T"):
@@ -79,68 +59,62 @@ def _stooq_symbol(ticker: str) -> str:
     return t
 
 
-def _http_get_csv(url: str, timeout: int = 20, retries: int = 3) -> Tuple[Optional[str], Optional[dict]]:
-    backoff = 1.0
-    last_meta = None
+def _http_get_csv(url: str, timeout: int = 12, retries: int = 2) -> Tuple[Optional[str], dict]:
+    backoff = 0.8
+    meta: dict = {"url": url}
     for _ in range(retries):
         try:
             r = requests.get(url, headers=_HEADERS, timeout=timeout)
-            last_meta = {"status_code": r.status_code, "len": len(r.text or ""), "url": url}
+            meta.update({"status_code": r.status_code, "len": len(r.text or "")})
             if r.status_code in (429, 500, 502, 503, 504):
                 time.sleep(backoff)
-                backoff = min(8.0, backoff * 2)
+                backoff = min(3.0, backoff * 1.7)
                 continue
             if r.status_code != 200:
-                return None, last_meta
+                return None, meta
             text = r.text or ""
-            # validate it's a CSV with OHLC header
             if "Date,Open,High,Low,Close" not in text[:300]:
-                return None, {**(last_meta or {}), "note": "non_csv_or_blocked", "head": text[:120]}
-            return text, last_meta
+                meta.update({"note": "non_csv_or_blocked", "head": text[:120]})
+                return None, meta
+            return text, meta
         except Exception as e:
-            last_meta = {**(last_meta or {}), "exc": f"{type(e).__name__}: {e}"}
+            meta.update({"exc": f"{type(e).__name__}: {e}"})
             time.sleep(backoff)
-            backoff = min(8.0, backoff * 2)
-    return None, last_meta
+            backoff = min(3.0, backoff * 1.7)
+    return None, meta
 
 
-def fetch_daily_stooq(ticker: str, *, min_rows: int = 260) -> Tuple[Optional[pd.DataFrame], Optional[dict]]:
+def fetch_daily_stooq(ticker: str, *, min_rows: int = 260) -> Tuple[Optional[pd.DataFrame], dict]:
     sym = _stooq_symbol(ticker)
-    last_meta = None
+    last_meta: dict = {"ticker": ticker, "sym": sym}
     for dom in _STOOQ_DOMAINS:
         url = f"https://{dom}/q/d/l/?s={sym}&i=d"
         text, meta = _http_get_csv(url)
-        last_meta = meta
+        last_meta.update(meta or {})
         if not text:
             continue
         try:
             df = pd.read_csv(StringIO(text))
             if df is None or df.empty:
+                last_meta["note"] = "empty_csv"
                 continue
             df.columns = [c.strip().capitalize() for c in df.columns]
-            if "Date" not in df.columns:
-                continue
             df["Date"] = pd.to_datetime(df["Date"])
             df = df.sort_values("Date")
-            # ensure required cols exist
-            for c in ["Open", "High", "Low", "Close"]:
-                if c not in df.columns:
-                    return None, {**(last_meta or {}), "note": f"missing_col_{c}"}
             if "Volume" not in df.columns:
                 df["Volume"] = np.nan
             df = df.dropna(subset=["Open", "High", "Low", "Close"])
             if len(df) < int(min_rows):
-                return None, {**(last_meta or {}), "note": "too_short", "rows": int(len(df))}
+                last_meta.update({"note": "too_short", "rows": int(len(df))})
+                return None, last_meta
             df = df.set_index("Date")
             return df[["Open", "High", "Low", "Close", "Volume"]].copy(), last_meta
         except Exception as e:
-            return None, {**(last_meta or {}), "note": "csv_parse_error", "exc": f"{type(e).__name__}: {e}"}
+            last_meta.update({"note": "csv_parse_error", "exc": f"{type(e).__name__}: {e}"})
+            return None, last_meta
     return None, last_meta
 
 
-# -----------------------------
-# Indicators
-# -----------------------------
 def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
     delta = close.diff()
     up = delta.clip(lower=0)
@@ -166,16 +140,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["ATR_PCT"] = (out["ATR"] / (out["Close"] + 1e-12)) * 100.0
     out["RET_3M"] = out["Close"].pct_change(60)
     out["VOL_AVG20"] = out["Volume"].rolling(20).mean()
-    out["TURNOVER"] = out["Close"] * out["Volume"]
-    out["TURNOVER_AVG20"] = out["TURNOVER"].rolling(20).mean()
     return out.dropna()
 
 
-# -----------------------------
-# Sector strength
-# -----------------------------
 def calc_sector_strength(latest_df: pd.DataFrame) -> pd.DataFrame:
-    # latest_df must include: sector, RET_3M, RSI, ATR_PCT, VOL_AVG20
     g = latest_df.groupby("sector", dropna=False).agg(
         ret_3m=("RET_3M", "mean"),
         rsi=("RSI", "mean"),
@@ -183,7 +151,6 @@ def calc_sector_strength(latest_df: pd.DataFrame) -> pd.DataFrame:
         vol=("VOL_AVG20", "mean"),
         n=("Symbol", "count"),
     ).reset_index()
-    # score: return and trendiness, penalize excessive vol (atr_pct too high)
     g["score"] = (
         (g["ret_3m"].fillna(0) * 100.0) * 0.55
         + (g["rsi"].fillna(50) / 100.0) * 0.20
@@ -193,11 +160,7 @@ def calc_sector_strength(latest_df: pd.DataFrame) -> pd.DataFrame:
     return g.sort_values("score", ascending=False)
 
 
-# -----------------------------
-# Pre-score (cheap ranking before heavy sims)
-# -----------------------------
 def pre_score(latest: pd.Series) -> float:
-    # trend: SMA25>SMA75
     trend = 1.0 if float(latest.get("SMA25", 0)) > float(latest.get("SMA75", 0)) else 0.0
     r3m = float(latest.get("RET_3M", 0.0) or 0.0)
     rsi = float(latest.get("RSI", 50.0) or 50.0)
@@ -212,9 +175,6 @@ def pre_score(latest: pd.Series) -> float:
     )
 
 
-# -----------------------------
-# Walk-forward optimization (lightweight)
-# -----------------------------
 @dataclass(frozen=True)
 class WFParams:
     atr_mult_stop: float
@@ -223,23 +183,11 @@ class WFParams:
 
 
 def _backtest_r(df_ind: pd.DataFrame, p: WFParams) -> Tuple[float, float, float, int]:
-    """
-    Very compact swing backtest to produce:
-    - expectancy (mean R)
-    - win_rate
-    - rr (avg_win / abs(avg_loss)) approximate
-    - n_trades
-    Rules:
-    - enter on close when SMA25>SMA75 and RSI in [40,75] and pullback-ish (close below SMA25 slightly) then close breaks prev high
-    - stop = entry - ATR*atr_mult
-    - tp2 = entry + R*tp2_r, partial at +1R (optional), time stop
-    """
     if df_ind is None or df_ind.empty or len(df_ind) < 120:
         return 0.0, 0.0, 1.0, 0
 
     df = df_ind.copy()
     trades_r: List[float] = []
-
     in_pos = False
     entry = stop = tp2 = 0.0
     entry_i = -1
@@ -255,10 +203,8 @@ def _backtest_r(df_ind: pd.DataFrame, p: WFParams) -> Tuple[float, float, float,
             rsi = float(row["RSI"])
             if not (40.0 <= rsi <= 75.0):
                 continue
-            # mild pullback condition: close <= SMA25 * 1.01
             if float(row["Close"]) > float(row["SMA25"]) * 1.01:
                 continue
-            # trigger: close breaks prev high
             if float(row["Close"]) <= float(prev["High"]):
                 continue
 
@@ -280,9 +226,7 @@ def _backtest_r(df_ind: pd.DataFrame, p: WFParams) -> Tuple[float, float, float,
         held = i - entry_i
 
         if low <= stop:
-            # if tp1 already hit we assume breakeven on rest
-            r = -1.0 if not tp1_hit else 0.0
-            trades_r.append(r)
+            trades_r.append(-1.0 if not tp1_hit else 0.0)
             in_pos = False
             continue
 
@@ -294,7 +238,7 @@ def _backtest_r(df_ind: pd.DataFrame, p: WFParams) -> Tuple[float, float, float,
 
         if (not tp1_hit) and high >= entry + r_unit * 1.0:
             tp1_hit = True
-            stop = entry  # move to breakeven
+            stop = entry
             continue
 
         if held >= int(p.time_stop_days):
@@ -318,58 +262,32 @@ def _backtest_r(df_ind: pd.DataFrame, p: WFParams) -> Tuple[float, float, float,
 
 
 def walk_forward_optimize(df_ind: pd.DataFrame) -> Tuple[WFParams, dict]:
-    """
-    Walk-forward optimize on small grid and return best param and out-of-sample score summary.
-    B運用: 上位候補だけに適用する前提。
-    """
-    # small grid (fast)
-    grid = [
-        WFParams(atr_mult_stop=a, tp2_r=t, time_stop_days=d)
-        for a in (1.6, 2.0, 2.4)
-        for t in (2.0, 3.0, 4.0)
-        for d in (7, 10, 14)
-    ]
-
-    # rolling scheme: train 2y (~500d), test 6m (~120d)
-    train = 500
-    test = 120
-    step = 120
+    grid = [WFParams(a, t, d) for a in (1.6, 2.0, 2.4) for t in (2.0, 3.0, 4.0) for d in (7, 10, 14)]
+    train, test, step = 500, 120, 120
 
     if df_ind is None or df_ind.empty or len(df_ind) < (train + test + 20):
-        # fallback: choose a sane default
         p = WFParams(2.0, 3.0, 10)
         exp, wr, rr, n = _backtest_r(df_ind, p)
         return p, {"wf_oos_mean_exp": exp, "wf_oos_wr": wr, "wf_oos_rr": rr, "wf_oos_trades": n, "note": "short_history_fallback"}
 
-    oos_scores = {p: [] for p in grid}
-
+    oos = {p: [] for p in grid}
     for start in range(0, len(df_ind) - (train + test), step):
         train_df = df_ind.iloc[start : start + train]
         test_df = df_ind.iloc[start + train : start + train + test]
-
-        # choose best on train by expectancy
-        best_p = None
-        best_train = -1e9
+        best_p, best_train = None, -1e9
         for p in grid:
             exp, _, _, n = _backtest_r(train_df, p)
-            # penalize tiny samples
             score = exp * min(1.0, n / 10.0)
             if score > best_train:
-                best_train = score
-                best_p = p
-
+                best_train, best_p = score, p
         if best_p is None:
             continue
-
         exp_oos, wr_oos, rr_oos, n_oos = _backtest_r(test_df, best_p)
-        oos_scores[best_p].append((exp_oos, wr_oos, rr_oos, n_oos))
+        oos[best_p].append((exp_oos, wr_oos, rr_oos, n_oos))
 
-    # aggregate by mean oos expectancy with sample penalty
     best_p = WFParams(2.0, 3.0, 10)
-    best_score = -1e9
-    best_summary = {}
-
-    for p, vals in oos_scores.items():
+    best_score, best_sum = -1e9, {}
+    for p, vals in oos.items():
         if not vals:
             continue
         exps = np.array([v[0] for v in vals], float)
@@ -380,28 +298,18 @@ def walk_forward_optimize(df_ind: pd.DataFrame) -> Tuple[WFParams, dict]:
         mean_wr = float(wrs.mean())
         mean_rr = float(rrs.mean())
         mean_n = float(ns.mean())
-        # penalty if low avg trades
         score = mean_exp * min(1.0, mean_n / 8.0)
         if score > best_score:
             best_score = score
             best_p = p
-            best_summary = {
-                "wf_oos_mean_exp": mean_exp,
-                "wf_oos_wr": mean_wr,
-                "wf_oos_rr": mean_rr,
-                "wf_oos_trades": mean_n,
-            }
-
-    return best_p, best_summary
+            best_sum = {"wf_oos_mean_exp": mean_exp, "wf_oos_wr": mean_wr, "wf_oos_rr": mean_rr, "wf_oos_trades": mean_n}
+    return best_p, best_sum
 
 
-# -----------------------------
-# Monte Carlo max DD (trade-return resampling)
-# -----------------------------
-def monte_carlo_maxdd_from_daily_returns(daily_returns: np.ndarray, n_sim: int = 1500) -> float:
+def monte_carlo_maxdd_from_daily_returns(daily_returns: np.ndarray, n_sim: int = 600) -> float:
     r = np.array(daily_returns, dtype=float)
     r = r[np.isfinite(r)]
-    if r.size < 60:
+    if r.size < 80:
         return 0.0
     max_dds = []
     for _ in range(int(n_sim)):
@@ -410,18 +318,10 @@ def monte_carlo_maxdd_from_daily_returns(daily_returns: np.ndarray, n_sim: int =
         peak = np.maximum.accumulate(equity)
         dd = equity - peak
         max_dds.append(float(dd.min()))
-    # 95% worst-case (more conservative)
     return float(np.percentile(max_dds, 5))
 
 
-# -----------------------------
-# Risk of Ruin (portfolio level)
-# -----------------------------
 def portfolio_ror(win_rate: float, rr: float, capital_units: float) -> float:
-    """
-    Edge = p - (1-p)/rr
-    RoR = ((1-Edge)/(1+Edge))^(units)
-    """
     p = float(win_rate)
     rr = max(1e-6, float(rr))
     edge = p - (1.0 - p) / rr
@@ -432,32 +332,6 @@ def portfolio_ror(win_rate: float, rr: float, capital_units: float) -> float:
     return float(base ** float(capital_units))
 
 
-# -----------------------------
-# Correlation filter
-# -----------------------------
-def correlation_filter(price_dict: Dict[str, pd.Series], symbols: List[str], threshold: float = 0.7) -> List[str]:
-    final: List[str] = []
-    for sym in symbols:
-        if sym not in price_dict:
-            continue
-        keep = True
-        for f in final:
-            if f not in price_dict:
-                continue
-            a = price_dict[sym].pct_change()
-            b = price_dict[f].pct_change()
-            c = a.corr(b)
-            if np.isfinite(c) and abs(float(c)) >= float(threshold):
-                keep = False
-                break
-        if keep:
-            final.append(sym)
-    return final
-
-
-# -----------------------------
-# DD control + Market vol control
-# -----------------------------
 def dd_factor(current_dd: float) -> float:
     dd = float(current_dd)
     if dd < 0.05:
@@ -480,61 +354,84 @@ def market_vol_factor(vol_ratio: float) -> float:
     return 1.0
 
 
-def compute_market_vol_ratio() -> Tuple[float, dict]:
-    """
-    Market vol proxy using 1306.T (TOPIX ETF) daily ATR%.
-    Returns vol_ratio = current_atr_pct / median_atr_pct(1y).
-    """
+def compute_market_vol_ratio(progress_cb: Optional[Callable[[str, dict], None]] = None) -> Tuple[float, dict]:
     meta = {"proxy": "1306.T", "ok": False}
+    if progress_cb:
+        progress_cb("market_vol_fetch", {"proxy": meta["proxy"]})
     df, m = fetch_daily_stooq("1306.T", min_rows=260)
     meta["fetch_meta"] = m
     if df is None or df.empty:
         return 1.0, meta
-
     ind = add_indicators(df)
     if ind.empty:
-        return 1.0, {**meta, "note": "ind_empty"}
-
+        meta["note"] = "ind_empty"
+        return 1.0, meta
     atrp = ind["ATR_PCT"]
     cur = float(atrp.iloc[-1])
     med = float(atrp.tail(260).median())
     if not (np.isfinite(cur) and np.isfinite(med) and med > 0):
-        return 1.0, {**meta, "note": "atr_nan"}
-
+        meta["note"] = "atr_nan"
+        return 1.0, meta
     meta.update({"ok": True, "current_atr_pct": cur, "median_atr_pct_1y": med})
     return float(cur / med), meta
 
 
-# -----------------------------
-# Main scan engine (B-mode heavy sims on top candidates only)
-# -----------------------------
+def correlation_filter(price_dict: Dict[str, pd.Series], symbols: List[str], threshold: float = 0.7) -> List[str]:
+    final: List[str] = []
+    for sym in symbols:
+        if sym not in price_dict:
+            continue
+        keep = True
+        for f in final:
+            if f not in price_dict:
+                continue
+            c = price_dict[sym].pct_change().corr(price_dict[f].pct_change())
+            if np.isfinite(c) and abs(float(c)) >= float(threshold):
+                keep = False
+                break
+        if keep:
+            final.append(sym)
+    return final
+
+
 def scan_engine(
     *,
-    universe_limit: int = 1200,
+    universe_limit: int = 800,
     sector_top_n: int = 6,
-    pre_top_m: int = 60,
+    pre_top_m: int = 45,
     top_n: int = 6,
     corr_threshold: float = 0.7,
+    max_workers: int = 10,
+    time_budget_sec: int = 52,
+    progress_cb: Optional[Callable[[str, dict], None]] = None,
 ) -> Dict[str, object]:
+    t0 = time.time()
     diag: dict = {
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
         "stage": "init",
         "stats": {},
         "errors": [],
         "sample_failures": [],
+        "timings_sec": {},
     }
+
+    def tick(stage: str, extra: Optional[dict] = None):
+        diag["stage"] = stage
+        diag["timings_sec"][stage] = float(time.time() - t0)
+        if progress_cb:
+            progress_cb(stage, extra or {})
 
     master = get_jpx_master()
     if master.empty:
-        diag["stage"] = "error"
-        diag["errors"].append("JPXマスター取得失敗（JPX公式Excel）")
-        return {"ok": False, "error": "JPXマスター取得失敗", "diag": diag, "sector_ranking": pd.DataFrame(), "candidates": pd.DataFrame(), "orders": pd.DataFrame()}
+        tick("error", {"reason": "jpx_master_empty"})
+        diag["errors"].append("JPXマスター取得失敗")
+        return {"ok": False, "error": "JPXマスター取得失敗", "diag": diag, "sector_ranking": pd.DataFrame(), "candidates": pd.DataFrame()}
 
-    # Limit universe for cloud stability (still large enough)
+    tick("universe")
     tickers = master["ticker"].astype(str).tolist()[: int(universe_limit)]
     diag["stats"]["universe"] = int(len(tickers))
 
-    # fetch concurrently
+    tick("fetch")
     rows_latest: List[dict] = []
     price_dict: Dict[str, pd.Series] = {}
     fail_count = 0
@@ -543,58 +440,70 @@ def scan_engine(
         df, meta = fetch_daily_stooq(t, min_rows=260)
         return t, df, meta
 
-    diag["stage"] = "fetch"
-    with ThreadPoolExecutor(max_workers=12) as ex:
-        results = list(ex.map(_one, tickers))
+    futures = []
+    with ThreadPoolExecutor(max_workers=int(max_workers)) as ex:
+        for t in tickers:
+            futures.append(ex.submit(_one, t))
 
-    for t, df, meta in results:
-        if df is None or df.empty:
-            fail_count += 1
-            if len(diag["sample_failures"]) < 25:
-                diag["sample_failures"].append({"ticker": t, "meta": meta})
-            continue
-        ind = add_indicators(df)
-        if ind.empty:
-            fail_count += 1
-            if len(diag["sample_failures"]) < 25:
-                diag["sample_failures"].append({"ticker": t, "meta": {**(meta or {}), "note": "ind_empty"}})
-            continue
+        done = 0
+        for fut in as_completed(futures):
+            done += 1
+            if (time.time() - t0) > float(time_budget_sec):
+                diag["errors"].append("time_budget_exceeded_fetch_partial")
+                break
 
-        latest = ind.iloc[-1].to_dict()
-        latest["Symbol"] = t
-        latest["pre_score"] = pre_score(ind.iloc[-1])
-        rows_latest.append(latest)
-        # keep prices for correlation
-        price_dict[t] = ind["Close"].tail(260)
+            t, df, meta = fut.result()
+            if df is None or df.empty:
+                fail_count += 1
+                if len(diag["sample_failures"]) < 25:
+                    diag["sample_failures"].append({"ticker": t, "meta": meta})
+            else:
+                ind = add_indicators(df)
+                if ind.empty:
+                    fail_count += 1
+                    if len(diag["sample_failures"]) < 25:
+                        diag["sample_failures"].append({"ticker": t, "meta": {**(meta or {}), "note": "ind_empty"}})
+                else:
+                    latest = ind.iloc[-1].to_dict()
+                    latest["Symbol"] = t
+                    latest["pre_score"] = pre_score(ind.iloc[-1])
+                    rows_latest.append(latest)
+                    price_dict[t] = ind["Close"].tail(260)
+
+            if progress_cb and (done % 15 == 0 or done == 1):
+                progress_cb("fetch_progress", {"done": done, "total": len(tickers), "ok": len(rows_latest), "fail": fail_count})
 
     diag["stats"]["fetched_ok"] = int(len(rows_latest))
     diag["stats"]["fetch_failed"] = int(fail_count)
 
     if not rows_latest:
-        diag["stage"] = "error"
-        diag["errors"].append("Stooq取得が全滅（CloudのIPブロック/レート制限/ネットワーク）")
-        return {"ok": False, "error": "Stooq取得が全滅", "diag": diag, "sector_ranking": pd.DataFrame(), "candidates": pd.DataFrame(), "orders": pd.DataFrame()}
+        tick("error", {"reason": "all_fetch_failed"})
+        diag["errors"].append("Stooq取得が全滅")
+        return {"ok": False, "error": "Stooq取得が全滅", "diag": diag, "sector_ranking": pd.DataFrame(), "candidates": pd.DataFrame()}
 
-    latest_df = pd.DataFrame(rows_latest)
-    latest_df = latest_df.merge(master, left_on="Symbol", right_on="ticker", how="left")
+    tick("merge")
+    latest_df = pd.DataFrame(rows_latest).merge(master, left_on="Symbol", right_on="ticker", how="left")
 
-    # sector strength
-    diag["stage"] = "sector_strength"
+    tick("sector_strength")
     sec_rank = calc_sector_strength(latest_df[["Symbol", "sector", "RET_3M", "RSI", "ATR_PCT", "VOL_AVG20"]].copy())
     top_sectors = sec_rank.head(int(sector_top_n))["sector"].astype(str).tolist()
     diag["stats"]["top_sectors"] = top_sectors
 
-    # filter to top sectors and pre-score top M
+    tick("preselect")
     cand0 = latest_df[latest_df["sector"].astype(str).isin(top_sectors)].copy()
     cand0 = cand0.sort_values("pre_score", ascending=False).head(int(pre_top_m)).copy()
     diag["stats"]["pre_top_m_actual"] = int(len(cand0))
 
-    # Heavy sims only on these symbols
-    diag["stage"] = "heavy_sims"
+    tick("heavy_sims")
     heavy_rows = []
     heavy_fail = 0
-    for sym in cand0["Symbol"].astype(str).tolist():
-        # reconstruct df to run WF/MC: refetch only for top list to save memory
+    syms = cand0["Symbol"].astype(str).tolist()
+
+    for idx, sym in enumerate(syms, start=1):
+        if (time.time() - t0) > float(time_budget_sec):
+            diag["errors"].append("time_budget_exceeded_heavy_partial")
+            break
+
         df, meta = fetch_daily_stooq(sym, min_rows=260)
         if df is None or df.empty:
             heavy_fail += 1
@@ -604,55 +513,51 @@ def scan_engine(
             heavy_fail += 1
             continue
 
-        # walk-forward optimize
         p_best, wf_sum = walk_forward_optimize(ind)
-
-        # MonteCarlo DD from daily returns (Close pct change)
         daily_ret = ind["Close"].pct_change().dropna().values
-        mc_dd = monte_carlo_maxdd_from_daily_returns(daily_ret, n_sim=1200)
-
-        # Backtest on full (for portfolio RoR estimation)
+        mc_dd = monte_carlo_maxdd_from_daily_returns(daily_ret, n_sim=350)
         exp_full, wr_full, rr_full, n_full = _backtest_r(ind, p_best)
 
         last = ind.iloc[-1]
         heavy_rows.append({
             "Symbol": sym,
+            "name": str(cand0[cand0["Symbol"] == sym].iloc[0]["name"]),
+            "sector": str(cand0[cand0["Symbol"] == sym].iloc[0]["sector"]),
             "Close": float(last["Close"]),
             "ATR": float(last["ATR"]),
             "RSI": float(last["RSI"]),
             "RET_3M": float(last["RET_3M"]),
-            "sector": str(cand0[cand0["Symbol"] == sym].iloc[0]["sector"]),
-            "name": str(cand0[cand0["Symbol"] == sym].iloc[0]["name"]),
             "pre_score": float(cand0[cand0["Symbol"] == sym].iloc[0]["pre_score"]),
             "wf_best": {"atr_mult_stop": p_best.atr_mult_stop, "tp2_r": p_best.tp2_r, "time_stop_days": p_best.time_stop_days},
             **wf_sum,
-            "mc_dd_p05": float(mc_dd),  # negative number (worse)
+            "mc_dd_p05": float(mc_dd),
             "exp_full": float(exp_full),
             "wr_full": float(wr_full),
             "rr_full": float(rr_full),
             "n_full": int(n_full),
         })
 
+        if progress_cb and (idx % 3 == 0 or idx == 1):
+            progress_cb("heavy_progress", {"done": idx, "total": len(syms), "heavy_ok": len(heavy_rows), "heavy_fail": heavy_fail})
+
     diag["stats"]["heavy_ok"] = int(len(heavy_rows))
     diag["stats"]["heavy_fail"] = int(heavy_fail)
 
     if not heavy_rows:
-        diag["stage"] = "error"
-        diag["errors"].append("上位候補の重い計算（WF/MC）が全滅。Stooqの断続ブロックの可能性。")
-        return {"ok": False, "error": "heavy_sims失敗", "diag": diag, "sector_ranking": sec_rank, "candidates": pd.DataFrame(), "orders": pd.DataFrame()}
+        tick("error", {"reason": "heavy_failed"})
+        diag["errors"].append("WF/MCが全滅")
+        return {"ok": False, "error": "heavy_sims失敗", "diag": diag, "sector_ranking": sec_rank, "candidates": pd.DataFrame()}
 
+    tick("final_rank")
     heavy_df = pd.DataFrame(heavy_rows)
-
-    # Final score: favor oos expectancy + 3m return, penalize MonteCarlo DD and tiny samples
-    sample_pen = np.clip(heavy_df["wf_oos_trades"].fillna(0).astype(float) / 8.0, 0.2, 1.0)
+    sample_pen = np.clip(heavy_df.get("wf_oos_trades", 0).fillna(0).astype(float) / 8.0, 0.2, 1.0)
     heavy_df["final_score"] = (
-        heavy_df["wf_oos_mean_exp"].fillna(0).astype(float) * 120.0 * sample_pen
+        heavy_df.get("wf_oos_mean_exp", 0).fillna(0).astype(float) * 120.0 * sample_pen
         + heavy_df["RET_3M"].fillna(0).astype(float) * 35.0
         + heavy_df["pre_score"].fillna(0).astype(float) * 10.0
         - np.abs(heavy_df["mc_dd_p05"].fillna(0).astype(float)) * 10.0
     )
 
-    # sort and correlation filter
     ranked = heavy_df.sort_values("final_score", ascending=False).reset_index(drop=True)
     symbols_ranked = ranked["Symbol"].astype(str).tolist()
     symbols_div = correlation_filter(price_dict, symbols_ranked, threshold=float(corr_threshold))
@@ -660,14 +565,11 @@ def scan_engine(
     final_df = ranked[ranked["Symbol"].astype(str).isin(final_syms)].copy()
     final_df = final_df.sort_values("final_score", ascending=False).reset_index(drop=True)
 
-    diag["stage"] = "done"
     diag["stats"]["selected"] = final_syms
+    tick("done")
     return {"ok": True, "diag": diag, "sector_ranking": sec_rank, "candidates": final_df}
 
 
-# -----------------------------
-# Portfolio RoR + Position sizing + Order sheet
-# -----------------------------
 def build_orders(
     candidates: pd.DataFrame,
     *,
@@ -676,35 +578,19 @@ def build_orders(
     current_dd: float,
     vol_ratio: float,
 ) -> Dict[str, object]:
-    """
-    - portfolio RoR computed from candidates' (wr_full, rr_full) aggregated (weighted by n_full)
-    - size each position via:
-      base_risk = capital * risk_pct_per_trade
-      * dd_factor
-      * market_vol_factor
-      * ror_factor
-      then risk per share = ATR*atr_mult_stop
-    """
     if candidates is None or candidates.empty:
         return {"orders": pd.DataFrame(), "portfolio": {}, "ror": 1.0}
 
     df = candidates.copy()
-
-    # aggregate portfolio win rate / rr by trade counts
-    w = df["n_full"].fillna(0).astype(float).values
+    w = df.get("n_full", 0).fillna(0).astype(float).values
     w = np.maximum(1.0, w)
-    wr = float(np.average(df["wr_full"].fillna(0.0).astype(float).values, weights=w))
-    rr = float(np.average(df["rr_full"].fillna(1.0).astype(float).values, weights=w))
+    wr = float(np.average(df.get("wr_full", 0.0).fillna(0.0).astype(float).values, weights=w))
+    rr = float(np.average(df.get("rr_full", 1.0).fillna(1.0).astype(float).values, weights=w))
     rr = max(0.5, rr)
 
-    # capital units: how many "R-units" the account can withstand (rough proxy)
-    # Here: unit = risk_pct_per_trade of capital. If risk=1%, then 100 units.
     units = float(1.0 / max(1e-6, risk_pct_per_trade))
-
     ror = portfolio_ror(wr, rr, units)
 
-    # ror factor: if ror high, scale down
-    # ror<=2%:1.0, <=5%:0.8, <=10%:0.6 else 0.3
     if ror <= 0.02:
         ror_factor = 1.0
     elif ror <= 0.05:
@@ -716,7 +602,6 @@ def build_orders(
 
     ddf = dd_factor(current_dd)
     mvf = market_vol_factor(vol_ratio)
-
     base_risk_budget = float(capital_yen) * float(risk_pct_per_trade) * float(ddf) * float(mvf) * float(ror_factor)
 
     orders = []
@@ -729,16 +614,14 @@ def build_orders(
 
         stop = price - atr * atr_mult
         r_unit = price - stop
+
         if r_unit <= 0:
             shares = 0
         else:
-            risk_budget = base_risk_budget / max(1.0, len(df))  # risk parity-ish by equal risk allocation
+            risk_budget = base_risk_budget / max(1.0, len(df))
             shares = int(math.floor(risk_budget / r_unit))
-            shares = int((shares // 100) * 100)  # JP lot
+            shares = int((shares // 100) * 100)
             shares = max(0, shares)
-
-        tp1 = price + r_unit * 1.0
-        tp2 = price + r_unit * tp2_r
 
         orders.append({
             "Symbol": str(row["Symbol"]),
@@ -746,8 +629,8 @@ def build_orders(
             "sector": str(row.get("sector", "")),
             "entry": price,
             "stop": stop,
-            "tp1": tp1,
-            "tp2": tp2,
+            "tp1": price + r_unit * 1.0,
+            "tp2": price + r_unit * tp2_r,
             "shares": shares,
             "atr_mult": atr_mult,
             "tp2_r": tp2_r,
@@ -765,5 +648,4 @@ def build_orders(
         "ror_factor": ror_factor,
         "risk_budget_total_yen": base_risk_budget,
     }
-
     return {"orders": pd.DataFrame(orders), "portfolio": portfolio, "ror": ror}
