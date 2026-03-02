@@ -1,28 +1,24 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-
-"""
-SBI 半自動プロ仕様（機関レベル）ULTIMATE8
-- 進捗(progress)を main.py に逐次返す
-- 診断JSONを session_state で保持しDL可能
-- fetch は as_completed で進捗可視化
-- タイムバジェット超過時は部分結果で終了（止まらない）
-"""
-
-import math
-import time
+import math, time
 from dataclasses import dataclass
 from io import BytesIO, StringIO
 from typing import Callable, Dict, List, Optional, Tuple
-
 import numpy as np
 import pandas as pd
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-_STOOQ_DOMAINS = ["stooq.pl", "stooq.com"]
-_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ai-stock-analyzer/3.0)"}
+"""
+ULTIMATE9 (Streamlit Cloud安定版)
+ログの根因を潰す:
+- NameError: ThreadPoolExecutor 未定義 → import 済み
+- TypeError: compute_market_vol_ratio(progress_cb=...) 不一致 → progress_cb で統一
+- Cloud 60s health-check timeout 対策: time_budget_sec で部分終了し、diag を必ず返す
+"""
 
+_STOOQ_DOMAINS = ["stooq.pl", "stooq.com"]
+_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ai-stock-analyzer/ULT9)"}
 
 def get_jpx_master() -> pd.DataFrame:
     url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
@@ -35,18 +31,15 @@ def get_jpx_master() -> pd.DataFrame:
             df = pd.read_excel(BytesIO(r.content), engine="xlrd")
         except Exception:
             return pd.DataFrame()
-
     needed = {"コード", "銘柄名", "33業種区分"}
     if not needed.issubset(set(df.columns)):
         return pd.DataFrame()
-
     df = df.copy()
     df = df[df["33業種区分"].notna()]
     df = df[df["33業種区分"] != "-"]
     df["ticker"] = df["コード"].astype(str).str.zfill(4) + ".T"
     df = df.rename(columns={"銘柄名": "name", "33業種区分": "sector"})
     return df[["ticker", "name", "sector"]].drop_duplicates().reset_index(drop=True)
-
 
 def _stooq_symbol(ticker: str) -> str:
     t = str(ticker).strip()
@@ -58,14 +51,13 @@ def _stooq_symbol(ticker: str) -> str:
         return f"{t}.jp"
     return t
 
-
-def _http_get_csv(url: str, timeout: int = 12, retries: int = 2) -> Tuple[Optional[str], dict]:
+def _http_get_csv(url: str, timeout: int = 10, retries: int = 2) -> Tuple[Optional[str], dict]:
     backoff = 0.8
     meta: dict = {"url": url}
     for _ in range(retries):
         try:
             r = requests.get(url, headers=_HEADERS, timeout=timeout)
-            meta.update({"status_code": r.status_code, "len": len(r.text or "")})
+            meta.update({"status_code": int(r.status_code), "len": int(len(r.text or ""))})
             if r.status_code in (429, 500, 502, 503, 504):
                 time.sleep(backoff)
                 backoff = min(3.0, backoff * 1.7)
@@ -73,7 +65,7 @@ def _http_get_csv(url: str, timeout: int = 12, retries: int = 2) -> Tuple[Option
             if r.status_code != 200:
                 return None, meta
             text = r.text or ""
-            if "Date,Open,High,Low,Close" not in text[:300]:
+            if "Date,Open,High,Low,Close" not in text[:400]:
                 meta.update({"note": "non_csv_or_blocked", "head": text[:120]})
                 return None, meta
             return text, meta
@@ -82,7 +74,6 @@ def _http_get_csv(url: str, timeout: int = 12, retries: int = 2) -> Tuple[Option
             time.sleep(backoff)
             backoff = min(3.0, backoff * 1.7)
     return None, meta
-
 
 def fetch_daily_stooq(ticker: str, *, min_rows: int = 260) -> Tuple[Optional[pd.DataFrame], dict]:
     sym = _stooq_symbol(ticker)
@@ -99,8 +90,8 @@ def fetch_daily_stooq(ticker: str, *, min_rows: int = 260) -> Tuple[Optional[pd.
                 last_meta["note"] = "empty_csv"
                 continue
             df.columns = [c.strip().capitalize() for c in df.columns]
-            df["Date"] = pd.to_datetime(df["Date"])
-            df = df.sort_values("Date")
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df = df.dropna(subset=["Date"]).sort_values("Date")
             if "Volume" not in df.columns:
                 df["Volume"] = np.nan
             df = df.dropna(subset=["Open", "High", "Low", "Close"])
@@ -114,7 +105,6 @@ def fetch_daily_stooq(ticker: str, *, min_rows: int = 260) -> Tuple[Optional[pd.
             return None, last_meta
     return None, last_meta
 
-
 def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
     delta = close.diff()
     up = delta.clip(lower=0)
@@ -124,12 +114,10 @@ def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
     rs = ma_up / (ma_down + 1e-12)
     return 100 - (100 / (1 + rs))
 
-
 def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     high, low, close = df["High"], df["Low"], df["Close"]
     tr = pd.concat([(high - low).abs(), (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / n, adjust=False).mean()
-
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -141,7 +129,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["RET_3M"] = out["Close"].pct_change(60)
     out["VOL_AVG20"] = out["Volume"].rolling(20).mean()
     return out.dropna()
-
 
 def calc_sector_strength(latest_df: pd.DataFrame) -> pd.DataFrame:
     g = latest_df.groupby("sector", dropna=False).agg(
@@ -159,7 +146,6 @@ def calc_sector_strength(latest_df: pd.DataFrame) -> pd.DataFrame:
     )
     return g.sort_values("score", ascending=False)
 
-
 def pre_score(latest: pd.Series) -> float:
     trend = 1.0 if float(latest.get("SMA25", 0)) > float(latest.get("SMA75", 0)) else 0.0
     r3m = float(latest.get("RET_3M", 0.0) or 0.0)
@@ -174,29 +160,24 @@ def pre_score(latest: pd.Series) -> float:
         - 0.05 * (atrp / 30.0)
     )
 
-
 @dataclass(frozen=True)
 class WFParams:
     atr_mult_stop: float
     tp2_r: float
     time_stop_days: int
 
-
 def _backtest_r(df_ind: pd.DataFrame, p: WFParams) -> Tuple[float, float, float, int]:
     if df_ind is None or df_ind.empty or len(df_ind) < 120:
         return 0.0, 0.0, 1.0, 0
-
     df = df_ind.copy()
     trades_r: List[float] = []
     in_pos = False
     entry = stop = tp2 = 0.0
     entry_i = -1
     tp1_hit = False
-
     for i in range(1, len(df)):
         row = df.iloc[i]
         prev = df.iloc[i - 1]
-
         if not in_pos:
             if not (float(row["SMA25"]) > float(row["SMA75"])):
                 continue
@@ -207,7 +188,6 @@ def _backtest_r(df_ind: pd.DataFrame, p: WFParams) -> Tuple[float, float, float,
                 continue
             if float(row["Close"]) <= float(prev["High"]):
                 continue
-
             entry = float(row["Close"])
             atr = float(row["ATR"])
             stop = entry - atr * float(p.atr_mult_stop)
@@ -215,41 +195,33 @@ def _backtest_r(df_ind: pd.DataFrame, p: WFParams) -> Tuple[float, float, float,
                 continue
             r_unit = entry - stop
             tp2 = entry + r_unit * float(p.tp2_r)
-
             in_pos = True
             tp1_hit = False
             entry_i = i
             continue
-
         low, high, close = float(row["Low"]), float(row["High"]), float(row["Close"])
         r_unit = entry - stop
         held = i - entry_i
-
         if low <= stop:
             trades_r.append(-1.0 if not tp1_hit else 0.0)
             in_pos = False
             continue
-
         if high >= tp2:
             r = float(p.tp2_r) if not tp1_hit else (0.5 * 1.0 + 0.5 * float(p.tp2_r))
             trades_r.append(r)
             in_pos = False
             continue
-
         if (not tp1_hit) and high >= entry + r_unit * 1.0:
             tp1_hit = True
             stop = entry
             continue
-
         if held >= int(p.time_stop_days):
             r = (close - entry) / (r_unit + 1e-12)
             trades_r.append(float(r))
             in_pos = False
             continue
-
     if not trades_r:
         return 0.0, 0.0, 1.0, 0
-
     arr = np.array(trades_r, dtype=float)
     wins = arr[arr > 0]
     losses = arr[arr < 0]
@@ -260,16 +232,13 @@ def _backtest_r(df_ind: pd.DataFrame, p: WFParams) -> Tuple[float, float, float,
     rr = float(avg_win / (abs(avg_loss) + 1e-12)) if avg_loss < 0 else 2.0
     return exp, win_rate, rr, int(len(arr))
 
-
 def walk_forward_optimize(df_ind: pd.DataFrame) -> Tuple[WFParams, dict]:
     grid = [WFParams(a, t, d) for a in (1.6, 2.0, 2.4) for t in (2.0, 3.0, 4.0) for d in (7, 10, 14)]
     train, test, step = 500, 120, 120
-
     if df_ind is None or df_ind.empty or len(df_ind) < (train + test + 20):
         p = WFParams(2.0, 3.0, 10)
         exp, wr, rr, n = _backtest_r(df_ind, p)
         return p, {"wf_oos_mean_exp": exp, "wf_oos_wr": wr, "wf_oos_rr": rr, "wf_oos_trades": n, "note": "short_history_fallback"}
-
     oos = {p: [] for p in grid}
     for start in range(0, len(df_ind) - (train + test), step):
         train_df = df_ind.iloc[start : start + train]
@@ -284,7 +253,6 @@ def walk_forward_optimize(df_ind: pd.DataFrame) -> Tuple[WFParams, dict]:
             continue
         exp_oos, wr_oos, rr_oos, n_oos = _backtest_r(test_df, best_p)
         oos[best_p].append((exp_oos, wr_oos, rr_oos, n_oos))
-
     best_p = WFParams(2.0, 3.0, 10)
     best_score, best_sum = -1e9, {}
     for p, vals in oos.items():
@@ -305,8 +273,7 @@ def walk_forward_optimize(df_ind: pd.DataFrame) -> Tuple[WFParams, dict]:
             best_sum = {"wf_oos_mean_exp": mean_exp, "wf_oos_wr": mean_wr, "wf_oos_rr": mean_rr, "wf_oos_trades": mean_n}
     return best_p, best_sum
 
-
-def monte_carlo_maxdd_from_daily_returns(daily_returns: np.ndarray, n_sim: int = 600) -> float:
+def monte_carlo_maxdd_from_daily_returns(daily_returns: np.ndarray, n_sim: int = 250) -> float:
     r = np.array(daily_returns, dtype=float)
     r = r[np.isfinite(r)]
     if r.size < 80:
@@ -320,7 +287,6 @@ def monte_carlo_maxdd_from_daily_returns(daily_returns: np.ndarray, n_sim: int =
         max_dds.append(float(dd.min()))
     return float(np.percentile(max_dds, 5))
 
-
 def portfolio_ror(win_rate: float, rr: float, capital_units: float) -> float:
     p = float(win_rate)
     rr = max(1e-6, float(rr))
@@ -331,28 +297,19 @@ def portfolio_ror(win_rate: float, rr: float, capital_units: float) -> float:
     base = min(0.999999, max(1e-9, base))
     return float(base ** float(capital_units))
 
-
 def dd_factor(current_dd: float) -> float:
     dd = float(current_dd)
-    if dd < 0.05:
-        return 1.0
-    if dd < 0.10:
-        return 0.7
-    if dd < 0.15:
-        return 0.4
+    if dd < 0.05: return 1.0
+    if dd < 0.10: return 0.7
+    if dd < 0.15: return 0.4
     return 0.0
-
 
 def market_vol_factor(vol_ratio: float) -> float:
     v = float(vol_ratio)
-    if v >= 1.6:
-        return 0.55
-    if v >= 1.3:
-        return 0.75
-    if v <= 0.8:
-        return 1.05
+    if v >= 1.6: return 0.55
+    if v >= 1.3: return 0.75
+    if v <= 0.8: return 1.05
     return 1.0
-
 
 def compute_market_vol_ratio(progress_cb: Optional[Callable[[str, dict], None]] = None) -> Tuple[float, dict]:
     meta = {"proxy": "1306.T", "ok": False}
@@ -361,6 +318,7 @@ def compute_market_vol_ratio(progress_cb: Optional[Callable[[str, dict], None]] 
     df, m = fetch_daily_stooq("1306.T", min_rows=260)
     meta["fetch_meta"] = m
     if df is None or df.empty:
+        meta["note"] = "fetch_failed"
         return 1.0, meta
     ind = add_indicators(df)
     if ind.empty:
@@ -374,7 +332,6 @@ def compute_market_vol_ratio(progress_cb: Optional[Callable[[str, dict], None]] 
         return 1.0, meta
     meta.update({"ok": True, "current_atr_pct": cur, "median_atr_pct_1y": med})
     return float(cur / med), meta
-
 
 def correlation_filter(price_dict: Dict[str, pd.Series], symbols: List[str], threshold: float = 0.7) -> List[str]:
     final: List[str] = []
@@ -393,228 +350,161 @@ def correlation_filter(price_dict: Dict[str, pd.Series], symbols: List[str], thr
             final.append(sym)
     return final
 
-
-def scan_engine(
-    *,
-    universe_limit: int = 800,
-    sector_top_n: int = 6,
-    pre_top_m: int = 45,
-    top_n: int = 6,
-    corr_threshold: float = 0.7,
-    max_workers: int = 10,
-    time_budget_sec: int = 52,
-    progress_cb: Optional[Callable[[str, dict], None]] = None,
-) -> Dict[str, object]:
+def scan_engine(*, universe_limit:int=700, sector_top_n:int=6, pre_top_m:int=35, top_n:int=6,
+               corr_threshold:float=0.7, max_workers:int=9, time_budget_sec:int=50,
+               progress_cb:Optional[Callable[[str,dict],None]]=None) -> Dict[str, object]:
     t0 = time.time()
-    diag: dict = {
-        "timestamp_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
-        "stage": "init",
-        "stats": {},
-        "errors": [],
-        "sample_failures": [],
-        "timings_sec": {},
-    }
-
-    def tick(stage: str, extra: Optional[dict] = None):
-        diag["stage"] = stage
-        diag["timings_sec"][stage] = float(time.time() - t0)
-        if progress_cb:
-            progress_cb(stage, extra or {})
-
-    master = get_jpx_master()
-    if master.empty:
-        tick("error", {"reason": "jpx_master_empty"})
-        diag["errors"].append("JPXマスター取得失敗")
-        return {"ok": False, "error": "JPXマスター取得失敗", "diag": diag, "sector_ranking": pd.DataFrame(), "candidates": pd.DataFrame()}
-
-    tick("universe")
-    tickers = master["ticker"].astype(str).tolist()[: int(universe_limit)]
-    diag["stats"]["universe"] = int(len(tickers))
-
-    tick("fetch")
-    rows_latest: List[dict] = []
-    price_dict: Dict[str, pd.Series] = {}
-    fail_count = 0
-
-    def _one(t: str):
-        df, meta = fetch_daily_stooq(t, min_rows=260)
-        return t, df, meta
-
-    futures = []
-    with ThreadPoolExecutor(max_workers=int(max_workers)) as ex:
-        for t in tickers:
-            futures.append(ex.submit(_one, t))
-
-        done = 0
-        for fut in as_completed(futures):
-            done += 1
-            if (time.time() - t0) > float(time_budget_sec):
-                diag["errors"].append("time_budget_exceeded_fetch_partial")
-                break
-
-            t, df, meta = fut.result()
-            if df is None or df.empty:
-                fail_count += 1
-                if len(diag["sample_failures"]) < 25:
-                    diag["sample_failures"].append({"ticker": t, "meta": meta})
-            else:
-                ind = add_indicators(df)
-                if ind.empty:
+    diag: dict = {"timestamp_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+                  "stage":"init","stats":{},"errors":[], "sample_failures":[], "timings_sec":{}}
+    def tick(stage:str, extra:Optional[dict]=None):
+        diag["stage"]=stage
+        diag["timings_sec"][stage]=float(time.time()-t0)
+        if progress_cb: progress_cb(stage, extra or {})
+    try:
+        master = get_jpx_master()
+        if master.empty:
+            tick("error", {"reason":"jpx_master_empty"})
+            diag["errors"].append("JPXマスター取得失敗")
+            return {"ok":False,"error":"JPXマスター取得失敗","diag":diag,"sector_ranking":pd.DataFrame(),"candidates":pd.DataFrame()}
+        tick("universe")
+        tickers = master["ticker"].astype(str).tolist()[:int(universe_limit)]
+        diag["stats"]["universe"]=int(len(tickers))
+        tick("fetch")
+        rows_latest=[]
+        price_dict={}
+        fail_count=0
+        def _one(t:str):
+            df, meta = fetch_daily_stooq(t, min_rows=260)
+            return t, df, meta
+        futures=[]
+        with ThreadPoolExecutor(max_workers=int(max_workers)) as ex:
+            for t in tickers:
+                futures.append(ex.submit(_one, t))
+            done=0
+            for fut in as_completed(futures):
+                done += 1
+                if (time.time()-t0) > float(time_budget_sec):
+                    diag["errors"].append("time_budget_exceeded_fetch_partial")
+                    break
+                t, df, meta = fut.result()
+                if df is None or df.empty:
                     fail_count += 1
-                    if len(diag["sample_failures"]) < 25:
-                        diag["sample_failures"].append({"ticker": t, "meta": {**(meta or {}), "note": "ind_empty"}})
+                    if len(diag["sample_failures"])<25:
+                        diag["sample_failures"].append({"ticker":t, "meta":meta})
                 else:
-                    latest = ind.iloc[-1].to_dict()
-                    latest["Symbol"] = t
-                    latest["pre_score"] = pre_score(ind.iloc[-1])
-                    rows_latest.append(latest)
-                    price_dict[t] = ind["Close"].tail(260)
+                    ind = add_indicators(df)
+                    if ind.empty:
+                        fail_count += 1
+                        if len(diag["sample_failures"])<25:
+                            diag["sample_failures"].append({"ticker":t, "meta":{**(meta or {}), "note":"ind_empty"}})
+                    else:
+                        latest = ind.iloc[-1].to_dict()
+                        latest["Symbol"]=t
+                        latest["pre_score"]=pre_score(ind.iloc[-1])
+                        rows_latest.append(latest)
+                        price_dict[t]=ind["Close"].tail(260)
+                if progress_cb and (done % 20 == 0 or done == 1):
+                    progress_cb("fetch_progress", {"done":done, "total":len(tickers), "ok":len(rows_latest), "fail":fail_count})
+        diag["stats"]["fetched_ok"]=int(len(rows_latest))
+        diag["stats"]["fetch_failed"]=int(fail_count)
+        if not rows_latest:
+            tick("error", {"reason":"all_fetch_failed"})
+            diag["errors"].append("Stooq取得が全滅（IPブロック/レート制限/ネットワーク）")
+            return {"ok":False,"error":"Stooq取得が全滅","diag":diag,"sector_ranking":pd.DataFrame(),"candidates":pd.DataFrame()}
+        tick("merge")
+        latest_df = pd.DataFrame(rows_latest).merge(master, left_on="Symbol", right_on="ticker", how="left")
+        tick("sector_strength")
+        sec_rank = calc_sector_strength(latest_df[["Symbol","sector","RET_3M","RSI","ATR_PCT","VOL_AVG20"]].copy())
+        top_sectors = sec_rank.head(int(sector_top_n))["sector"].astype(str).tolist()
+        diag["stats"]["top_sectors"]=top_sectors
+        tick("preselect")
+        cand0 = latest_df[latest_df["sector"].astype(str).isin(top_sectors)].copy()
+        cand0 = cand0.sort_values("pre_score", ascending=False).head(int(pre_top_m)).copy()
+        diag["stats"]["pre_top_m_actual"]=int(len(cand0))
+        tick("heavy_sims")
+        heavy_rows=[]
+        heavy_fail=0
+        syms = cand0["Symbol"].astype(str).tolist()
+        for idx, sym in enumerate(syms, start=1):
+            if (time.time()-t0) > float(time_budget_sec):
+                diag["errors"].append("time_budget_exceeded_heavy_partial")
+                break
+            df, meta = fetch_daily_stooq(sym, min_rows=260)
+            if df is None or df.empty:
+                heavy_fail += 1
+                continue
+            ind = add_indicators(df)
+            if ind.empty:
+                heavy_fail += 1
+                continue
+            p_best, wf_sum = walk_forward_optimize(ind)
+            daily_ret = ind["Close"].pct_change().dropna().values
+            mc_dd = monte_carlo_maxdd_from_daily_returns(daily_ret, n_sim=200)
+            exp_full, wr_full, rr_full, n_full = _backtest_r(ind, p_best)
+            last = ind.iloc[-1]
+            rname = str(cand0[cand0["Symbol"]==sym].iloc[0].get("name",""))
+            rsec  = str(cand0[cand0["Symbol"]==sym].iloc[0].get("sector",""))
+            heavy_rows.append({
+                "Symbol":sym,"name":rname,"sector":rsec,
+                "Close":float(last["Close"]), "ATR":float(last["ATR"]),
+                "RSI":float(last["RSI"]), "RET_3M":float(last["RET_3M"]),
+                "pre_score":float(cand0[cand0["Symbol"]==sym].iloc[0]["pre_score"]),
+                "wf_best":{"atr_mult_stop":p_best.atr_mult_stop,"tp2_r":p_best.tp2_r,"time_stop_days":p_best.time_stop_days},
+                **wf_sum,
+                "mc_dd_p05":float(mc_dd),
+                "exp_full":float(exp_full),"wr_full":float(wr_full),"rr_full":float(rr_full),"n_full":int(n_full),
+            })
+            if progress_cb and (idx % 4 == 0 or idx == 1):
+                progress_cb("heavy_progress", {"done":idx,"total":len(syms),"heavy_ok":len(heavy_rows),"heavy_fail":heavy_fail})
+        diag["stats"]["heavy_ok"]=int(len(heavy_rows))
+        diag["stats"]["heavy_fail"]=int(heavy_fail)
+        if not heavy_rows:
+            tick("error", {"reason":"heavy_failed"})
+            diag["errors"].append("WF/MCが全滅（Stooq断続ブロックの可能性）")
+            return {"ok":False,"error":"heavy_sims失敗","diag":diag,"sector_ranking":sec_rank,"candidates":pd.DataFrame()}
+        tick("final_rank")
+        heavy_df = pd.DataFrame(heavy_rows)
+        sample_pen = np.clip(heavy_df.get("wf_oos_trades",0).fillna(0).astype(float)/8.0, 0.2, 1.0)
+        heavy_df["final_score"] = (
+            heavy_df.get("wf_oos_mean_exp",0).fillna(0).astype(float)*120.0*sample_pen
+            + heavy_df["RET_3M"].fillna(0).astype(float)*35.0
+            + heavy_df["pre_score"].fillna(0).astype(float)*10.0
+            - np.abs(heavy_df["mc_dd_p05"].fillna(0).astype(float))*10.0
+        )
+        ranked = heavy_df.sort_values("final_score", ascending=False).reset_index(drop=True)
+        symbols_ranked = ranked["Symbol"].astype(str).tolist()
+        final_syms = correlation_filter(price_dict, symbols_ranked, threshold=float(corr_threshold))[:int(top_n)]
+        final_df = ranked[ranked["Symbol"].astype(str).isin(final_syms)].copy().sort_values("final_score", ascending=False).reset_index(drop=True)
+        diag["stats"]["selected"]=final_syms
+        tick("done")
+        return {"ok":True,"diag":diag,"sector_ranking":sec_rank,"candidates":final_df}
+    except Exception as e:
+        tick("error", {"reason":"exception"})
+        diag["errors"].append(f"exception: {type(e).__name__}: {e}")
+        return {"ok":False,"error":f"例外: {type(e).__name__}","diag":diag,"sector_ranking":pd.DataFrame(),"candidates":pd.DataFrame()}
 
-            if progress_cb and (done % 15 == 0 or done == 1):
-                progress_cb("fetch_progress", {"done": done, "total": len(tickers), "ok": len(rows_latest), "fail": fail_count})
-
-    diag["stats"]["fetched_ok"] = int(len(rows_latest))
-    diag["stats"]["fetch_failed"] = int(fail_count)
-
-    if not rows_latest:
-        tick("error", {"reason": "all_fetch_failed"})
-        diag["errors"].append("Stooq取得が全滅")
-        return {"ok": False, "error": "Stooq取得が全滅", "diag": diag, "sector_ranking": pd.DataFrame(), "candidates": pd.DataFrame()}
-
-    tick("merge")
-    latest_df = pd.DataFrame(rows_latest).merge(master, left_on="Symbol", right_on="ticker", how="left")
-
-    tick("sector_strength")
-    sec_rank = calc_sector_strength(latest_df[["Symbol", "sector", "RET_3M", "RSI", "ATR_PCT", "VOL_AVG20"]].copy())
-    top_sectors = sec_rank.head(int(sector_top_n))["sector"].astype(str).tolist()
-    diag["stats"]["top_sectors"] = top_sectors
-
-    tick("preselect")
-    cand0 = latest_df[latest_df["sector"].astype(str).isin(top_sectors)].copy()
-    cand0 = cand0.sort_values("pre_score", ascending=False).head(int(pre_top_m)).copy()
-    diag["stats"]["pre_top_m_actual"] = int(len(cand0))
-
-    tick("heavy_sims")
-    heavy_rows = []
-    heavy_fail = 0
-    syms = cand0["Symbol"].astype(str).tolist()
-
-    for idx, sym in enumerate(syms, start=1):
-        if (time.time() - t0) > float(time_budget_sec):
-            diag["errors"].append("time_budget_exceeded_heavy_partial")
-            break
-
-        df, meta = fetch_daily_stooq(sym, min_rows=260)
-        if df is None or df.empty:
-            heavy_fail += 1
-            continue
-        ind = add_indicators(df)
-        if ind.empty:
-            heavy_fail += 1
-            continue
-
-        p_best, wf_sum = walk_forward_optimize(ind)
-        daily_ret = ind["Close"].pct_change().dropna().values
-        mc_dd = monte_carlo_maxdd_from_daily_returns(daily_ret, n_sim=350)
-        exp_full, wr_full, rr_full, n_full = _backtest_r(ind, p_best)
-
-        last = ind.iloc[-1]
-        heavy_rows.append({
-            "Symbol": sym,
-            "name": str(cand0[cand0["Symbol"] == sym].iloc[0]["name"]),
-            "sector": str(cand0[cand0["Symbol"] == sym].iloc[0]["sector"]),
-            "Close": float(last["Close"]),
-            "ATR": float(last["ATR"]),
-            "RSI": float(last["RSI"]),
-            "RET_3M": float(last["RET_3M"]),
-            "pre_score": float(cand0[cand0["Symbol"] == sym].iloc[0]["pre_score"]),
-            "wf_best": {"atr_mult_stop": p_best.atr_mult_stop, "tp2_r": p_best.tp2_r, "time_stop_days": p_best.time_stop_days},
-            **wf_sum,
-            "mc_dd_p05": float(mc_dd),
-            "exp_full": float(exp_full),
-            "wr_full": float(wr_full),
-            "rr_full": float(rr_full),
-            "n_full": int(n_full),
-        })
-
-        if progress_cb and (idx % 3 == 0 or idx == 1):
-            progress_cb("heavy_progress", {"done": idx, "total": len(syms), "heavy_ok": len(heavy_rows), "heavy_fail": heavy_fail})
-
-    diag["stats"]["heavy_ok"] = int(len(heavy_rows))
-    diag["stats"]["heavy_fail"] = int(heavy_fail)
-
-    if not heavy_rows:
-        tick("error", {"reason": "heavy_failed"})
-        diag["errors"].append("WF/MCが全滅")
-        return {"ok": False, "error": "heavy_sims失敗", "diag": diag, "sector_ranking": sec_rank, "candidates": pd.DataFrame()}
-
-    tick("final_rank")
-    heavy_df = pd.DataFrame(heavy_rows)
-    sample_pen = np.clip(heavy_df.get("wf_oos_trades", 0).fillna(0).astype(float) / 8.0, 0.2, 1.0)
-    heavy_df["final_score"] = (
-        heavy_df.get("wf_oos_mean_exp", 0).fillna(0).astype(float) * 120.0 * sample_pen
-        + heavy_df["RET_3M"].fillna(0).astype(float) * 35.0
-        + heavy_df["pre_score"].fillna(0).astype(float) * 10.0
-        - np.abs(heavy_df["mc_dd_p05"].fillna(0).astype(float)) * 10.0
-    )
-
-    ranked = heavy_df.sort_values("final_score", ascending=False).reset_index(drop=True)
-    symbols_ranked = ranked["Symbol"].astype(str).tolist()
-    symbols_div = correlation_filter(price_dict, symbols_ranked, threshold=float(corr_threshold))
-    final_syms = symbols_div[: int(top_n)]
-    final_df = ranked[ranked["Symbol"].astype(str).isin(final_syms)].copy()
-    final_df = final_df.sort_values("final_score", ascending=False).reset_index(drop=True)
-
-    diag["stats"]["selected"] = final_syms
-    tick("done")
-    return {"ok": True, "diag": diag, "sector_ranking": sec_rank, "candidates": final_df}
-
-
-def build_orders(
-    candidates: pd.DataFrame,
-    *,
-    capital_yen: int,
-    risk_pct_per_trade: float,
-    current_dd: float,
-    vol_ratio: float,
-) -> Dict[str, object]:
+def build_orders(candidates: pd.DataFrame, *, capital_yen:int, risk_pct_per_trade:float, current_dd:float, vol_ratio:float) -> Dict[str, object]:
     if candidates is None or candidates.empty:
         return {"orders": pd.DataFrame(), "portfolio": {}, "ror": 1.0}
-
     df = candidates.copy()
     w = df.get("n_full", 0).fillna(0).astype(float).values
     w = np.maximum(1.0, w)
-    wr = float(np.average(df.get("wr_full", 0.0).fillna(0.0).astype(float).values, weights=w))
-    rr = float(np.average(df.get("rr_full", 1.0).fillna(1.0).astype(float).values, weights=w))
+    wr = float(np.average(df.get("wr_full",0.0).fillna(0.0).astype(float).values, weights=w))
+    rr = float(np.average(df.get("rr_full",1.0).fillna(1.0).astype(float).values, weights=w))
     rr = max(0.5, rr)
-
     units = float(1.0 / max(1e-6, risk_pct_per_trade))
     ror = portfolio_ror(wr, rr, units)
-
-    if ror <= 0.02:
-        ror_factor = 1.0
-    elif ror <= 0.05:
-        ror_factor = 0.8
-    elif ror <= 0.10:
-        ror_factor = 0.6
-    else:
-        ror_factor = 0.3
-
+    ror_factor = 1.0 if ror <= 0.02 else (0.8 if ror <= 0.05 else (0.6 if ror <= 0.10 else 0.3))
     ddf = dd_factor(current_dd)
     mvf = market_vol_factor(vol_ratio)
     base_risk_budget = float(capital_yen) * float(risk_pct_per_trade) * float(ddf) * float(mvf) * float(ror_factor)
-
-    orders = []
+    orders=[]
     for _, row in df.iterrows():
-        price = float(row["Close"])
-        atr = float(row["ATR"])
+        price = float(row["Close"]); atr = float(row["ATR"])
         p = row.get("wf_best", {}) or {}
-        atr_mult = float(p.get("atr_mult_stop", 2.0))
-        tp2_r = float(p.get("tp2_r", 3.0))
-
+        atr_mult = float(p.get("atr_mult_stop", 2.0)); tp2_r = float(p.get("tp2_r", 3.0))
         stop = price - atr * atr_mult
         r_unit = price - stop
-
         if r_unit <= 0:
             shares = 0
         else:
@@ -622,30 +512,16 @@ def build_orders(
             shares = int(math.floor(risk_budget / r_unit))
             shares = int((shares // 100) * 100)
             shares = max(0, shares)
-
         orders.append({
-            "Symbol": str(row["Symbol"]),
-            "name": str(row.get("name", "")),
-            "sector": str(row.get("sector", "")),
-            "entry": price,
-            "stop": stop,
-            "tp1": price + r_unit * 1.0,
-            "tp2": price + r_unit * tp2_r,
-            "shares": shares,
-            "atr_mult": atr_mult,
-            "tp2_r": tp2_r,
+            "Symbol": str(row["Symbol"]), "name": str(row.get("name","")), "sector": str(row.get("sector","")),
+            "entry": price, "stop": stop,
+            "tp1": price + r_unit * 1.0, "tp2": price + r_unit * tp2_r,
+            "shares": shares, "atr_mult": atr_mult, "tp2_r": tp2_r,
             "note": "" if shares > 0 else "shares=0（単元/リスク不足）",
         })
-
     portfolio = {
-        "win_rate_est": wr,
-        "rr_est": rr,
-        "capital_units": units,
-        "ror": ror,
-        "dd_factor": ddf,
-        "market_vol_ratio": float(vol_ratio),
-        "market_vol_factor": mvf,
-        "ror_factor": ror_factor,
-        "risk_budget_total_yen": base_risk_budget,
+        "win_rate_est": wr, "rr_est": rr, "capital_units": units, "ror": ror,
+        "dd_factor": ddf, "market_vol_ratio": float(vol_ratio), "market_vol_factor": mvf,
+        "ror_factor": ror_factor, "risk_budget_total_yen": base_risk_budget,
     }
     return {"orders": pd.DataFrame(orders), "portfolio": portfolio, "ror": ror}
