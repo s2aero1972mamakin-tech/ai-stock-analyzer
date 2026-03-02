@@ -52,55 +52,88 @@ def add_indicators(df):
     return df
 
 # =============================
-# SECTOR STRENGTH
+# WALK FORWARD
 # =============================
 
-def calc_sector_strength(master, data_rows):
-    df = pd.DataFrame(data_rows)
-    merged = df.merge(master, left_on="Symbol", right_on="ticker")
-    sec = merged.groupby("sector")["RET_3M"].mean().reset_index()
-    sec["score"] = sec["RET_3M"] * 100
-    return sec.sort_values("score", ascending=False)
+def walk_forward_score(df):
+
+    window_train = 400
+    window_test = 120
+
+    scores = []
+
+    for start in range(0, len(df)-window_train-window_test, window_test):
+
+        train = df.iloc[start:start+window_train]
+        test = df.iloc[start+window_train:start+window_train+window_test]
+
+        train_ret = train["Close"].pct_change().mean()
+        test_ret = test["Close"].pct_change().mean()
+
+        scores.append(test_ret)
+
+    if not scores:
+        return 0
+
+    return np.mean(scores)
+
+# =============================
+# MONTE CARLO DD
+# =============================
+
+def monte_carlo_dd(returns, n_sim=2000):
+
+    max_dds = []
+
+    for _ in range(n_sim):
+        shuffled = np.random.permutation(returns)
+        equity = np.cumsum(shuffled)
+        peak = np.maximum.accumulate(equity)
+        dd = equity - peak
+        max_dds.append(dd.min())
+
+    return np.percentile(max_dds, 95)
+
+# =============================
+# PORTFOLIO RISK OF RUIN
+# =============================
+
+def portfolio_ror(win_rate, rr, capital_units):
+
+    edge = win_rate - (1-win_rate)/rr
+    if edge <= 0:
+        return 1.0
+
+    return ((1-edge)/(1+edge))**capital_units
 
 # =============================
 # CORRELATION FILTER
 # =============================
 
 def correlation_filter(price_dict, selected, threshold=0.7):
+
     final = []
+
     for sym in selected:
         keep = True
         for f in final:
-            c = price_dict[sym].pct_change().corr(price_dict[f].pct_change())
-            if abs(c) > threshold:
+            corr = price_dict[sym].pct_change().corr(price_dict[f].pct_change())
+            if abs(corr) > threshold:
                 keep = False
                 break
         if keep:
             final.append(sym)
+
     return final
 
 # =============================
-# DRAW DOWN CONTROL
+# MAIN ENGINE
 # =============================
 
-def adjust_risk_by_dd(current_dd):
-    if current_dd < 0.05:
-        return 1.0
-    elif current_dd < 0.1:
-        return 0.7
-    elif current_dd < 0.15:
-        return 0.4
-    else:
-        return 0.0
-
-# =============================
-# MAIN SCAN ENGINE
-# =============================
-
-def scan_engine(top_n=10, sector_top_n=5):
+def scan_engine(top_n=5, sector_top_n=5):
 
     master = get_jpx_master()
-    tickers = master["ticker"].tolist()[:800]  # 初期負荷軽減
+    tickers = master["ticker"].tolist()[:800]
 
     rows = []
     price_dict = {}
@@ -109,74 +142,94 @@ def scan_engine(top_n=10, sector_top_n=5):
         results = list(ex.map(fetch_stooq, tickers))
 
     for t, df in zip(tickers, results):
-        if df is None:
+
+        if df is None or len(df) < 600:
             continue
+
         df = add_indicators(df)
+
         latest = df.tail(1)
         if latest.empty:
             continue
+
         row = latest.iloc[0].to_dict()
         row["Symbol"] = t
+        row["wf_score"] = walk_forward_score(df)
+
+        returns = df["Close"].pct_change().dropna().values
+        row["mc_dd"] = monte_carlo_dd(returns)
+
         rows.append(row)
         price_dict[t] = df["Close"]
 
     if not rows:
         return None
 
-    sec_rank = calc_sector_strength(master, rows)
+    df_all = pd.DataFrame(rows)
+
+    # Sector strength
+    merged = df_all.merge(master, left_on="Symbol", right_on="ticker")
+    sec_rank = merged.groupby("sector")["RET_3M"].mean().reset_index()
+    sec_rank["score"] = sec_rank["RET_3M"]*100
+    sec_rank = sec_rank.sort_values("score", ascending=False)
+
     top_sectors = sec_rank.head(sector_top_n)["sector"].tolist()
 
-    df = pd.DataFrame(rows)
-    df = df.merge(master, left_on="Symbol", right_on="ticker")
-    df = df[df["sector"].isin(top_sectors)]
+    df_all = merged[merged["sector"].isin(top_sectors)]
 
-    # スコア計算
-    df["score"] = (
-        df["RET_3M"] * 0.4 +
-        (df["SMA25"] > df["SMA75"]).astype(int) * 0.3 +
-        np.log1p(df["VOL_AVG"]) * 0.3
+    df_all["score"] = (
+        df_all["wf_score"]*0.4 +
+        df_all["RET_3M"]*0.3 -
+        abs(df_all["mc_dd"])*0.3
     )
 
-    ranked = df.sort_values("score", ascending=False).head(top_n*2)
+    ranked = df_all.sort_values("score", ascending=False).head(top_n*2)
 
-    selected = ranked["Symbol"].tolist()
-    selected = correlation_filter(price_dict, selected)
+    selected = correlation_filter(price_dict, ranked["Symbol"].tolist())
 
-    final = df[df["Symbol"].isin(selected)].head(top_n)
+    final = ranked[ranked["Symbol"].isin(selected)].head(top_n)
 
     return {
         "sector_ranking": sec_rank,
-        "candidates": final,
-        "price_dict": price_dict
+        "candidates": final
     }
 
 # =============================
-# TRADE PLAN
+# ORDER BUILDER
 # =============================
 
-def build_orders(df, capital, risk_pct, current_dd):
+def build_orders(df, capital, risk_pct, current_dd, market_vol):
 
-    risk_adj = adjust_risk_by_dd(current_dd)
     orders = []
+
+    dd_factor = 1.0
+    if current_dd > 0.1:
+        dd_factor = 0.6
+    if current_dd > 0.15:
+        dd_factor = 0.3
+
+    vol_factor = 1.0
+    if market_vol > 1.5:
+        vol_factor = 0.6
 
     for _, row in df.iterrows():
 
         price = row["Close"]
         atr = row["ATR"]
-        stop = price - atr * 2
+
+        stop = price - atr*2
         r = price - stop
 
-        risk_budget = capital * risk_pct * risk_adj
-        shares = int(risk_budget / r) if r > 0 else 0
-        shares = (shares // 100) * 100
+        risk_budget = capital*risk_pct*dd_factor*vol_factor
+        shares = int(risk_budget/r) if r>0 else 0
+        shares = (shares//100)*100
 
         orders.append({
             "Symbol": row["Symbol"],
-            "name": row["name"],
             "entry": price,
             "stop": stop,
-            "tp1": price + r,
-            "tp2": price + r*3,
+            "tp1": price+r,
+            "tp2": price+r*3,
             "shares": shares
         })
 
