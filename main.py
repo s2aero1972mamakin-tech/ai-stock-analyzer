@@ -5,7 +5,7 @@ import streamlit as st
 import pandas as pd
 import logic
 
-APP_BUILD = "ULTIMATE8-2026-03-02"
+APP_BUILD = "ULTIMATE9-2026-03-02"
 
 def _json_dumps(obj) -> str:
     def default(o):
@@ -25,22 +25,18 @@ st.caption("スキャン→セクター強度→銘柄選択→WF/MC→RoR→DD/
 
 with st.sidebar.expander("🧭 使い方 / 設定の意味（必読）", expanded=True):
     st.markdown("""
-**目的**：AIが「買う候補」を絞り、SBIでの発注はあなたが最終確認して実行（半自動）。
+**重要**：あなたのログで「timeoutに見える」原因は、実際は **例外で落ちて応答不能** になっているケースが混ざっています。
+この版は main/logic の不整合を無くし、例外でも診断JSONを残す設計です。
 
-- **スキャン対象上限**：Cloudでは800前後が安定しやすい。増やすほど遅く/ブロックされやすい。  
-- **上位セクター数**：強いセクターだけに絞る（4〜7推奨）  
-- **事前候補M**：WF/MCをかける銘柄数（ここが一番重い、30〜60推奨）  
-- **最終採用銘柄数**：ポートフォリオ銘柄数  
-- **相関除外**：0.7なら相関の高い銘柄は同時採用しない（0.6〜0.75推奨）  
-- **運用資金/リスク%**：1トレードで失ってよい上限（0.5〜1.0%推奨）  
-- **現在DD%**：DDが大きいほどロット縮小  
-- **タイムバジェット**：一定秒数で“部分結果を返して”止まらない（Cloud対策）
+- **スキャン対象上限**：Cloudは 600〜800 推奨  
+- **事前候補M**：WF/MC対象（30〜45推奨）  
+- **タイムバジェット**：この秒数を超えたら“部分結果で返す”（止まらない）
 """)
 
 st.sidebar.header("⚙️ 設定")
-universe_limit = st.sidebar.slider("スキャン対象上限", 200, 2500, 800, step=100)
+universe_limit = st.sidebar.slider("スキャン対象上限", 200, 2500, 700, step=100)
 sector_top_n = st.sidebar.slider("上位セクター数", 2, 12, 6)
-pre_top_m = st.sidebar.slider("重い計算対象（事前候補M）", 15, 120, 45, step=5)
+pre_top_m = st.sidebar.slider("重い計算対象（事前候補M）", 15, 120, 35, step=5)
 top_n = st.sidebar.slider("最終採用銘柄数", 3, 10, 6)
 corr_threshold = st.sidebar.slider("相関除外しきい値", 0.3, 0.95, 0.70, step=0.05)
 
@@ -50,8 +46,8 @@ risk_pct = st.sidebar.slider("1トレード許容リスク%", 0.3, 3.0, 1.0, ste
 current_dd = st.sidebar.slider("現在DD%", 0.0, 30.0, 0.0, step=0.5) / 100.0
 
 st.sidebar.markdown("---")
-max_workers = st.sidebar.slider("並列数（多すぎ注意）", 4, 16, 10)
-time_budget_sec = st.sidebar.slider("タイムバジェット（秒）", 15, 90, 52, step=1)
+max_workers = st.sidebar.slider("並列数（多すぎ注意）", 4, 16, 9)
+time_budget_sec = st.sidebar.slider("タイムバジェット（秒）", 15, 90, 50, step=1)
 
 if "diag" not in st.session_state:
     st.session_state["diag"] = None
@@ -63,7 +59,7 @@ if st.session_state["diag"]:
     with st.sidebar.expander("表示", expanded=False):
         st.sidebar.json(st.session_state["diag"])
 else:
-    st.sidebar.info("スキャン実行後にここに診断JSONが出ます。")
+    st.sidebar.info("スキャン実行後にここに診断JSONが出ます（失敗でも出ます）。")
 
 prog = st.progress(0)
 status = st.empty()
@@ -71,43 +67,37 @@ detail = st.empty()
 
 def progress_cb(stage: str, payload: dict):
     stage_map = {
-        "universe": 0.05,
-        "fetch": 0.10,
-        "merge": 0.55,
-        "sector_strength": 0.60,
-        "preselect": 0.65,
-        "heavy_sims": 0.70,
-        "final_rank": 0.92,
-        "done": 1.00,
-        "error": 1.00,
-        "market_vol_fetch": 0.02,
+        "market_vol_fetch": 0.02, "universe": 0.05, "fetch": 0.10, "merge": 0.55,
+        "sector_strength": 0.60, "preselect": 0.65, "heavy_sims": 0.70, "final_rank": 0.92,
+        "done": 1.00, "error": 1.00,
     }
     if stage in stage_map:
         prog.progress(int(stage_map[stage] * 100))
-
     if stage == "fetch_progress":
         done = payload.get("done", 0); total = payload.get("total", 1)
         ok = payload.get("ok", 0); fail = payload.get("fail", 0)
         frac = 0.10 + 0.40 * (done / max(1, total))
         prog.progress(int(frac * 100))
         status.write(f"📡 取得中: {done}/{total}  OK={ok} / FAIL={fail}")
-        detail.write(payload)
-        return
-
+        detail.write(payload); return
     if stage == "heavy_progress":
         done = payload.get("done", 0); total = payload.get("total", 1)
         frac = 0.70 + 0.20 * (done / max(1, total))
         prog.progress(int(frac * 100))
         status.write(f"🧠 最適化/推定中: {done}/{total}  heavy_ok={payload.get('heavy_ok')} / heavy_fail={payload.get('heavy_fail')}")
-        detail.write(payload)
-        return
-
+        detail.write(payload); return
     status.write(f"⏳ stage: {stage}")
-    if payload:
-        detail.write(payload)
+    if payload: detail.write(payload)
+
+# 市場ボラは毎回ネット取得するとtimeout原因になるのでキャッシュ
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_market_vol():
+    return logic.compute_market_vol_ratio(progress_cb=None)
 
 with st.sidebar.expander("📉 市場ボラ（自動: 1306.T）", expanded=False):
-    vol_ratio, vol_meta = logic.compute_market_vol_ratio(progress_cb=progress_cb)
+    if st.button("🔄 市場ボラを再取得（必要時のみ）"):
+        _cached_market_vol.clear()
+    vol_ratio, vol_meta = _cached_market_vol()
     st.write({"vol_ratio": vol_ratio, "meta": vol_meta})
 
 run = st.sidebar.button("🔥 スキャン開始", type="primary")
@@ -116,18 +106,20 @@ if run:
     prog.progress(1)
     status.write("開始...")
     detail.empty()
-
-    with st.spinner("スキャン＆最適化中...（進捗は上に表示）"):
-        result = logic.scan_engine(
-            universe_limit=int(universe_limit),
-            sector_top_n=int(sector_top_n),
-            pre_top_m=int(pre_top_m),
-            top_n=int(top_n),
-            corr_threshold=float(corr_threshold),
-            max_workers=int(max_workers),
-            time_budget_sec=int(time_budget_sec),
-            progress_cb=progress_cb,
-        )
+    try:
+        with st.spinner("スキャン＆最適化中...（進捗は上に表示）"):
+            result = logic.scan_engine(
+                universe_limit=int(universe_limit),
+                sector_top_n=int(sector_top_n),
+                pre_top_m=int(pre_top_m),
+                top_n=int(top_n),
+                corr_threshold=float(corr_threshold),
+                max_workers=int(max_workers),
+                time_budget_sec=int(time_budget_sec),
+                progress_cb=progress_cb,
+            )
+    except Exception as e:
+        result = {"ok": False, "error": f"main_exception: {type(e).__name__}", "diag": {"stage":"error","errors":[f"{type(e).__name__}: {e}"]}, "sector_ranking": pd.DataFrame(), "candidates": pd.DataFrame()}
 
     st.session_state["diag"] = result.get("diag") or {}
 
@@ -138,7 +130,7 @@ if run:
         st.markdown("### 直近の失敗サンプル（最大25件）")
         st.json((st.session_state["diag"] or {}).get("sample_failures", []))
     else:
-        st.success("完了")
+        st.success("完了（タイムバジェットで部分終了でも結果は出ます）")
 
         st.markdown("## 🏆 セクター強度ランキング")
         st.dataframe(result["sector_ranking"], use_container_width=True)
@@ -149,7 +141,7 @@ if run:
             "Symbol","name","sector","Close","RET_3M",
             "wf_oos_mean_exp","wf_oos_wr","wf_oos_rr","wf_oos_trades",
             "mc_dd_p05","final_score","wf_best"
-        ] if c in cands.columns]
+        ] if hasattr(cands, "columns") and c in cands.columns]
         st.dataframe(cands[show_cols], use_container_width=True)
 
         out = logic.build_orders(
