@@ -17,7 +17,7 @@ import time
 import traceback
 from dataclasses import dataclass, replace
 from io import BytesIO
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Any
 
 import numpy as np
 import pandas as pd
@@ -526,6 +526,8 @@ def scan_swing_candidates(
     sector_prefilter: bool = True,
     sector_top_n: int = 6,
     relax_level: int = 0,
+    start_index: int = 0,
+    diag: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, object]:
     stats = {
         "universe": 0,
@@ -570,9 +572,14 @@ def scan_swing_candidates(
     partial_top: List[dict] = []
     partial_limit = max(8, int(top_n) * 3)
 
+    last_idx = int(start_index) - 1
+
     scan_started_t0 = time.time()
 
-    for i, t in enumerate(tickers, start=1):
+    for idx in range(int(start_index), len(tickers)):
+        t = tickers[idx]
+        i = idx + 1
+        last_idx = idx
         if i < int(start_index) + 1:
             continue
         if diag is not None:
@@ -581,7 +588,7 @@ def scan_swing_candidates(
             diag['status'] = 'running'
             diag['stage'] = 'scanning'
         if progress_callback and (i % 10 == 0 or i == 1):
-            progress_callback(i, total, f"fetch+indicators {t}", partial=partial_top, stats=stats)
+            progress_callback(i, total, f"fetch+indicators {t}", partial=partial_top, stats=stats, cursor_index=idx)
 
         df = get_market_data(t, period=backtest_period, diag=diag)
         t_ind0 = time.time()
