@@ -5,7 +5,7 @@ import streamlit as st
 import pandas as pd
 import logic
 
-APP_BUILD = "ULTIMATE10-2026-03-02"
+APP_BUILD = "ULTIMATE11-2026-03-02"
 
 def _json_dumps(obj) -> str:
     def default(o):
@@ -19,43 +19,12 @@ def _json_dumps(obj) -> str:
         return str(o)
     return json.dumps(obj, ensure_ascii=False, indent=2, default=default)
 
+# ---------------- UI ----------------
 st.set_page_config(page_title="SBI 半自動プロ仕様（機関レベル）", layout="wide")
 st.title("📈 SBI 半自動プロ仕様（機関レベル）")
 st.caption("スキャン→セクター強度→銘柄選択→WF/MC→RoR→DD/市場ボラ制御→注文書CSV。 build: " + APP_BUILD)
 
-with st.sidebar.expander("🧭 使い方 / 設定の意味（必読）", expanded=True):
-    st.markdown("""
-**今回の失敗の根因**：Stooq が `Exceeded the daily hits limit` を返しており、データがCSVとして取れません。  
-ULT10は **Stooq→yfinance自動フォールバック** を入れ、止まりにくくしています。
-
-推奨（Streamlit Cloud）  
-- スキャン対象上限: 600〜800  
-- 事前候補M: 25〜40  
-- 並列: 6〜10  
-- タイムバジェット: 55秒（超えたら部分結果で返す）
-""")
-
-st.sidebar.header("⚙️ 設定")
-universe_limit = st.sidebar.slider("スキャン対象上限", 200, 2500, 700, step=100)
-sector_top_n = st.sidebar.slider("上位セクター数", 2, 12, 6)
-pre_top_m = st.sidebar.slider("重い計算対象（事前候補M）", 10, 120, 35, step=5)
-top_n = st.sidebar.slider("最終採用銘柄数", 3, 10, 6)
-corr_threshold = st.sidebar.slider("相関除外しきい値", 0.3, 0.95, 0.70, step=0.05)
-
-st.sidebar.markdown("---")
-capital = st.sidebar.number_input("運用資金（円）", 100_000, 50_000_000, 1_000_000, step=100_000)
-risk_pct = st.sidebar.slider("1トレード許容リスク%", 0.3, 3.0, 1.0, step=0.1) / 100.0
-current_dd = st.sidebar.slider("現在DD%", 0.0, 30.0, 0.0, step=0.5) / 100.0
-
-st.sidebar.markdown("---")
-max_workers = st.sidebar.slider("並列数（多すぎ注意）", 3, 16, 8)
-time_budget_sec = st.sidebar.slider("タイムバジェット（秒）", 20, 90, 55, step=1)
-
-if "diag_obj" not in st.session_state:
-    st.session_state["diag_obj"] = None
-if "diag_text" not in st.session_state:
-    st.session_state["diag_text"] = ""
-
+# Always-visible progress area (top)
 prog = st.progress(0)
 status = st.empty()
 detail = st.empty()
@@ -68,6 +37,7 @@ def progress_cb(stage: str, payload: dict):
     }
     if stage in stage_map:
         prog.progress(int(stage_map[stage] * 100))
+
     if stage == "fetch_progress":
         done = payload.get("done", 0); total = payload.get("total", 1)
         ok = payload.get("ok", 0); fail = payload.get("fail", 0)
@@ -75,16 +45,76 @@ def progress_cb(stage: str, payload: dict):
         frac = 0.10 + 0.40 * (done / max(1, total))
         prog.progress(int(frac * 100))
         status.write(f"📡 取得中: {done}/{total}  OK={ok} / FAIL={fail}  prefer_yfinance={prefer_yf}")
-        detail.write(payload); return
+        if payload:
+            detail.write(payload)
+        return
+
     if stage == "heavy_progress":
         done = payload.get("done", 0); total = payload.get("total", 1)
         frac = 0.70 + 0.20 * (done / max(1, total))
         prog.progress(int(frac * 100))
         status.write(f"🧠 最適化/推定中: {done}/{total}  heavy_ok={payload.get('heavy_ok')} / heavy_fail={payload.get('heavy_fail')}")
-        detail.write(payload); return
-    status.write(f"⏳ stage: {stage}")
-    if payload: detail.write(payload)
+        if payload:
+            detail.write(payload)
+        return
 
+    status.write(f"⏳ stage: {stage}")
+    if payload:
+        detail.write(payload)
+
+# Session state for diag (robust)
+if "diag_obj" not in st.session_state:
+    st.session_state["diag_obj"] = {}
+if "diag_text" not in st.session_state:
+    st.session_state["diag_text"] = ""
+
+# Sidebar: full explanations (RESTORED)
+with st.sidebar.expander("🧭 使い方 / 設定の意味（必読）", expanded=True):
+    st.markdown("""
+### 目的
+日経（JPXマスター）から銘柄を取り、**セクター強度**で上位セクターを絞り込み、
+その中から **WF（ウォークフォワード）最適化**・**モンテカルロDD推定**・**RoR（Risk of Ruin）** を使って
+「半自動でSBI発注できる注文書CSV」を出します。
+
+### よくある失敗の原因
+- **Stooqがアクセス制限**：`Exceeded the daily hits limit` が出たら Stooq は当日使えません。  
+  → ULT11は **Stooq→yfinance自動フォールバック** します。
+
+### 各設定の意味
+- **スキャン対象上限**：最初に見る銘柄数。Cloudは 600〜900 が現実的
+- **上位セクター数**：セクターランキングの上位いくつを採用するか
+- **事前候補M（重い計算対象）**：ここから先でWF/MCを回す銘柄数（25〜40推奨）
+- **最終採用銘柄数**：発注候補（相関フィルタ後）
+- **相関除外**：似た値動きを除外（0.65〜0.80推奨）
+- **並列数**：上げすぎるとBAN/失敗が増える（6〜10推奨）
+- **タイムバジェット**：超えたら部分結果で返す（止まらない）
+
+### 出力
+- **診断JSON**：失敗しても必ず出します（原因解析用）
+- **注文書CSV**：SBI向けに「銘柄・株数・ストップ・TP」を出力
+""")
+
+# Sidebar: controls inside a form (scan button ALWAYS appears)
+st.sidebar.header("⚙️ 設定")
+with st.sidebar.form("scan_form", clear_on_submit=False):
+    universe_limit = st.slider("スキャン対象上限", 200, 2500, 800, step=100)
+    sector_top_n = st.slider("上位セクター数", 2, 12, 6)
+    pre_top_m = st.slider("重い計算対象（事前候補M）", 10, 120, 35, step=5)
+    top_n = st.slider("最終採用銘柄数", 3, 10, 6)
+    corr_threshold = st.slider("相関除外しきい値", 0.3, 0.95, 0.70, step=0.05)
+
+    st.markdown("---")
+    capital = st.number_input("運用資金（円）", 100_000, 50_000_000, 1_000_000, step=100_000)
+    risk_pct = st.slider("1トレード許容リスク%", 0.3, 3.0, 1.0, step=0.1) / 100.0
+    current_dd = st.slider("現在DD%", 0.0, 30.0, 0.0, step=0.5) / 100.0
+
+    st.markdown("---")
+    max_workers = st.slider("並列数（多すぎ注意）", 3, 16, 8)
+    time_budget_sec = st.slider("タイムバジェット（秒）", 20, 120, 70, step=1)
+
+    run = st.form_submit_button("🔥 スキャン開始", type="primary")
+
+# Market vol cached
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_market_vol():
     return logic.compute_market_vol_ratio(progress_cb=None)
@@ -95,8 +125,7 @@ with st.sidebar.expander("📉 市場ボラ（自動: 1306.T）", expanded=False
     vol_ratio, vol_meta = _cached_market_vol()
     st.write({"vol_ratio": vol_ratio, "meta": vol_meta})
 
-run = st.sidebar.button("🔥 スキャン開始", type="primary")
-
+# Download diag (sidebar + main)
 st.sidebar.subheader("🧾 診断JSON")
 if st.session_state["diag_text"]:
     st.sidebar.download_button(
@@ -117,8 +146,9 @@ if st.session_state["diag_text"]:
         mime="application/json",
     )
 else:
-    st.caption("未生成")
+    st.caption("未生成（スキャン後に出ます）")
 
+# ---------------- Run scan ----------------
 if run:
     prog.progress(1)
     status.write("開始...")
@@ -137,14 +167,21 @@ if run:
                 progress_cb=progress_cb,
             )
     except Exception as e:
-        result = {"ok": False, "error": f"main_exception: {type(e).__name__}", "diag": {"stage":"error","errors":[f"{type(e).__name__}: {e}"]}, "sector_ranking": pd.DataFrame(), "candidates": pd.DataFrame()}
+        result = {
+            "ok": False,
+            "error": f"main_exception: {type(e).__name__}",
+            "diag": {"stage": "error", "errors": [f"{type(e).__name__}: {e}"]},
+            "sector_ranking": pd.DataFrame(),
+            "candidates": pd.DataFrame(),
+        }
 
     st.session_state["diag_obj"] = result.get("diag") or {}
     st.session_state["diag_text"] = _json_dumps(st.session_state["diag_obj"])
 
     if not result.get("ok"):
         st.error("スキャンに失敗/部分終了しました。診断JSONをDLして原因を確認できます。")
-        st.write({"error": result.get("error")})
+        if result.get("error"):
+            st.write({"error": result.get("error")})
         st.markdown("### 直近の失敗サンプル（最大25件）")
         st.json((st.session_state["diag_obj"] or {}).get("sample_failures", []))
         st.markdown("### 診断JSON（表示）")
@@ -185,3 +222,4 @@ if run:
         st.json(st.session_state["diag_obj"], expanded=False)
 else:
     status.info("左の設定を決めて『スキャン開始』を押してください。")
+    prog.progress(0)
