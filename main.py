@@ -1,48 +1,79 @@
 # -*- coding: utf-8 -*-
-"""
-JPX Swing Auto Scanner — ULTIMATE FAST UI
-- Stooq一括DL対応
-- セクター強度モデル対応
-"""
+# ================================================================
+# main.py — JPX Sector-First Swing Trader (Stooq)
+# - セクター強弱 → 上位セクターだけ深掘り（全銘柄スキャン回避）
+# - 診断JSONを必ずダウンロード可能
+# ================================================================
 
-import streamlit as st
+from __future__ import annotations
+
+import json
+import hashlib
+import datetime as dt
+
 import pandas as pd
-import logic   # ← ULTIMATE版に差し替え済前提
+import streamlit as st
 
-st.set_page_config(page_title="JPX Ultimate Scanner", layout="wide")
+import logic
 
-st.title("🚀 日本株スイング自動スキャン（ULTIMATE）")
-st.caption("Stooq一括DL + セクター強度モデル")
 
-# =========================
-# Sidebar
-# =========================
+st.set_page_config(layout="wide")
+st.title("JPX Sector-First Swing Trader（セクター→銘柄でスキャン地獄回避）")
 
-st.sidebar.header("⚙️ スキャン設定")
+col1, col2, col3, col4, col5 = st.columns(5)
+capital = col1.number_input("資金（円）", value=300000, step=50000, min_value=50000)
+top_sectors = col2.number_input("上位セクター数", value=3, step=1, min_value=1, max_value=10)
+max_per_sector = col3.number_input("セクターあたり最大銘柄数", value=180, step=20, min_value=40, max_value=600)
+lot = col4.number_input("単元株（通常100）", value=100, step=100, min_value=1, max_value=1000)
+max_positions = col5.number_input("最大保有数", value=4, step=1, min_value=1, max_value=10)
 
-top_n = st.sidebar.slider("抽出銘柄数", 5, 30, 10)
-sector_top_n = st.sidebar.slider("上位セクター数", 1, 10, 5)
+st.caption("あなたの要望どおり『まずセクターを絞ってから』深掘りします。4000銘柄を全部取りに行きません。")
 
-run_btn = st.sidebar.button("🔥 スキャン開始", type="primary")
 
-# =========================
-# Run
-# =========================
+@st.cache_data(ttl=24*60*60)
+def load_jpx_universe() -> pd.DataFrame:
+    url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
+    df = pd.read_excel(url)
+    df = df[df["33業種区分"] != "-"].copy()
+    df["ticker"] = df["コード"].astype(str).str.zfill(4) + ".T"
+    df = df.rename(columns={"33業種区分": "sector"})
+    return df[["ticker", "sector"]].dropna()
 
-if run_btn:
-    with st.spinner("一括DL & 分析中（最大90秒）..."):
-        result = logic.scan_swing_candidates(
-            top_n=top_n,
-            sector_top_n=sector_top_n
+
+universe = load_jpx_universe()
+st.write(f"ユニバース: {len(universe):,} 銘柄 / セクター: {universe['sector'].nunique()}")
+
+run = st.button("🚀 セクター→銘柄スキャン開始", type="primary")
+
+if run:
+    with st.spinner("セクター強弱推定 → 上位セクター深掘り → ランキング → ポートフォリオ案…"):
+        out = logic.scan_sector_first(
+            universe,
+            capital_yen=float(capital),
+            top_sectors=int(top_sectors),
+            max_per_sector=int(max_per_sector),
+            lot=int(lot),
+            max_positions=int(max_positions),
         )
 
-    st.success("完了")
+    st.success(f"完了: {out['meta']['elapsed_sec']:.1f}s（dynamic_delay={out['meta']['dynamic_delay_sec']:.2f}s）")
 
-    st.markdown("## 🏆 セクター強度ランキング")
-    st.dataframe(result["sector_ranking"], use_container_width=True)
+    payload = json.dumps(out, ensure_ascii=False, indent=2)
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
+    fname = f"scan_result_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_{digest}.json"
+    st.download_button("⬇️ 診断JSONをダウンロード", data=payload, file_name=fname, mime="application/json")
 
-    st.markdown("## 🎯 上位銘柄")
-    st.dataframe(result["candidates"], use_container_width=True)
+    st.subheader("セクター強弱スコア")
+    sec_df = pd.DataFrame([{"sector": k, "score": v} for k, v in out["sector_scores"].items()]).sort_values("score", ascending=False)
+    st.dataframe(sec_df, use_container_width=True, height=280)
 
-else:
-    st.info("左のサイドバーからスキャン開始")
+    st.subheader("選択セクター（上位）")
+    st.write(out["chosen_sectors"])
+
+    st.subheader("ランキング（上位50）")
+    st.dataframe(pd.DataFrame(out["ranked"][:50]), use_container_width=True, height=440)
+
+    st.subheader("推奨ポートフォリオ案")
+    st.dataframe(pd.DataFrame(out["portfolio"]), use_container_width=True, height=260)
+
+    st.info("上位セクターだけを深掘りします。精度↑にしたければ『セクターあたり最大銘柄数』を上げ、速度↑にしたければ下げてください。")
