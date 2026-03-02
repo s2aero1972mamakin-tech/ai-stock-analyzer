@@ -1,45 +1,61 @@
-
 # -*- coding: utf-8 -*-
-import streamlit as st
+# main.py — Sector-First Trader (Robust)
+
+from __future__ import annotations
+
+import json
+import hashlib
+import datetime as dt
 import pandas as pd
+import streamlit as st
 import logic
 
-st.set_page_config(page_title="JPX Ultimate Scanner", layout="wide")
-st.title("🚀 日本株スイング自動スキャン（ULTIMATE6）")
+st.set_page_config(layout="wide")
+st.title("JPX Sector-First Swing Trader（セクター→銘柄 / 取得堅牢化）")
 
-st.sidebar.header("⚙️ 設定")
-top_n = st.sidebar.slider("抽出銘柄数", 5, 30, 10)
-sector_top_n = st.sidebar.slider("上位セクター数", 1, 10, 5)
-capital = st.sidebar.number_input("運用資金（円）", 100000, 10000000, 500000, step=100000)
-risk_pct = st.sidebar.slider("1トレード許容リスク%", 0.5, 3.0, 1.0) / 100
+col1, col2, col3, col4 = st.columns(4)
+capital = col1.number_input("資金（円）", value=300000, step=50000, min_value=50000)
+top_sectors = col2.number_input("上位セクター数", value=3, step=1, min_value=1, max_value=10)
+max_per_sector = col3.number_input("セクターあたり最大銘柄数", value=180, step=20, min_value=40, max_value=600)
+lot = col4.number_input("単元株（通常100）", value=100, step=100, min_value=1, max_value=1000)
 
-if st.sidebar.button("🔥 スキャン開始", type="primary"):
-    with st.spinner("分析中..."):
-        result = logic.scan_swing_candidates(top_n=top_n, sector_top_n=sector_top_n)
+@st.cache_data(ttl=24*60*60)
+def load_jpx_universe() -> pd.DataFrame:
+    url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
+    df = pd.read_excel(url)
+    df = df[df["33業種区分"] != "-"].copy()
+    df["ticker"] = df["コード"].astype(str).str.zfill(4) + ".T"
+    df = df.rename(columns={"33業種区分": "sector"})
+    return df[["ticker","sector"]].dropna()
 
-    st.success("完了")
+universe = load_jpx_universe()
+st.write(f"ユニバース: {len(universe):,} 銘柄 / セクター: {universe['sector'].nunique()}")
 
-    st.markdown("## 🏆 セクター強度ランキング")
-    st.dataframe(result["sector_ranking"], use_container_width=True)
-
-    st.markdown("## 🎯 上位銘柄")
-    st.dataframe(result["candidates"], use_container_width=True)
-
-    # 注文書生成
-    orders = []
-    for _, row in result["candidates"].iterrows():
-        plan = logic.build_trade_plan(
-            price=row["Close"],
-            atr=row["ATR"],
-            capital=capital,
-            risk_pct=risk_pct
+if st.button("🚀 セクター→銘柄スキャン開始", type="primary"):
+    with st.spinner("セクター推定 → 上位セクター深掘り…"):
+        out = logic.scan_sector_first(
+            universe,
+            capital_yen=float(capital),
+            top_sectors=int(top_sectors),
+            max_per_sector=int(max_per_sector),
+            lot=int(lot),
         )
-        plan.update({"Symbol": row["Symbol"], "name": row["name"]})
-        orders.append(plan)
 
-    orders_df = pd.DataFrame(orders)
-    st.markdown("## 📝 注文書（実行用）")
-    st.dataframe(orders_df, use_container_width=True)
+    st.success(f"完了: {out['meta']['elapsed_sec']:.1f}s")
+    st.subheader("診断（取得状況）")
+    st.json(out["meta"]["diagnostics"])
 
-    csv = orders_df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("⬇️ 注文書CSVダウンロード", csv, "orders.csv", "text/csv")
+    if out["meta"]["diagnostics"].get("global_fetch_failed"):
+        st.error("価格データ取得がほぼ全滅しています。診断の http_status_counts を確認してください（403/429が多いなら取得元がブロックしている可能性大）。")
+
+    payload = json.dumps(out, ensure_ascii=False, indent=2)
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
+    fname = f"scan_result_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_{digest}.json"
+    st.download_button("⬇️ 診断JSONをダウンロード", data=payload, file_name=fname, mime="application/json")
+
+    st.subheader("セクター強弱スコア")
+    sec_df = pd.DataFrame([{"sector": k, "score": v} for k, v in out["sector_scores"].items()]).sort_values("score", ascending=False)
+    st.dataframe(sec_df, use_container_width=True, height=320)
+
+    st.subheader("ランキング（上位50）")
+    st.dataframe(pd.DataFrame(out["ranked"][:50]), use_container_width=True, height=440)
