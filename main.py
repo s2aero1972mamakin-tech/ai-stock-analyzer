@@ -1,79 +1,579 @@
+# main.py
 # -*- coding: utf-8 -*-
-# ================================================================
-# main.py — JPX Sector-First Swing Trader (Stooq)
-# - セクター強弱 → 上位セクターだけ深掘り（全銘柄スキャン回避）
-# - 診断JSONを必ずダウンロード可能
-# ================================================================
+"""
+JPX Swing Auto Scanner (Stooq) — STABLE5c-2026-02-28 (FULL)
+- 診断JSONを「スキャン開始時点」で生成し、途中でも必ずDL可能
+- Streamlitの描画順/再実行の罠を回避：queued → calling_scan → done/error の二段階実行
+- JPX銘柄ユニバースは、JPX公式の「東証上場銘柄一覧（33業種）」Excelを取得して生成（CSV不要）
+"""
 
 from __future__ import annotations
 
-import json
+import dataclasses
+import datetime as _dt
 import hashlib
-import datetime as dt
+import json
+import os
+import traceback
 
 import pandas as pd
 import streamlit as st
 
 import logic
 
-
-st.set_page_config(layout="wide")
-st.title("JPX Sector-First Swing Trader（セクター→銘柄でスキャン地獄回避）")
-
-col1, col2, col3, col4, col5 = st.columns(5)
-capital = col1.number_input("資金（円）", value=300000, step=50000, min_value=50000)
-top_sectors = col2.number_input("上位セクター数", value=3, step=1, min_value=1, max_value=10)
-max_per_sector = col3.number_input("セクターあたり最大銘柄数", value=180, step=20, min_value=40, max_value=600)
-lot = col4.number_input("単元株（通常100）", value=100, step=100, min_value=1, max_value=1000)
-max_positions = col5.number_input("最大保有数", value=4, step=1, min_value=1, max_value=10)
-
-st.caption("あなたの要望どおり『まずセクターを絞ってから』深掘りします。4000銘柄を全部取りに行きません。")
+APP_BUILD = "STABLE5c-2026-02-28"
+TMP_DIAG_PATH = "/tmp/ai_stock_scan_diag_latest.json"
+STALL_SECONDS = 180  # 中断検知（更新停止）
 
 
-@st.cache_data(ttl=24*60*60)
-def load_jpx_universe() -> pd.DataFrame:
-    url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
-    df = pd.read_excel(url)
-    df = df[df["33業種区分"] != "-"].copy()
-    df["ticker"] = df["コード"].astype(str).str.zfill(4) + ".T"
-    df = df.rename(columns={"33業種区分": "sector"})
-    return df[["ticker", "sector"]].dropna()
+def _json_dumps(obj) -> str:
+    def default(o):
+        try:
+            if dataclasses.is_dataclass(o):
+                return dataclasses.asdict(o)
+        except Exception:
+            pass
+        if isinstance(o, (pd.Timestamp, _dt.datetime, _dt.date)):
+            return str(o)
+        if hasattr(o, "item"):
+            try:
+                return o.item()
+            except Exception:
+                pass
+        return str(o)
+
+    return json.dumps(obj, ensure_ascii=False, indent=2, default=default)
 
 
-universe = load_jpx_universe()
-st.write(f"ユニバース: {len(universe):,} 銘柄 / セクター: {universe['sector'].nunique()}")
+def _save_diag_tmp(diag: dict) -> None:
+    try:
+        with open(TMP_DIAG_PATH, "w", encoding="utf-8") as f:
+            f.write(_json_dumps(diag))
+    except Exception:
+        pass
 
-run = st.button("🚀 セクター→銘柄スキャン開始", type="primary")
 
-if run:
-    with st.spinner("セクター強弱推定 → 上位セクター深掘り → ランキング → ポートフォリオ案…"):
-        out = logic.scan_sector_first(
-            universe,
-            capital_yen=float(capital),
-            top_sectors=int(top_sectors),
-            max_per_sector=int(max_per_sector),
-            lot=int(lot),
-            max_positions=int(max_positions),
+def _load_diag_tmp() -> dict | None:
+    try:
+        if os.path.exists(TMP_DIAG_PATH):
+            with open(TMP_DIAG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        return None
+    return None
+
+
+
+def _maybe_mark_interrupted(diag: dict) -> dict:
+    """updated_at が一定時間更新されない running を interrupted 扱い"""
+    try:
+        if not diag:
+            return diag
+        if diag.get("status") != "running":
+            return diag
+        ua = diag.get("updated_at")
+        if not ua:
+            return diag
+        last = _dt.datetime.fromisoformat(str(ua))
+        if (_dt.datetime.now() - last).total_seconds() > STALL_SECONDS:
+            diag["status"] = "interrupted"
+            diag["stage"] = "stalled"
+            diag["error"] = diag.get("error") or "progress更新が一定時間止まったため interrupted 扱い"
+            diag["updated_at"] = str(_dt.datetime.now())
+            _save_diag_tmp(diag)
+    except Exception:
+        pass
+    return diag
+
+
+def _ensure_state_defaults():
+    defaults = {
+        "pending_scan": False,
+        "scan_start_index": 0,
+        "has_scanned_once": False,
+        "auto_candidates": [],
+        "partial_candidates": [],
+        "scan_meta": {},
+        "target_ticker": "",
+        "pair_label": "",
+        "last_scan_diag": None,
+        "_dropped_param_keys": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def build_swing_params_safe(**kwargs) -> logic.SwingParams:
+    allowed = {f.name for f in dataclasses.fields(logic.SwingParams)}
+    safe = {k: v for k, v in kwargs.items() if k in allowed}
+    dropped = sorted([k for k in kwargs.keys() if k not in safe])
+    st.session_state["_dropped_param_keys"] = dropped if dropped else None
+    return logic.SwingParams(**safe)
+
+
+def _render_scan_diag_sidebar(slot, *, expanded: bool, title: str):
+    tag = hashlib.md5(title.encode("utf-8")).hexdigest()[:10]
+
+    diag = st.session_state.get("last_scan_diag")
+    if not diag:
+        diag = _load_diag_tmp()
+        if diag:
+            st.session_state["last_scan_diag"] = diag
+
+    with slot.container():
+        st.sidebar.caption(f"build: {APP_BUILD}")
+        st.sidebar.subheader(title)
+
+        cols = st.sidebar.columns([1, 1, 2])
+        if cols[0].button("🧹 診断をクリア", key=f"btn_clear_diag_{tag}"):
+            st.session_state["last_scan_diag"] = None
+            _save_diag_tmp({})
+            st.rerun()
+
+        if cols[1].button("📦 /tmp から再読込", key=f"btn_reload_diag_{tag}"):
+            d = _load_diag_tmp()
+            if d:
+                st.session_state["last_scan_diag"] = d
+            st.rerun()
+
+        if not diag:
+            st.sidebar.info("診断JSONはスキャン開始時点で生成されます（途中でもDL可）。")
+            return
+
+        ts = str(diag.get("timestamp", "diag")).replace(":", "-").replace(" ", "_")
+        st.sidebar.download_button(
+            "⬇️ 診断JSONをダウンロード（途中でも可）",
+            data=_json_dumps(diag),
+            file_name=f"scan_diag_{ts}.json",
+            mime="application/json",
+            key=f"dl_diag_{tag}",
         )
 
-    st.success(f"完了: {out['meta']['elapsed_sec']:.1f}s（dynamic_delay={out['meta']['dynamic_delay_sec']:.2f}s）")
+        st.sidebar.markdown(
+            f"- status: **{diag.get('status','')}**\n"
+            f"- stage: **{diag.get('stage','')}**\n"
+            f"- mode: **{diag.get('mode','')}**\n"
+            f"- updated_at: **{diag.get('updated_at','')}**"
+        )
+        dropped = st.session_state.get("_dropped_param_keys")
+        if dropped:
+            st.sidebar.warning("main/logicの不一致で無視したパラメータ: " + ", ".join(dropped))
 
-    payload = json.dumps(out, ensure_ascii=False, indent=2)
-    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
-    fname = f"scan_result_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_{digest}.json"
-    st.download_button("⬇️ 診断JSONをダウンロード", data=payload, file_name=fname, mime="application/json")
+        with st.sidebar.expander("🧾 診断JSON（表示）", expanded=expanded):
+            st.json(diag, expanded=False)
 
-    st.subheader("セクター強弱スコア")
-    sec_df = pd.DataFrame([{"sector": k, "score": v} for k, v in out["sector_scores"].items()]).sort_values("score", ascending=False)
-    st.dataframe(sec_df, use_container_width=True, height=280)
 
-    st.subheader("選択セクター（上位）")
-    st.write(out["chosen_sectors"])
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="JPX Swing Auto Scanner", layout="wide")
+_ensure_state_defaults()
 
-    st.subheader("ランキング（上位50）")
-    st.dataframe(pd.DataFrame(out["ranked"][:50]), use_container_width=True, height=440)
+st.title("📈 日本株スイング自動スキャン（Stooq）")
+st.caption("JPXユニバースはJPX公式Excelから生成（CSV不要）。診断JSONは常時DL可。")
 
-    st.subheader("推奨ポートフォリオ案")
-    st.dataframe(pd.DataFrame(out["portfolio"]), use_container_width=True, height=260)
+diag_slot = st.sidebar.empty()
+_render_scan_diag_sidebar(diag_slot, expanded=False, title="🧾 診断JSON（常時表示）")
 
-    st.info("上位セクターだけを深掘りします。精度↑にしたければ『セクターあたり最大銘柄数』を上げ、速度↑にしたければ下げてください。")
+st.sidebar.header("⚙️ スキャン設定")
+budget = st.sidebar.number_input("想定資金（円）", min_value=50_000, max_value=5_000_000, value=300_000, step=50_000)
+capital = st.sidebar.number_input("運用資金（円）", min_value=50_000, max_value=20_000_000, value=300_000, step=50_000)
+risk_pct = st.sidebar.slider("許容損失（1トレード）%", 0.1, 3.0, 1.0, step=0.1) / 100.0
+
+entry_mode_label = st.sidebar.selectbox("モード", ["押し目（pullback）", "ブレイクアウト（breakout）"], index=0)
+entry_mode = "pullback" if entry_mode_label.startswith("押し目") else "breakout"
+
+require_trend = st.sidebar.checkbox("SMA25 > SMA75 を必須", value=True)
+rsi_low = st.sidebar.slider("RSI下限", 10.0, 60.0, 40.0, step=1.0)
+rsi_high = st.sidebar.slider("RSI上限", 40.0, 90.0, 70.0, step=1.0)
+
+pb_low = st.sidebar.slider("押し目下限（SMA25乖離%）", -25.0, 0.0, -8.0, step=0.5)
+pb_high = st.sidebar.slider("押し目上限（SMA25乖離%）", -15.0, 5.0, -3.0, step=0.5)
+
+atr_min = st.sidebar.slider("ATR%下限", 0.5, 12.0, 1.5, step=0.5)
+atr_max = st.sidebar.slider("ATR%上限", 1.0, 25.0, 10.0, step=0.5)
+
+vol_min = st.sidebar.number_input("平均出来高(20日) 下限", min_value=0, max_value=10_000_000, value=50_000, step=10_000)
+turnover_min_yen = st.sidebar.number_input("平均売買代金(20日) 下限（円）", min_value=0, max_value=50_000_000_000, value=0, step=10_000_000)
+
+breakout_lookback = st.sidebar.slider("高値更新参照日数", 5, 60, 20, step=1)
+breakout_vol_ratio = st.sidebar.slider("出来高倍率（当日/20日平均）", 1.0, 5.0, 1.6, step=0.1)
+
+atr_mult = st.sidebar.slider("損切: ATR倍率", 0.8, 3.5, 2.0, step=0.1)
+tp1_r = st.sidebar.slider("利確1: +何Rで半分利確", 0.5, 2.0, 1.0, step=0.1)
+tp2_r = st.sidebar.slider("利確2: +何Rを狙う", 1.5, 6.0, 3.0, step=0.5)
+time_stop_days = st.sidebar.slider("時間切れ（日）", 3, 20, 10, step=1)
+
+bt_period = st.sidebar.selectbox("バックテスト期間", ["1y", "2y", "3y", "5y"], index=1)
+bt_topk = st.sidebar.slider("バックテスト対象（上位K）", 5, 60, 20, step=5)
+
+sector_prefilter = st.sidebar.checkbox("セクター事前絞り込み（推奨）", value=True)
+sector_top_n = st.sidebar.slider("上位セクター数", 2, 12, 6, step=1)
+
+st.sidebar.markdown("---")
+scan_btn = st.sidebar.button("🔥 スキャン開始", type="primary")
+
+params = build_swing_params_safe(
+    require_sma25_over_sma75=bool(require_trend),
+    entry_mode=str(entry_mode),
+    rsi_low=float(rsi_low),
+    rsi_high=float(rsi_high),
+    pullback_low=float(pb_low),
+    pullback_high=float(pb_high),
+    atr_pct_min=float(atr_min),
+    atr_pct_max=float(atr_max),
+    vol_avg20_min=float(vol_min),
+    turnover_avg20_min_yen=float(turnover_min_yen),
+    breakout_lookback=int(breakout_lookback),
+    breakout_vol_ratio=float(breakout_vol_ratio),
+    atr_mult_stop=float(atr_mult),
+    tp1_r=float(tp1_r),
+    tp2_r=float(tp2_r),
+    time_stop_days=int(time_stop_days),
+    risk_pct=float(risk_pct),
+)
+
+# -------- Two-phase execution --------
+if scan_btn:
+    st.session_state["pending_scan"] = True
+    st.session_state["scan_start_index"] = 0
+    st.session_state["has_scanned_once"] = True
+    st.session_state["last_scan_diag"] = {
+        "timestamp": str(_dt.datetime.now()),
+        "updated_at": str(_dt.datetime.now()),
+        "status": "running",
+        "stage": "queued",
+        "mode": entry_mode,
+        "relax_level": 0,
+        "selected_sectors": [],
+        "filter_stats": {},
+        "params_effective": dataclasses.asdict(params),
+        "auto_relax_trace": [],
+        "progress": {"current": 0, "total": 0, "info": "queued"},
+        "cursor_index": int(st.session_state.get("scan_start_index", 0)),
+        "fail_data_reason": {},
+        "timing": {"fetch_sec": 0.0, "parse_sec": 0.0, "indicators_sec": 0.0, "total_sec": 0.0},
+        "last_ticker": "",
+        "error_ring": [],
+    }
+    _save_diag_tmp(st.session_state["last_scan_diag"])
+    _render_scan_diag_sidebar(diag_slot, expanded=False, title="🧾 診断JSON（実行開始）")
+    st.rerun()
+
+if st.session_state.get("pending_scan"):
+    st.session_state["pending_scan"] = False
+
+    diag = st.session_state.get("last_scan_diag") or {}
+    diag.update(
+        {
+            "updated_at": str(_dt.datetime.now()),
+            "status": "running",
+            "stage": "calling_scan",
+            "progress": {"current": 0, "total": 0, "info": "calling_scan"},
+        }
+    )
+    st.session_state["last_scan_diag"] = diag
+    _save_diag_tmp(diag)
+    _render_scan_diag_sidebar(diag_slot, expanded=False, title="🧾 診断JSON（呼び出し直前）")
+
+    
+    progress_bar = st.empty()
+
+
+    
+    status_text = st.empty()
+
+
+
+    
+    def update_progress(current: int, total: int, info: str, partial=None, stats=None):
+
+
+    
+        pct = int((current / max(1, total)) * 100)
+
+
+    
+        progress_bar.progress(min(100, max(0, pct)))
+
+
+    
+        status_text.text(f"🔍 {info} ({current}/{total})")
+
+
+    
+        d = st.session_state.get("last_scan_diag") or {}
+
+
+    
+        d["updated_at"] = str(_dt.datetime.now())
+
+
+    
+        d["status"] = "running"
+
+
+    
+        d["stage"] = "scanning"
+
+
+    
+        d["progress"] = {"current": int(current), "total": int(total), "info": str(info)}
+
+
+    
+        st.session_state["last_scan_diag"] = d
+
+
+    
+        _save_diag_tmp(d)
+
+
+    
+        if stats is not None:
+
+
+    
+            d["filter_stats"] = stats
+
+
+    
+            st.session_state["last_scan_diag"] = d
+
+
+    
+            _save_diag_tmp(d)
+
+
+    
+        if partial is not None:
+
+
+    
+            st.session_state["partial_candidates"] = partial
+
+
+
+    
+    try:
+
+
+    
+        with st.status("スキャン＆バックテスト中…", expanded=True) as status:
+
+
+    
+            res = logic.scan_swing_candidates(
+
+
+    
+                budget_yen=int(budget),
+
+
+    
+                top_n=3,
+
+
+    
+                params=params,
+
+
+    
+                progress_callback=update_progress,
+
+
+    
+                backtest_period=bt_period,
+
+
+    
+                backtest_topk=int(bt_topk),
+
+
+    
+                sector_prefilter=bool(sector_prefilter),
+
+
+    
+                sector_top_n=int(sector_top_n),
+
+
+    
+                start_index=int(st.session_state.get('scan_start_index', 0)),
+
+
+    
+                diag=st.session_state.get('last_scan_diag'),
+
+
+    
+            )
+
+
+
+    
+            candidates = res.get("candidates", []) or []
+
+
+    
+            st.session_state["auto_candidates"] = candidates
+
+
+    
+            st.session_state["scan_meta"] = res
+
+
+
+    
+            diag = st.session_state.get("last_scan_diag") or {}
+
+
+    
+            diag = {
+
+
+    
+                **diag,
+
+
+    
+                "updated_at": str(_dt.datetime.now()),
+
+
+    
+                "status": "ok",
+
+
+    
+                "stage": "done",
+
+
+    
+                "mode": res.get("mode", entry_mode),
+
+
+    
+                "relax_level": res.get("relax_level", 0),
+
+
+    
+                "selected_sectors": res.get("selected_sectors", []),
+
+
+    
+                "filter_stats": res.get("filter_stats", {}),
+
+
+    
+                "params_effective": res.get("params_effective", dataclasses.asdict(params)),
+
+
+    
+                "auto_relax_trace": res.get("auto_relax_trace", []),
+
+
+    
+                "error": res.get("error"),
+
+
+    
+                "progress": {"current": 1, "total": 1, "info": "done"},
+
+
+    
+            }
+
+
+    
+            st.session_state["last_scan_diag"] = diag
+
+
+    
+            _save_diag_tmp(diag)
+
+
+    
+            _render_scan_diag_sidebar(diag_slot, expanded=False, title="🧾 診断JSON（完了）")
+
+
+
+    
+            if candidates:
+
+
+    
+                status.update(label="✅ 完了：候補を抽出しました", state="complete", expanded=False)
+
+
+    
+            else:
+
+
+    
+                status.update(label="⚠️ 完了：候補が0件でした（診断JSONを確認）", state="complete", expanded=True)
+
+
+
+    
+    except Exception as e:
+
+
+    
+        diag = st.session_state.get("last_scan_diag") or {}
+
+
+    
+        diag.update(
+
+
+    
+            {
+
+
+    
+                "updated_at": str(_dt.datetime.now()),
+
+
+    
+                "status": "error",
+
+
+    
+                "stage": "error",
+
+
+    
+                "error": f"{type(e).__name__}: {e}",
+
+
+    
+                "traceback": traceback.format_exc(),
+
+
+    
+            }
+
+
+    
+        )
+
+
+    
+        st.session_state["last_scan_diag"] = diag
+
+
+    
+        _save_diag_tmp(diag)
+
+
+    
+        _render_scan_diag_sidebar(diag_slot, expanded=True, title="🧾 診断JSON（例外）")
+
+
+    
+        st.exception(e)
+
+
+# -----------------------------
+# Results
