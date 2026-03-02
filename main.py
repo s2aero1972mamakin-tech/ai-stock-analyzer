@@ -287,7 +287,7 @@ if st.session_state.get("pending_scan"):
 
 
     
-    def update_progress(current: int, total: int, info: str, partial=None, stats=None):
+    def update_progress(current: int, total: int, info: str, partial=None, stats=None, **kwargs):
 
 
     
@@ -320,6 +320,11 @@ if st.session_state.get("pending_scan"):
 
     
         d["progress"] = {"current": int(current), "total": int(total), "info": str(info)}
+
+        # FIXED7.1: optional resume diagnostics
+        if 'cursor_index' in kwargs and kwargs['cursor_index'] is not None:
+            d['cursor_index'] = int(kwargs['cursor_index'])
+
 
 
     
