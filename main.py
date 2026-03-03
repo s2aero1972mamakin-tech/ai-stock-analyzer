@@ -112,9 +112,9 @@ atr_pct_max = st.sidebar.number_input("ATR% 上限", min_value=0.0, value=8.0, s
 
 st.sidebar.markdown("---")
 st.sidebar.header("🔄 DB更新（増分）")
-update_days_back = st.sidebar.slider("更新取得日数（直近）", 3, 60, 14, 1)
-keep_days = st.sidebar.slider("DB保持日数（古い分は削除）", 120, 900, 400, 10)
-chunk_size = st.sidebar.slider("一括取得チャンク", 50, 600, 200, 50)
+update_days_back = st.sidebar.slider("更新取得日数（直近）", 3, 365, 120, 1)
+keep_days = st.sidebar.slider("DB保持日数（古い分は削除）", 120, 2000, 600, 10)
+chunk_size = st.sidebar.slider("一括取得チャンク", 20, 300, 120, 10)
 
 col1, col2 = st.sidebar.columns(2)
 with col1:
