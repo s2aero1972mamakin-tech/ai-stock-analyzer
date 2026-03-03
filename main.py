@@ -13,7 +13,7 @@ JST = timezone(timedelta(hours=9))
 
 st.set_page_config(page_title="JPX 利確銘柄抽出AI", layout="wide")
 
-st.title("📈 JPX 利確が取れる銘柄抽出AI（数日〜2週間 / 固定TP・SL）")
+st.title("JPX Swing AI")
 st.caption("固定条件：最大保有10営業日 / 利確=+1.5ATR(14) / 損切=-1.0ATR(14)  —  DB: Neon(Postgres)")
 
 # --- Streamlit secrets -> env bridge ---
@@ -110,6 +110,9 @@ min_avg_volume = st.sidebar.number_input("最低出来高（20日平均）", min
 atr_pct_min = st.sidebar.number_input("ATR% 下限", min_value=0.0, value=1.0, step=0.1)
 atr_pct_max = st.sidebar.number_input("ATR% 上限", min_value=0.0, value=8.0, step=0.5)
 
+stage2_days = st.sidebar.slider("Stage2 利確評価に使う履歴日数", 60, 365, 180, 5)
+stage2_min_bars = st.sidebar.slider("Stage2 最低バー数（短期は暫定評価）", 40, 140, 60, 5)
+
 st.sidebar.markdown("---")
 st.sidebar.header("🔄 DB更新（増分）")
 update_days_back = st.sidebar.slider("更新取得日数（直近）", 3, 365, 120, 1)
@@ -174,6 +177,8 @@ if run_scan:
                 min_avg_volume=min_avg_volume,
                 atr_pct_min=atr_pct_min,
                 atr_pct_max=atr_pct_max,
+                stage2_days=stage2_days,
+                stage2_min_bars=stage2_min_bars,
             )
         elapsed = time.time() - t0
         diag = out.get("diag", {})
