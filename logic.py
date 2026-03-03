@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -39,112 +40,11 @@ def driver_diagnostics() -> Dict[str, Any]:
         info["psycopg2"] = {"error": repr(e)}
     return info
 
-
-def universe_count() -> int:
-    try:
-        conn = _connect()
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM universe_symbols")
-            n = int(cur.fetchone()[0])
-        conn.close()
-        return n
-    except Exception:
-        return 0
-
-
-def universe_upsert(symbols, name_map=None, market_map=None, sector_map=None) -> int:
-    name_map = name_map or {}
-    market_map = market_map or {}
-    sector_map = sector_map or {}
-    symbols = [s.strip() for s in symbols if str(s).strip()]
-    # normalize: add .T if looks like 4-digit code
-    norm = []
-    for s in symbols:
-        s2 = s.replace(" ", "").upper()
-        if re.fullmatch(r"\d{4}", s2):
-            s2 = s2 + ".T"
-        norm.append(s2)
-    # unique
-    uniq = []
-    seen = set()
-    for s in norm:
-        if s and s not in seen:
-            seen.add(s)
-            uniq.append(s)
-
-    if not uniq:
-        return 0
-
-    conn = _connect()
-    with conn.cursor() as cur:
-        for sym in uniq:
-            cur.execute(
-                "INSERT INTO universe_symbols(symbol, name, market, sector, updated_utc) "
-                "VALUES(%s,%s,%s,%s,NOW()) "
-                "ON CONFLICT(symbol) DO UPDATE SET "
-                "name=EXCLUDED.name, market=EXCLUDED.market, sector=EXCLUDED.sector, updated_utc=NOW()",
-                (sym, name_map.get(sym), market_map.get(sym), sector_map.get(sym)),
-            )
-    conn.commit()
-    conn.close()
-    return len(uniq)
-
-
-def universe_load_symbols(limit=None):
-    conn = _connect()
-    with conn.cursor() as cur:
-        if limit:
-            cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol LIMIT %s", (int(limit),))
-        else:
-            cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol")
-        rows = cur.fetchall()
-    conn.close()
-    return [r[0] for r in rows]
-
-
-def universe_register_from_inputs(uploaded_csv_file, pasted_text: str):
-    # returns (count, message)
-    symbols = []
-    try:
-        if uploaded_csv_file is not None:
-            import pandas as pd
-            df = pd.read_csv(uploaded_csv_file)
-            cols = [c.lower() for c in df.columns]
-            pick = None
-            for c in ["ticker", "symbol", "code"]:
-                if c in cols:
-                    pick = df.columns[cols.index(c)]
-                    break
-            if pick is None:
-                return 0, "CSVに ticker / symbol / code 列が見つかりません。"
-            symbols += [str(x).strip() for x in df[pick].dropna().tolist()]
-    except Exception as e:
-        return 0, f"CSV読込に失敗: {e}"
-
-    if pasted_text and pasted_text.strip():
-        for line in pasted_text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            # allow comma-separated on a line
-            parts = [p.strip() for p in re.split(r"[\s,]+", line) if p.strip()]
-            symbols += parts
-
-    if not symbols:
-        return 0, "入力が空です。CSVをアップロードするか、銘柄を貼り付けてください。"
-
-    try:
-        n = universe_upsert(symbols)
-        return n, "ok"
-    except Exception as e:
-        return 0, f"DB登録に失敗: {e}"
 def _connect():
     url = _get_db_url()
     if not url:
         raise RuntimeError("NEON_DATABASE_URL not set")
 
-    # Streamlit CloudはPython 3.13系が多く、psycopg2-binary がimport失敗するケースがあります。
-    # そのため psycopg(3) を優先し、だめなら psycopg2 にフォールバックします。
     psycopg_err = None
     psycopg2_err = None
 
@@ -161,35 +61,41 @@ def _connect():
         psycopg2_err = repr(e)
 
     raise RuntimeError(
-        "Postgresドライバをimportできませんでした。\n"
-        "推奨: requirements.txt に『psycopg[binary]』（または psycopg-binary）を追加し、psycopg2-binary は削除してください。\n"
-        f"psycopg import error: {psycopg_err}\n"
-        f"psycopg2 import error: {psycopg2_err}"
+        "Postgresドライバをimport/接続できませんでした。\n"
+        f"psycopg error: {psycopg_err}\n"
+        f"psycopg2 error: {psycopg2_err}"
     )
 
-def ensure_schema():
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS ohlc_daily (
-                symbol TEXT NOT NULL,
-                trade_date DATE NOT NULL,
-                open DOUBLE PRECISION,
-                high DOUBLE PRECISION,
-                low DOUBLE PRECISION,
-                close DOUBLE PRECISION,
-                adj_close DOUBLE PRECISION,
-                volume BIGINT,
-                PRIMARY KEY(symbol, trade_date)
-            );
-            """)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS kv_meta (
-                k TEXT PRIMARY KEY,
-                v TEXT
-            );
-            """)
-        conn.commit()
+def ensure_schema() -> None:
+    conn = _connect()
+    with conn.cursor() as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ohlc_daily (
+            symbol TEXT NOT NULL,
+            trade_date DATE NOT NULL,
+            open DOUBLE PRECISION,
+            high DOUBLE PRECISION,
+            low DOUBLE PRECISION,
+            close DOUBLE PRECISION,
+            adj_close DOUBLE PRECISION,
+            volume BIGINT,
+            PRIMARY KEY(symbol, trade_date)
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS kv_meta (
+            k TEXT PRIMARY KEY,
+            v TEXT
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS universe_symbols (
+            symbol TEXT PRIMARY KEY,
+            updated_utc TIMESTAMP DEFAULT NOW()
+        );
+        """)
+    conn.commit()
+    conn.close()
 
 def _set_meta(conn, k: str, v: str):
     with conn.cursor() as cur:
@@ -204,18 +110,111 @@ def _get_meta(conn, k: str) -> Optional[str]:
         row = cur.fetchone()
     return row[0] if row else None
 
+def universe_count() -> int:
+    ensure_schema()
+    conn = _connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM universe_symbols;")
+        n = int(cur.fetchone()[0] or 0)
+    conn.close()
+    return n
+
+def universe_upsert(symbols: List[str]) -> int:
+    ensure_schema()
+    # normalize
+    norm = []
+    for s in symbols:
+        s = str(s).strip()
+        if not s:
+            continue
+        s2 = s.replace(" ", "").upper()
+        if re.fullmatch(r"\d{4}", s2):
+            s2 = s2 + ".T"
+        norm.append(s2)
+    # unique preserve order
+    seen = set()
+    uniq = []
+    for s in norm:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    if not uniq:
+        return 0
+
+    conn = _connect()
+    with conn.cursor() as cur:
+        for sym in uniq:
+            cur.execute(
+                "INSERT INTO universe_symbols(symbol, updated_utc) VALUES(%s, NOW()) "
+                "ON CONFLICT(symbol) DO UPDATE SET updated_utc=NOW();",
+                (sym,),
+            )
+    conn.commit()
+    conn.close()
+    return len(uniq)
+
+def universe_load_symbols(limit: Optional[int] = None) -> List[str]:
+    ensure_schema()
+    conn = _connect()
+    with conn.cursor() as cur:
+        if limit:
+            cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol LIMIT %s;", (int(limit),))
+        else:
+            cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol;")
+        rows = cur.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def universe_register_from_inputs(uploaded_csv_file, pasted_text: str):
+    symbols: List[str] = []
+    if uploaded_csv_file is not None:
+        try:
+            df = pd.read_csv(uploaded_csv_file)
+            cols = [c.lower() for c in df.columns]
+            pick = None
+            for c in ["ticker", "symbol", "code"]:
+                if c in cols:
+                    pick = df.columns[cols.index(c)]
+                    break
+            if pick is None:
+                return 0, "CSVに ticker / symbol / code 列が見つかりません。"
+            symbols += [str(x).strip() for x in df[pick].dropna().tolist()]
+        except Exception as e:
+            return 0, f"CSV読込に失敗: {e}"
+
+    if pasted_text and pasted_text.strip():
+        for line in pasted_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in re.split(r"[\s,]+", line) if p.strip()]
+            symbols += parts
+
+    if not symbols:
+        return 0, "入力が空です。CSVをアップロードするか、銘柄を貼り付けてください。"
+
+    try:
+        n = universe_upsert(symbols)
+        return n, "ok"
+    except Exception as e:
+        return 0, f"DB登録に失敗: {e}"
+
 def get_db_status() -> Dict[str, Any]:
     try:
         ensure_schema()
-        with _connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(DISTINCT symbol) FROM ohlc_daily;")
-                symbols_count = int(cur.fetchone()[0] or 0)
-                cur.execute("SELECT COUNT(*) FROM ohlc_daily;")
-                rows_count = int(cur.fetchone()[0] or 0)
-                cur.execute("SELECT MAX(trade_date) FROM ohlc_daily;")
-                latest_trade_date = cur.fetchone()[0]
-                last_update_utc = _get_meta(conn, "last_update_utc")
+        conn = _connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM universe_symbols;")
+            uni = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(DISTINCT symbol) FROM ohlc_daily;")
+            symbols_count = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(*) FROM ohlc_daily;")
+            rows_count = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT MAX(trade_date) FROM ohlc_daily;")
+            latest_trade_date = cur.fetchone()[0]
+            last_update_utc = _get_meta(conn, "last_update_utc")
+        conn.close()
+
         hours_since = None
         if last_update_utc:
             try:
@@ -223,8 +222,10 @@ def get_db_status() -> Dict[str, Any]:
                 hours_since = (datetime.now(timezone.utc) - dt).total_seconds()/3600.0
             except Exception:
                 hours_since = None
+
         return {
             "ok": True,
+            "universe_count": uni,
             "symbols_count": symbols_count,
             "rows_count": rows_count,
             "latest_trade_date": str(latest_trade_date) if latest_trade_date else None,
@@ -233,35 +234,6 @@ def get_db_status() -> Dict[str, Any]:
         }
     except Exception as e:
         return {"ok": False, "message": str(e)}
-
-# --- master/universe ---
-def load_master() -> pd.DataFrame:
-    candidates = ["master.csv", "jpx_master.csv", "JPX_master.csv", "jpx_master.tsv"]
-    for p in candidates:
-        if os.path.exists(p):
-            if p.endswith(".tsv"):
-                return pd.read_csv(p, sep="\t")
-            return pd.read_csv(p)
-    # fallback: universe from DB
-    with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT symbol FROM ohlc_daily;")
-            syms = [r[0] for r in cur.fetchall()]
-    return pd.DataFrame({"symbol": syms, "sector": "不明", "name": ""})
-
-def get_universe_symbols(master: pd.DataFrame) -> List[str]:
-    for col in ["symbol", "ticker", "code"]:
-        if col in master.columns:
-            s = master[col].astype(str).tolist()
-            out = []
-            for x in s:
-                x = str(x).strip()
-                if x.isdigit():
-                    out.append(f"{x}.T")
-                else:
-                    out.append(x)
-            return out
-    raise ValueError("masterに symbol/ticker/code 列がありません")
 
 # --- DB update ---
 def _fetch_from_yf(symbols: List[str], start: str) -> Dict[str, pd.DataFrame]:
@@ -287,10 +259,11 @@ def _fetch_from_yf(symbols: List[str], start: str) -> Dict[str, pd.DataFrame]:
             out[symbols[0]] = df
     return out
 
-def update_db_incremental(days_back: int = 7, keep_days: int = 400, chunk_size: int = 200) -> Dict[str, Any]:
+def update_db_incremental(days_back: int = 14, keep_days: int = 400, chunk_size: int = 200) -> Dict[str, Any]:
     ensure_schema()
-    master = load_master()
-    universe = get_universe_symbols(master)
+    universe = universe_load_symbols()
+    if not universe:
+        return {"upserted_rows": 0, "failed_symbols": 0, "message": "銘柄マスタが0件です。先に『銘柄マスタ登録』を行ってください。"}
 
     start_dt = (datetime.now(timezone.utc) - timedelta(days=days_back + 5)).date()
     start = str(start_dt)
@@ -299,7 +272,8 @@ def update_db_incremental(days_back: int = 7, keep_days: int = 400, chunk_size: 
     failed = 0
     sample_fail: List[str] = []
 
-    with _connect() as conn:
+    conn = _connect()
+    try:
         for i in range(0, len(universe), chunk_size):
             chunk = universe[i:i+chunk_size]
             try:
@@ -308,7 +282,8 @@ def update_db_incremental(days_back: int = 7, keep_days: int = 400, chunk_size: 
                 fetched = {}
             if not fetched:
                 failed += len(chunk)
-                sample_fail.extend(chunk[:10])
+                if len(sample_fail) < 50:
+                    sample_fail.extend(chunk[: min(10, len(chunk))])
                 continue
 
             rows = []
@@ -354,10 +329,12 @@ def update_db_incremental(days_back: int = 7, keep_days: int = 400, chunk_size: 
             cur.execute("DELETE FROM ohlc_daily WHERE trade_date < %s;", (cutoff,))
         _set_meta(conn, "last_update_utc", datetime.now(timezone.utc).isoformat().replace("+00:00","Z"))
         conn.commit()
+    finally:
+        conn.close()
 
     return {"upserted_rows": upserted, "failed_symbols": failed, "sample_failures": sample_fail[:20], "start": start, "keep_days": keep_days, "chunk_size": chunk_size}
 
-# --- indicators ---
+# --- Indicators & scan (unchanged core) ---
 def _atr14(df: pd.DataFrame) -> pd.Series:
     h = df["High"].astype(float)
     l = df["Low"].astype(float)
@@ -435,7 +412,6 @@ def _pick_strategy(features: Dict[str, float], atr_pct: float) -> str:
         return "レンジ（小動き）"
     return "押し目買い（回復狙い）"
 
-# --- DB read helpers ---
 def _read_latest_dates(conn) -> Tuple[Optional[str], Optional[str]]:
     with conn.cursor() as cur:
         cur.execute("SELECT MAX(trade_date) FROM ohlc_daily;")
@@ -450,7 +426,8 @@ def fetch_last_n_days(symbols: List[str], n_days: int = 80) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame()
     ensure_schema()
-    with _connect() as conn:
+    conn = _connect()
+    try:
         latest, _ = _read_latest_dates(conn)
         if not latest:
             return pd.DataFrame()
@@ -463,18 +440,20 @@ def fetch_last_n_days(symbols: List[str], n_days: int = 80) -> pd.DataFrame:
             ORDER BY symbol, trade_date;
             """, (symbols, cutoff))
             rows = cur.fetchall()
+    finally:
+        conn.close()
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows, columns=["Symbol","Date","Open","High","Low","Close","Volume"])
     df["Date"] = pd.to_datetime(df["Date"])
     return df
 
-def stage0_select(master: pd.DataFrame, min_price: float, min_avg_volume: float, keep: int) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     ensure_schema()
-    universe = get_universe_symbols(master)
-
+    universe = universe_load_symbols()
     t0 = time.time()
-    with _connect() as conn:
+    conn = _connect()
+    try:
         latest, prev = _read_latest_dates(conn)
         if not latest or not prev:
             return pd.DataFrame(), pd.DataFrame(), {"ok": False, "reason": "db_has_no_latest_prev"}
@@ -505,44 +484,33 @@ def stage0_select(master: pd.DataFrame, min_price: float, min_avg_volume: float,
             GROUP BY symbol;
             """, (universe, cutoff20))
             vol20 = cur.fetchall()
+    finally:
+        conn.close()
 
     snap_df = pd.DataFrame(snap, columns=["symbol","close_latest","close_prev"])
     vol20_df = pd.DataFrame(vol20, columns=["symbol","avg_vol20"])
     df = snap_df.merge(vol20_df, on="symbol", how="left")
     df["pct_change_1d"] = (df["close_latest"]/(df["close_prev"]+1e-12)-1.0)*100.0
 
-    m = master.copy()
-    sym_col = "symbol" if "symbol" in m.columns else ("ticker" if "ticker" in m.columns else None)
-    if sym_col is None:
-        m["symbol"] = universe; sym_col = "symbol"
-    if sym_col != "symbol":
-        m["symbol"] = m[sym_col].astype(str)
-    if "sector" not in m.columns and "sector_name" in m.columns:
-        m["sector"] = m["sector_name"]
-    if "sector" not in m.columns:
-        m["sector"] = "不明"
-    if "name" not in m.columns:
-        m["name"] = ""
-    df = df.merge(m[["symbol","sector","name"]], on="symbol", how="left")
-
     df = df[pd.notna(df["close_latest"])]
     df = df[df["close_latest"] >= float(min_price)]
     df = df[pd.notna(df["avg_vol20"])]
     df = df[df["avg_vol20"] >= float(min_avg_volume)]
 
-    sec = (df.groupby("sector", dropna=False)["pct_change_1d"].median().sort_values(ascending=False).reset_index())
-    sec.columns = ["セクター","前日比（中央値%）"]
+    sec = (df.groupby("symbol", dropna=False)["pct_change_1d"].median().sort_values(ascending=False).reset_index())
+    sec.columns = ["銘柄","前日比（%）"]
+    sec = sec.head(30)
     sec.insert(0, "順位", range(1, len(sec)+1))
 
-    df["sector_strength"] = df["sector"].map(dict(zip(sec["セクター"], sec["前日比（中央値%）"])))
-    df["stage0_score"] = 0.6*df["sector_strength"].fillna(0.0) + 0.3*df["pct_change_1d"].fillna(0.0) + 0.1*np.log10(df["avg_vol20"].fillna(1.0))
-
+    # Stage0 score: simple (no sector without master)
+    df["stage0_score"] = 0.7*df["pct_change_1d"].fillna(0.0) + 0.3*np.log10(df["avg_vol20"].fillna(1.0))
     df = df.sort_values("stage0_score", ascending=False).head(int(keep)).copy()
-    out = df.rename(columns={"symbol":"銘柄","name":"名称","sector":"セクター","close_latest":"現在値（終値）","pct_change_1d":"前日比（%）","avg_vol20":"平均出来高20日"})[["銘柄","名称","セクター","現在値（終値）","前日比（%）","平均出来高20日","stage0_score"]]
+
+    out = df.rename(columns={"symbol":"銘柄","close_latest":"現在値（終値）","pct_change_1d":"前日比（%）","avg_vol20":"平均出来高20日"})[["銘柄","現在値（終値）","前日比（%）","平均出来高20日","stage0_score"]]
     out["stage0_score"] = out["stage0_score"].astype(float).round(4)
 
     meta = {"ok": True, "latest_trade_date": latest, "elapsed_sec": time.time()-t0, "stage0_candidates": int(len(out))}
-    return out, sec, meta
+    return out, pd.DataFrame(), meta
 
 def stage1_select(stage0_df: pd.DataFrame, keep: int, atr_pct_min: float, atr_pct_max: float) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     t0 = time.time()
@@ -576,26 +544,12 @@ def stage1_select(stage0_df: pd.DataFrame, keep: int, atr_pct_min: float, atr_pc
     df["現在値（終値）"] = df["現在値（終値）"].round(2)
     return df, {"ok": True, "elapsed_sec": time.time()-t0, "stage1_candidates": int(len(df))}
 
-def stage2_rank(stage1_df: pd.DataFrame, master: pd.DataFrame, keep: int) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+def stage2_rank(stage1_df: pd.DataFrame, keep: int) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     t0 = time.time()
     syms = stage1_df["銘柄"].astype(str).tolist()
     hist = fetch_last_n_days(syms, n_days=260)
     if hist.empty:
         return pd.DataFrame(), pd.DataFrame(), {"ok": False}
-
-    m = master.copy()
-    sym_col = "symbol" if "symbol" in m.columns else ("ticker" if "ticker" in m.columns else None)
-    if sym_col is None:
-        m["symbol"] = syms; sym_col = "symbol"
-    if sym_col != "symbol":
-        m["symbol"] = m[sym_col].astype(str)
-    if "sector" not in m.columns and "sector_name" in m.columns:
-        m["sector"] = m["sector_name"]
-    if "sector" not in m.columns:
-        m["sector"] = "不明"
-    if "name" not in m.columns:
-        m["name"] = ""
-    m = m[["symbol","sector","name"]].drop_duplicates("symbol")
 
     rows, guides = [], []
     errors, sample_fail = 0, []
@@ -612,7 +566,9 @@ def stage2_rank(stage1_df: pd.DataFrame, master: pd.DataFrame, keep: int) -> Tup
             atr_pct = float(stage1_df.loc[stage1_df["銘柄"]==sym, "ATR%"].iloc[0]) if len(stage1_df.loc[stage1_df["銘柄"]==sym]) else np.nan
             strat = _pick_strategy(_trend_features(g), atr_pct)
 
-            rows.append({"銘柄": sym, "利確スコア": res["swing_score"], "TP到達率": res["tp_hit_rate"], "期待値EV(R)": res["ev_r"], "平均利確日数": res["avg_tp_days"], "平均逆行(R)": res["avg_dd_r"], "検証回数": res["trials"], "現在値（終値）": round(close_last,2), "TP目安": round(tp,2), "SL目安": round(sl,2), "推奨方式": strat})
+            rows.append({"銘柄": sym, "推奨方式": strat, "現在値（終値）": round(close_last,2), "TP目安": round(tp,2), "SL目安": round(sl,2),
+                         "TP到達率": res["tp_hit_rate"], "期待値EV(R)": res["ev_r"], "平均利確日数": res["avg_tp_days"],
+                         "平均逆行(R)": res["avg_dd_r"], "検証回数": res["trials"], "利確スコア": res["swing_score"]})
             guides.append({"銘柄": sym, "推奨方式": strat, "Entry目安": round(close_last,2), "SL目安": round(sl,2), "TP目安": round(tp,2), "最大保有": "10営業日"})
         except Exception:
             errors += 1
@@ -624,7 +580,6 @@ def stage2_rank(stage1_df: pd.DataFrame, master: pd.DataFrame, keep: int) -> Tup
     if df.empty:
         return pd.DataFrame(), pd.DataFrame(), {"ok": False}
 
-    df = df.merge(m.rename(columns={"symbol":"銘柄","sector":"セクター","name":"名称"}), on="銘柄", how="left")
     df["TP到達率"] = df["TP到達率"].clip(0,1)
     df["期待値EV(R)"] = df["期待値EV(R)"].clip(-5,5)
     df["平均逆行(R)"] = df["平均逆行(R)"].clip(0,10)
@@ -637,14 +592,8 @@ def stage2_rank(stage1_df: pd.DataFrame, master: pd.DataFrame, keep: int) -> Tup
         df[c] = df[c].astype(float).round(4)
     df["TP到達率"] = (df["TP到達率"]*100.0).round(2)
 
-    cols = ["銘柄","名称","セクター","推奨方式","現在値（終値）","TP目安","SL目安","TP到達率","期待値EV(R)","平均利確日数","平均逆行(R)","検証回数","利確スコア","総合スコア"]
-    for c in cols:
-        if c not in df.columns:
-            df[c] = np.nan
+    cols = ["銘柄","推奨方式","現在値（終値）","TP目安","SL目安","TP到達率","期待値EV(R)","平均利確日数","平均逆行(R)","検証回数","利確スコア","総合スコア"]
     df = df[cols]
-
-    guide = guide.merge(m.rename(columns={"symbol":"銘柄","sector":"セクター","name":"名称"}), on="銘柄", how="left")
-    guide = guide[["銘柄","名称","セクター","推奨方式","Entry目安","SL目安","TP目安","最大保有"]]
 
     meta = {"ok": True, "elapsed_sec": time.time()-t0, "errors": errors, "sample_failures": sample_fail, "stage2_selected": int(len(df))}
     return df, guide, meta
@@ -653,11 +602,9 @@ def run_scan_3stage(stage0_keep: int = 1200, stage1_keep: int = 300, stage2_keep
                     min_price: float = 300.0, min_avg_volume: float = 30000.0,
                     atr_pct_min: float = 1.0, atr_pct_max: float = 8.0) -> Dict[str, Any]:
     ensure_schema()
-    master = load_master()
-
     diag: Dict[str, Any] = {"ok": True, "stage": "start", "mode": "stable", "errors": [], "sample_failures": []}
 
-    s0, sec, m0 = stage0_select(master, min_price=min_price, min_avg_volume=min_avg_volume, keep=stage0_keep)
+    s0, sec, m0 = stage0_select(min_price=min_price, min_avg_volume=min_avg_volume, keep=stage0_keep)
     diag["stage0"] = m0
     if s0.empty:
         diag["stage"] = "done"; diag["mode"] = "degraded"
@@ -671,7 +618,7 @@ def run_scan_3stage(stage0_keep: int = 1200, stage1_keep: int = 300, stage2_keep
         diag["errors"].append("Stage1 empty: ATR%条件/履歴不足")
         return {"selected": pd.DataFrame(), "guide": pd.DataFrame(), "sector_strength": sec, "diag": diag}
 
-    sel, guide, m2 = stage2_rank(s1, master=master, keep=stage2_keep)
+    sel, guide, m2 = stage2_rank(s1, keep=stage2_keep)
     diag["stage2"] = m2
     if sel.empty:
         diag["mode"] = "degraded"
