@@ -20,19 +20,58 @@ def check_db_config() -> Tuple[bool, str]:
         return False, "Neonの接続URLが見つかりません（NEON_DATABASE_URL）。"
     return True, "ok"
 
+
+def driver_diagnostics() -> Dict[str, Any]:
+    info: Dict[str, Any] = {"python": None, "psycopg": None, "psycopg2": None}
+    try:
+        import sys
+        info["python"] = sys.version
+    except Exception:
+        pass
+    try:
+        import psycopg  # type: ignore
+        info["psycopg"] = getattr(psycopg, "__version__", "unknown")
+    except Exception as e:
+        info["psycopg"] = {"error": repr(e)}
+    try:
+        import psycopg2  # type: ignore
+        info["psycopg2"] = getattr(psycopg2, "__version__", "unknown")
+    except Exception as e:
+        info["psycopg2"] = {"error": repr(e)}
+    return info
+
+
 def _connect():
     url = _get_db_url()
     if not url:
         raise RuntimeError("NEON_DATABASE_URL not set")
+
+    # Streamlit CloudはPython 3.13系が多く、psycopg2-binary がimport失敗するケースがあります。
+    # そのため psycopg(3) を優先し、だめなら psycopg2 にフォールバックします。
+    psycopg_err = None
+    psycopg2_err = None
+
+    try:
+        import psycopg  # type: ignore
+        return psycopg.connect(url)
+    except Exception as e:
+        psycopg_err = repr(e)
+
     try:
         import psycopg2  # type: ignore
         return psycopg2.connect(url)
-    except Exception:
-        try:
-            import psycopg  # type: ignore
-            return psycopg.connect(url)
-        except Exception as e:
-            raise RuntimeError("Postgresドライバが不足です。requirements.txtに psycopg2-binary か psycopg[binary] を追加してください。") from e
+    except Exception as e:
+        psycopg2_err = repr(e)
+
+    raise RuntimeError(
+        "Postgresドライバをimportできませんでした。
+"
+        "推奨: requirements.txt に『psycopg[binary]』(または psycopg-binary) を追加し、psycopg2-binary は削除してください。
+"
+        f"psycopg import error: {psycopg_err}
+"
+        f"psycopg2 import error: {psycopg2_err}"
+    )
 
 def ensure_schema():
     with _connect() as conn:
