@@ -7,5 +7,6 @@ pytz
 openai
 requests
 xlrd
-psycopg2-binary
+psycopg[binary]
+
 
