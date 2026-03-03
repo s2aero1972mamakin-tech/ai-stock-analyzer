@@ -416,12 +416,19 @@ def _atr14(df: pd.DataFrame) -> pd.Series:
     tr = pd.concat([(h-l), (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
     return tr.rolling(14).mean()
 
-def evaluate_swing_fixed(df: pd.DataFrame, max_hold_days: int = 10, tp_atr: float = 1.5, sl_atr: float = 1.0) -> Dict[str, Any]:
+def evaluate_swing_fixed(df: pd.DataFrame, max_hold_days: int = 10, tp_atr: float = 1.5, sl_atr: float = 1.0, min_bars: int = 60, atr_pct: float | None = None) -> Dict[str, Any]:
     d = df.copy()
     d["ATR14"] = _atr14(d)
     d = d.dropna()
-    if len(d) < 80:
-        return {"ok": False}
+    # 履歴が短い場合でも「暫定評価」で落とさない（Cloudで最初は履歴が薄くなりがち）
+    if len(d) < int(min_bars):
+        tf = _trend_features(df)
+        ap = float(atr_pct) if atr_pct is not None and np.isfinite(atr_pct) else np.nan
+        # 暫定スコア：トレンド(20/60日)を加点、ボラ(ATR%)を軽く減点
+        score = 0.55*(tf.get("ret_60", np.nan) if np.isfinite(tf.get("ret_60", np.nan)) else 0.0) + 0.35*(tf.get("ret_20", np.nan) if np.isfinite(tf.get("ret_20", np.nan)) else 0.0)
+        if np.isfinite(ap):
+            score -= 0.02*(ap)
+        return {"ok": True, "trials": 0, "tp_hit_rate": float("nan"), "ev_r": float("nan"), "avg_tp_days": float(max_hold_days), "avg_dd_r": float("nan"), "swing_score": float(score), "note": "履歴不足のため暫定評価"}
 
     wins = 0
     losses = 0
@@ -618,23 +625,31 @@ def stage1_select(stage0_df: pd.DataFrame, keep: int, atr_pct_min: float, atr_pc
     df["現在値（終値）"] = df["現在値（終値）"].round(2)
     return df, {"ok": True, "elapsed_sec": time.time()-t0, "stage1_candidates": int(len(df))}
 
-def stage2_rank(stage1_df: pd.DataFrame, keep: int) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_bars: int = 60) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     t0 = time.time()
     syms = stage1_df["銘柄"].astype(str).tolist()
-    hist = fetch_last_n_days(syms, n_days=260)
+    hist = fetch_last_n_days(syms, n_days=int(stage2_days))
     if hist.empty:
         return pd.DataFrame(), pd.DataFrame(), {"ok": False}
 
     rows, guides = [], []
     errors, sample_fail = 0, []
+    diag = {"hist_symbols": int(len(syms)), "hist_days": int(stage2_days), "ok_eval": 0, "fallback_eval": 0, "skipped_no_atr": 0}
+
     for sym, g in hist.groupby("Symbol"):
         try:
             g = g.sort_values("Date")
-            res = evaluate_swing_fixed(g)
+            atr_pct = float(stage1_df.loc[stage1_df["銘柄"]==sym, "ATR%"].iloc[0]) if len(stage1_df.loc[stage1_df["銘柄"]==sym]) else np.nan
+            res = evaluate_swing_fixed(g, min_bars=int(min_bars), atr_pct=atr_pct)
             if not res.get("ok"):
                 continue
+            if res.get("trials", 0) == 0:
+                diag["fallback_eval"] += 1
+            else:
+                diag["ok_eval"] += 1
             close_last = float(g["Close"].iloc[-1])
-            atr_last = float(_atr14(g).iloc[-1])
+            atr_series = _atr14(g)
+            atr_last = float(atr_series.dropna().iloc[-1]) if len(atr_series.dropna()) else float("nan")
             tp = close_last + 1.5*atr_last
             sl = close_last - 1.0*atr_last
             atr_pct = float(stage1_df.loc[stage1_df["銘柄"]==sym, "ATR%"].iloc[0]) if len(stage1_df.loc[stage1_df["銘柄"]==sym]) else np.nan
@@ -642,7 +657,7 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int) -> Tuple[pd.DataFrame, pd.Da
 
             rows.append({"銘柄": sym, "推奨方式": strat, "現在値（終値）": round(close_last,2), "TP目安": round(tp,2), "SL目安": round(sl,2),
                          "TP到達率": res["tp_hit_rate"], "期待値EV(R)": res["ev_r"], "平均利確日数": res["avg_tp_days"],
-                         "平均逆行(R)": res["avg_dd_r"], "検証回数": res["trials"], "利確スコア": res["swing_score"]})
+                         "平均逆行(R)": res["avg_dd_r"], "検証回数": res.get("trials",0), "利確スコア": res.get("swing_score", float("nan")), "備考": res.get("note","")})
             guides.append({"銘柄": sym, "推奨方式": strat, "Entry目安": round(close_last,2), "SL目安": round(sl,2), "TP目安": round(tp,2), "最大保有": "10営業日"})
         except Exception:
             errors += 1
@@ -652,7 +667,7 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int) -> Tuple[pd.DataFrame, pd.Da
     df = pd.DataFrame(rows)
     guide = pd.DataFrame(guides)
     if df.empty:
-        return pd.DataFrame(), pd.DataFrame(), {"ok": False}
+        return pd.DataFrame(), pd.DataFrame(), {"ok": False, "reason": "no_pass", "diag": diag, "errors": errors, "sample_failures": sample_fail}
 
     df["TP到達率"] = df["TP到達率"].clip(0,1)
     df["期待値EV(R)"] = df["期待値EV(R)"].clip(-5,5)
@@ -669,12 +684,13 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int) -> Tuple[pd.DataFrame, pd.Da
     cols = ["銘柄","推奨方式","現在値（終値）","TP目安","SL目安","TP到達率","期待値EV(R)","平均利確日数","平均逆行(R)","検証回数","利確スコア","総合スコア"]
     df = df[cols]
 
-    meta = {"ok": True, "elapsed_sec": time.time()-t0, "errors": errors, "sample_failures": sample_fail, "stage2_selected": int(len(df))}
+    meta = {"ok": True, "elapsed_sec": time.time()-t0, "errors": errors, "sample_failures": sample_fail, "stage2_selected": int(len(df)), "diag": diag}
     return df, guide, meta
 
 def run_scan_3stage(stage0_keep: int = 1200, stage1_keep: int = 300, stage2_keep: int = 60,
                     min_price: float = 300.0, min_avg_volume: float = 30000.0,
-                    atr_pct_min: float = 1.0, atr_pct_max: float = 8.0) -> Dict[str, Any]:
+                    atr_pct_min: float = 1.0, atr_pct_max: float = 8.0,
+                    stage2_days: int = 180, stage2_min_bars: int = 60) -> Dict[str, Any]:
     ensure_schema()
     diag: Dict[str, Any] = {"ok": True, "stage": "start", "mode": "stable", "errors": [], "sample_failures": []}
 
@@ -692,7 +708,7 @@ def run_scan_3stage(stage0_keep: int = 1200, stage1_keep: int = 300, stage2_keep
         diag["errors"].append("Stage1 empty: ATR%条件/履歴不足")
         return {"selected": pd.DataFrame(), "guide": pd.DataFrame(), "sector_strength": sec, "diag": diag}
 
-    sel, guide, m2 = stage2_rank(s1, keep=stage2_keep)
+    sel, guide, m2 = stage2_rank(s1, keep=stage2_keep, stage2_days=int(stage2_days), min_bars=int(stage2_min_bars))
     diag["stage2"] = m2
     if sel.empty:
         diag["mode"] = "degraded"
