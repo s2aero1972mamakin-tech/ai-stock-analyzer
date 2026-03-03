@@ -199,6 +199,73 @@ def universe_register_from_inputs(uploaded_csv_file, pasted_text: str):
     except Exception as e:
         return 0, f"DB登録に失敗: {e}"
 
+
+def universe_autofetch_from_jpx() -> Tuple[int, str]:
+    """JPX公式サイトで配布されている『東証上場銘柄一覧（Excel）』を取得し、universe_symbols に登録する。"""
+    ensure_schema()
+
+    url_candidates = [
+        "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls",
+    ]
+
+    last_err = None
+    content = None
+    for url in url_candidates:
+        try:
+            import requests  # type: ignore
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            content = r.content
+            break
+        except Exception as e:
+            last_err = e
+
+    if content is None:
+        return 0, f"JPX一覧のダウンロードに失敗しました: {last_err}"
+
+    try:
+        import io
+        bio = io.BytesIO(content)
+        df = pd.read_excel(bio)
+    except Exception as e:
+        return 0, f"Excel読込に失敗しました（環境依存）: {e}"
+
+    pick = None
+    # よくある列名（日本語）
+    for c in df.columns:
+        if str(c).strip() in ["コード", "銘柄コード"]:
+            pick = c
+            break
+    if pick is None:
+        # 英語/一般
+        for c in df.columns:
+            low = str(c).lower().replace(" ", "").replace("-", "_")
+            if low in ["code", "securitycode", "security_code", "stockcode", "stock_code"]:
+                pick = c
+                break
+    if pick is None:
+        # 4桁比率で推定
+        for c in df.columns:
+            ser = df[c].dropna().astype(str).str.replace(r"\D", "", regex=True)
+            if len(ser) == 0:
+                continue
+            ratio = ser.str.fullmatch(r"\d{4}").mean()
+            if ratio > 0.6:
+                pick = c
+                break
+
+    if pick is None:
+        return 0, "銘柄コード列を特定できませんでした。手動CSVでの登録をお使いください。"
+
+    codes = df[pick].dropna().astype(str).str.replace(r"\D", "", regex=True)
+    codes = [c for c in codes.tolist() if re.fullmatch(r"\d{4}", c)]
+    if not codes:
+        return 0, "銘柄コードが抽出できませんでした。"
+
+    n = universe_upsert(codes)
+    return n, "ok"
+
+
 def get_db_status() -> Dict[str, Any]:
     try:
         ensure_schema()
