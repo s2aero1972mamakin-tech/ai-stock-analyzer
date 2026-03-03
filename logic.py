@@ -73,8 +73,49 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         )
         con.execute("CREATE INDEX IF NOT EXISTS idx_ohlc_ticker_d ON ohlc(ticker, d);")
         con.commit()
+        # meta table for batch status
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS meta (
+              k TEXT PRIMARY KEY,
+              v TEXT NOT NULL
+            )
+        """)
+        con.commit()
     finally:
         con.close()
+
+
+def db_set_meta(db_path: str, k: str, v: str) -> None:
+    init_db(db_path)
+    con = _db_connect(db_path)
+    try:
+        con.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;", (k, str(v)))
+        con.commit()
+    finally:
+        con.close()
+
+def db_get_meta(db_path: str) -> dict:
+    init_db(db_path)
+    con = _db_connect(db_path)
+    try:
+        cur = con.execute("SELECT k, v FROM meta;")
+        rows = cur.fetchall()
+        return {str(k): str(v) for (k, v) in rows}
+    except Exception:
+        return {}
+    finally:
+        con.close()
+
+def db_get_last_batch_jst_date(db_path: str) -> Optional[_dt.date]:
+    meta = db_get_meta(db_path)
+    v = meta.get("last_batch_jst")
+    if not v:
+        return None
+    try:
+        dt = _dt.datetime.fromisoformat(v)
+        return dt.date()
+    except Exception:
+        return None
 
 def db_get_last_date(db_path: str, ticker: str) -> Optional[_dt.date]:
     init_db(db_path)
@@ -466,10 +507,12 @@ def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    # Avoid duplicate column names (pandas may return DataFrame for out['ATR'] if duplicated)
+    out = out.loc[:, ~out.columns.duplicated()].copy()
     out["SMA25"] = out["Close"].rolling(25).mean()
     out["SMA75"] = out["Close"].rolling(75).mean()
     out["RSI"] = _rsi(out["Close"], 14)
-    out["ATR"] = _atr(out, 14)
+    out["ATR"] = pd.Series(_atr(out, 14), index=out.index).astype(float)
     out["ATR_PCT"] = (out["ATR"] / (out["Close"] + 1e-12)) * 100.0
     out["RET_3M"] = out["Close"].pct_change(60)
     out["VOL_AVG20"] = out["Volume"].rolling(20).mean()
@@ -505,6 +548,52 @@ def pre_score(latest: pd.Series) -> float:
         + 0.20 * (np.log1p(vol) / 20.0)
         - 0.05 * (atrp / 30.0)
     )
+
+
+def add_trade_plan_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """UI表示用に、戦略タイプと Entry/SL/TP の目安を付与。
+
+    - heavy_sims が間に合わない場合でも「銘柄＋方式＋価格目安」を返せるようにする。
+    - ここでの価格は “目安” であり、最終執行はユーザー側アプリで判断。
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+
+    def _strategy_row(r) -> str:
+        r3m = float(r.get("RET_3M", 0.0) or 0.0)
+        rsi = float(r.get("RSI", 50.0) or 50.0)
+        atrp = float(r.get("ATR_PCT", 0.0) or 0.0)
+        if r3m > 0.12 and rsi >= 55:
+            return "Trend/Breakout"
+        if rsi <= 35:
+            return "MeanRevert/Rebound"
+        if atrp <= 2.0:
+            return "Range/LowVol"
+        return "Hybrid"
+
+    out["strategy"] = out.apply(_strategy_row, axis=1)
+
+    price = out.get("Close")
+    if price is None:
+        out["entry"] = np.nan
+        out["stop_loss"] = np.nan
+        out["take_profit"] = np.nan
+        return out
+
+    # ATR%があれば ATR ベース、無ければ固定幅
+    atrp = out.get("ATR_PCT", pd.Series([np.nan]*len(out)))
+    base_stop = 0.03
+    stop_pct = (atrp.fillna(3.0) / 100.0 * 1.2).clip(0.02, 0.12)
+    stop_pct = np.maximum(stop_pct, base_stop)
+
+    rr = out.get("wf_oos_rr", pd.Series([np.nan]*len(out))).fillna(2.0).clip(1.2, 3.5)
+    tp_pct = (stop_pct * rr).clip(0.04, 0.30)
+
+    out["entry"] = price.astype(float)
+    out["stop_loss"] = (price.astype(float) * (1.0 - stop_pct)).astype(float)
+    out["take_profit"] = (price.astype(float) * (1.0 + tp_pct)).astype(float)
+    return out
 
 # -----------------------------
 # Walk-forward (simplified)
@@ -706,6 +795,7 @@ def scan_engine(
     time_budget_sec: int = 70,
     progress_cb: Optional[Callable] = None,
     db_path: str = DEFAULT_DB_PATH,
+    yf_bulk_chunk: int = 180,
 ) -> dict:
     t0 = time.time()
     diag = {
@@ -747,85 +837,110 @@ def scan_engine(
     ticks = pick_universe_tickers(master_f, int(universe_limit), mode=universe_mode, seed=seed)
     diag["stats"]["universe_tickers"] = int(len(ticks))
 
-    # --- Fetch OHLC in parallel (DB first) ---
+    # --- Fetch OHLC (DB first, then yfinance bulk to reduce rate-limit hits) ---
     if progress_cb:
         progress_cb("fetch", {"total": len(ticks)})
 
-    prefer_yf = True
-    stooq_blocked = False
+    MIN_ROWS = 260
+
     ok = 0
     fail = 0
     db_hit = 0
+    rows: List[dict] = []
+    failures: List[dict] = []
 
-    rows = []
-    failures = []
+    # 1) DB hit check (fast, no external calls)
+    missing: List[str] = []
+    for i, tk in enumerate(ticks, start=1):
+        if time.time() - t0 > float(time_budget_sec):
+            diag["errors"].append("time_budget_exceeded_during_db_check")
+            break
+        df = db_load_ohlc(db_path=db_path, ticker=tk, max_age_days=int(cache_days))
+        meta = {"provider": "db"} if df is not None and not df.empty else {"provider": "db", "note": "miss_or_stale"}
+        if df is None or df.empty:
+            missing.append(tk)
+            continue
+        db_hit += 1
+        ind = add_indicators(df)
+        if ind is None or ind.empty:
+            fail += 1
+            if len(failures) < 25:
+                failures.append({"ticker": tk, "meta": {"note": "indicator_empty_db", **(meta or {})}})
+            continue
+        last = ind.iloc[-1].copy()
+        if float(last.get("Close", 0.0)) < float(min_price) or float(last.get("VOL_AVG20", 0.0)) < float(min_avg_volume):
+            continue
+        ok += 1
+        rows.append({
+            "Symbol": tk,
+            "Close": float(last.get("Close", 0.0)),
+            "RET_3M": float(last.get("RET_3M", 0.0)),
+            "RSI": float(last.get("RSI", 50.0)),
+            "ATR_PCT": float(last.get("ATR_PCT", 0.0)),
+            "VOL_AVG20": float(last.get("VOL_AVG20", 0.0)),
+            "_close_series": df["Close"].astype(float).values,
+        })
+        if progress_cb and i % 50 == 0:
+            progress_cb("fetch_progress", {"done": i, "total": len(ticks), "ok": ok, "fail": fail, "db_hit": db_hit, "missing": len(missing), "mode": "db_check"})
 
-    def one(tk: str):
-        nonlocal prefer_yf, stooq_blocked
-        df, meta, rate_limited, hit_db = fetch_daily(
-            tk, min_rows=260, prefer_yf=prefer_yf or stooq_blocked, cache_days=cache_days, db_path=db_path
-        )
-        if rate_limited:
-            stooq_blocked = True
-            prefer_yf = True
-        return tk, df, meta, hit_db
-
-    with ThreadPoolExecutor(max_workers=int(max_workers)) as ex:
-        futs = {ex.submit(one, tk): tk for tk in ticks}
+    # 2) Bulk yfinance download for missing (dramatically reduces external hit count)
+    if missing and (time.time() - t0) <= float(time_budget_sec):
         done_n = 0
-        for fut in as_completed(futs):
-            done_n += 1
-            tk = futs[fut]
+        for chunk in [missing[i:i+int(yf_bulk_chunk)] for i in range(0, len(missing), int(yf_bulk_chunk))]:
             if time.time() - t0 > float(time_budget_sec):
-                diag["errors"].append("time_budget_exceeded_during_fetch")
+                diag["errors"].append("time_budget_exceeded_during_yf_bulk")
                 break
             try:
-                tk2, df, meta, hit_db = fut.result()
+                got = _yf_multi_download(chunk, days=730)
             except Exception as e:
-                df = None
-                meta = {"provider": "exc", "exc": f"{type(e).__name__}: {e}"}
-                hit_db = False
+                got = {}
+                diag["errors"].append(f"yf_bulk_exc: {type(e).__name__}: {e}")
 
-            if hit_db:
-                db_hit += 1
-
-            if df is None or df.empty:
-                fail += 1
-                if len(failures) < 25:
-                    failures.append({"ticker": tk, "meta": meta})
-            else:
-                ok += 1
-                # indicators
-                ind = add_indicators(df)
-                if ind is None or ind.empty:
+            for tk in chunk:
+                done_n += 1
+                df = got.get(tk)
+                if df is None or df.empty or len(df) < int(MIN_ROWS):
                     fail += 1
                     if len(failures) < 25:
-                        failures.append({"ticker": tk, "meta": {"note": "indicator_empty", **(meta or {})}})
-                else:
-                    last = ind.iloc[-1].copy()
-                    # liquidity filters
-                    if float(last.get("Close", 0.0)) < float(min_price):
-                        pass
-                    elif float(last.get("VOL_AVG20", 0.0)) < float(min_avg_volume):
-                        pass
-                    else:
-                        r = {
-                            "Symbol": tk,
-                            "Close": float(last["Close"]),
-                            "RET_3M": float(last.get("RET_3M", 0.0)),
-                            "RSI": float(last.get("RSI", 50.0)),
-                            "ATR_PCT": float(last.get("ATR_PCT", 0.0)),
-                            "VOL_AVG20": float(last.get("VOL_AVG20", 0.0)),
-                            "_close_series": df["Close"].astype(float).values,  # for corr
-                        }
-                        rows.append(r)
+                        failures.append({"ticker": tk, "meta": {"provider": "yfinance_bulk", "note": "empty_or_short"}})
+                    continue
+                try:
+                    df2 = df.copy()
+                    df2.index = pd.to_datetime(df2.index)
+                    df2 = df2.sort_index()
+                    cols = [c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in df2.columns]
+                    df2 = df2[cols]
+                    if "Adj Close" not in df2.columns and "Close" in df2.columns:
+                        df2["Adj Close"] = df2["Close"]
 
-            if progress_cb and done_n % 10 == 0:
-                progress_cb("fetch_progress", {
-                    "done": done_n, "total": len(ticks),
-                    "ok": ok, "fail": fail, "prefer_yf": prefer_yf, "stooq_blocked": stooq_blocked,
-                    "db_hit": db_hit,
-                })
+                    db_upsert_ohlc(db_path=db_path, ticker=tk, df=df2)
+
+                    ind = add_indicators(df2)
+                    if ind is None or ind.empty:
+                        fail += 1
+                        if len(failures) < 25:
+                            failures.append({"ticker": tk, "meta": {"provider": "yfinance_bulk", "note": "indicator_empty"}})
+                        continue
+                    last = ind.iloc[-1].copy()
+                    if float(last.get("Close", 0.0)) < float(min_price) or float(last.get("VOL_AVG20", 0.0)) < float(min_avg_volume):
+                        continue
+                    ok += 1
+                    rows.append({
+                        "Symbol": tk,
+                        "Close": float(last.get("Close", 0.0)),
+                        "RET_3M": float(last.get("RET_3M", 0.0)),
+                        "RSI": float(last.get("RSI", 50.0)),
+                        "ATR_PCT": float(last.get("ATR_PCT", 0.0)),
+                        "VOL_AVG20": float(last.get("VOL_AVG20", 0.0)),
+                        "_close_series": df2["Close"].astype(float).values,
+                    })
+                except Exception as e:
+                    fail += 1
+                    if len(failures) < 25:
+                        failures.append({"ticker": tk, "meta": {"provider": "yfinance_bulk", "exc": f"{type(e).__name__}: {e}"}})
+
+            if progress_cb:
+                progress_cb("fetch_progress", {"done": min(len(ticks), done_n), "total": len(ticks), "ok": ok, "fail": fail, "db_hit": db_hit, "mode": "yfinance_bulk"})
 
     diag["sample_failures"] = failures
     diag["stats"]["fetch_ok"] = int(ok)
@@ -906,9 +1021,33 @@ def scan_engine(
 
     heavy_df = pd.DataFrame(heavy_rows)
     if heavy_df.empty:
-        diag["errors"].append("heavy_df_empty")
-        diag["stage"] = "error"
-        return {"ok": False, "error": "heavy_df_empty", "diag": diag, "sector_ranking": sec_rank, "candidates": pd.DataFrame()}
+        # Degraded mode: still return a ranked pool with simple risk bands and plan.
+        diag["errors"].append("heavy_df_empty_degraded")
+        merged = pool.copy()
+        merged["wf_oos_wr"] = np.nan
+        merged["wf_oos_rr"] = np.nan
+        merged["wf_oos_mean_exp"] = np.nan
+        merged["wf_oos_trades"] = np.nan
+        merged["mc_dd_p05"] = np.nan
+        merged["final_score"] = merged["_pre"].astype(float)
+        merged = merged.sort_values("final_score", ascending=False).head(int(top_n)).reset_index(drop=True)
+        merged = add_trade_plan_columns(merged)
+        keep_cols = [
+            "Symbol","name","sector","Close","RET_3M","RSI","ATR_PCT","VOL_AVG20",
+            "strategy","entry","stop_loss","take_profit",
+            "final_score",
+        ]
+        for c in keep_cols:
+            if c not in merged.columns:
+                merged[c] = np.nan
+        merged = merged[keep_cols]
+
+        diag["ok"] = True
+        diag["stage"] = "done"
+        diag["elapsed_sec"] = float(time.time() - t0)
+        if progress_cb:
+            progress_cb("done", {"elapsed_sec": diag["elapsed_sec"], "mode": "degraded"})
+        return {"ok": True, "diag": diag, "sector_ranking": sec_rank, "candidates": merged}
 
     merged = pool.merge(heavy_df, on="Symbol", how="left")
     merged = merged.dropna(subset=["wf_oos_wr","wf_oos_rr","mc_dd_p05"], how="any")
@@ -931,11 +1070,13 @@ def scan_engine(
     merged = correlation_filter(merged, corr_threshold=float(corr_threshold))
     merged = merged.head(int(top_n)).reset_index(drop=True)
 
+    merged = add_trade_plan_columns(merged)
+
     # keep columns
     keep_cols = [
-        "Symbol","name","sector","Close","RET_3M",
+        "Symbol","name","sector","Close","RET_3M","RSI","ATR_PCT","VOL_AVG20",
         "wf_oos_mean_exp","wf_oos_wr","wf_oos_rr","wf_oos_trades",
-        "mc_dd_p05","final_score",
+        "mc_dd_p05","strategy","entry","stop_loss","take_profit","final_score",
     ]
     for c in keep_cols:
         if c not in merged.columns:
@@ -1131,6 +1272,20 @@ def daily_batch_update(
 
         if sleep_sec and sleep_sec > 0:
             time.sleep(float(sleep_sec))
+
+    # write batch meta (even if partial failures)
+    try:
+        now_utc = _dt.datetime.now(tz=_dt.timezone.utc).isoformat()
+        jst = _dt.timezone(_dt.timedelta(hours=9))
+        now_jst = _dt.datetime.now(tz=jst).isoformat()
+        db_set_meta(db_path, "last_batch_utc", now_utc)
+        db_set_meta(db_path, "last_batch_jst", now_jst)
+        db_set_meta(db_path, "last_batch_ok", "1")
+        db_set_meta(db_path, "last_batch_rows_upserted", str(inserted))
+        db_set_meta(db_path, "last_batch_ok_count", str(ok))
+        db_set_meta(db_path, "last_batch_fail_count", str(fail))
+    except Exception:
+        pass
 
     return {
         "ok": True,
