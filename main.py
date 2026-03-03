@@ -2,6 +2,7 @@ import os
 import json
 import time
 import traceback
+import html
 from datetime import datetime, timezone, timedelta
 
 import streamlit as st
@@ -11,10 +12,75 @@ import logic
 
 JST = timezone(timedelta(hours=9))
 
-st.set_page_config(page_title="JPX 利確銘柄抽出AI", layout="wide")
+def render_cards_selected(df: pd.DataFrame):
+    for _, r in df.iterrows():
+        sym = r.get("銘柄","")
+        strat = r.get("推奨方式","")
+        title = f"{sym} / {strat}"
+        items = []
+        for k in ["現在値（終値）","TP目安","SL目安","TP到達率","利確スコア","総合スコア","平均利確日数","イベント注意","バフェット簡易スコア"]:
+            if k in df.columns:
+                v = r.get(k)
+                items.append(f"{k}:{v}")
+        st.markdown(
+            f'<div class="card"><div class="card-title">{title}</div><div class="kv">'
+            + "".join([f"<span>{html.escape(str(x))}</span>" for x in items])
+            + "</div></div>",
+            unsafe_allow_html=True,
+        )
 
-st.title("JPX Swing AI")
-st.caption("固定条件：最大保有10営業日 / 利確=+1.5ATR(14) / 損切=-1.0ATR(14)  —  DB: Neon(Postgres)")
+def render_cards_sector(sec: pd.DataFrame):
+    for _, r in sec.iterrows():
+        st.markdown(
+            f'<div class="card"><div class="card-title">#{int(r.get("順位",0))} {html.escape(str(r.get("セクター（33業種）","")))}'
+            f'</div><div class="kv"><span>強度:{r.get("強度（中央値）")}</span></div></div>',
+            unsafe_allow_html=True,
+        )
+
+def render_cards_guide(df: pd.DataFrame):
+    for _, r in df.iterrows():
+        sym = r.get("銘柄","")
+        strat = r.get("推奨方式","")
+        title = f"{sym} / {strat}"
+        items = []
+        for k in ["Entry目安","SL目安","TP目安","最大保有"]:
+            if k in df.columns:
+                items.append(f"{k}:{r.get(k)}")
+        st.markdown(
+            f'<div class="card"><div class="card-title">{title}</div><div class="kv">'
+            + "".join([f"<span>{html.escape(str(x))}</span>" for x in items])
+            + "</div></div>",
+            unsafe_allow_html=True,
+        )
+
+st.set_page_config(page_title="JPX Swing AI", layout="wide")
+
+# ---- スマホ最適化CSS（Streamlit Cloudでも効く）----
+st.markdown(
+    """
+<style>
+/* 全体の余白を少し詰める */
+.block-container {padding-top: 1.0rem; padding-bottom: 1.0rem;}
+/* タイトルを小さめに */
+h1 {font-size: 1.6rem !important; margin-bottom: 0.25rem !important;}
+/* モバイルではテーブルが横に溢れやすいので、カード表示優先 */
+@media (max-width: 768px){
+  h1 {font-size: 1.35rem !important;}
+  .stDataFrame {overflow-x: auto;}
+}
+.small-note {font-size: 0.85rem; opacity: 0.85;}
+.card {border: 1px solid rgba(49,51,63,0.2); border-radius: 12px; padding: 12px; margin-bottom: 10px;}
+.card-title {font-weight: 700; font-size: 1.05rem; margin-bottom: 6px;}
+.kv {display: flex; gap: 10px; flex-wrap: wrap;}
+.kv span {background: rgba(49,51,63,0.08); padding: 4px 8px; border-radius: 10px; font-size: 0.88rem;}
+</style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown("# JPX Swing AI")
+st.markdown('<div class="small-note">固定条件：最大保有10営業日 / 利確=+1.5ATR(14) / 損切=-1.0ATR(14) — DB: Neon(Postgres)</div>', unsafe_allow_html=True)
+
 
 # --- Streamlit secrets -> env bridge ---
 if "NEON_DATABASE_URL" in st.secrets and not os.environ.get("NEON_DATABASE_URL"):
@@ -113,6 +179,11 @@ atr_pct_max = st.sidebar.number_input("ATR% 上限", min_value=0.0, value=8.0, s
 stage2_days = st.sidebar.slider("Stage2 利確評価に使う履歴日数", 60, 365, 180, 5)
 stage2_min_bars = st.sidebar.slider("Stage2 最低バー数（短期は暫定評価）", 40, 140, 60, 5)
 
+
+mobile_cards = st.sidebar.checkbox("📱 スマホ表示（カード）", value=True)
+include_fund = st.sidebar.checkbox("🧾 財務/イベント簡易チェック（RateLimit時は自動スキップ）", value=True)
+fund_top_n = st.sidebar.slider("財務/イベント取得数（上位Nのみ）", 0, 60, 20, 5)
+
 st.sidebar.markdown("---")
 st.sidebar.header("🔄 DB更新（増分）")
 update_days_back = st.sidebar.slider("更新取得日数（直近）", 3, 365, 120, 1)
@@ -179,6 +250,8 @@ if run_scan:
                 atr_pct_max=atr_pct_max,
                 stage2_days=stage2_days,
                 stage2_min_bars=stage2_min_bars,
+                include_fundamentals=include_fund,
+                fundamentals_top_n=fund_top_n,
             )
         elapsed = time.time() - t0
         diag = out.get("diag", {})
@@ -188,20 +261,33 @@ if run_scan:
         st.success(f"スキャン完了（{elapsed:.1f}秒） / mode={diag.get('mode','?')}")
         with st.expander("📊 診断（JSON）", expanded=False):
             st.json(diag)
-
         st.subheader("🏁 セクター強度ランキング（Stage0）")
+        st.caption("※ここは **33業種ごとの“強度（中央値）”** ランキングです。銘柄ランキングではありません。")
         sec = out.get("sector_strength")
         if isinstance(sec, pd.DataFrame) and len(sec):
-            st.dataframe(sec, width="stretch")
+            if mobile_cards:
+                render_cards_sector(sec.head(20))
+                with st.expander("表で見る（PC向け）", expanded=False):
+                    st.dataframe(sec, width="stretch")
+            else:
+                st.dataframe(sec, width="stretch")
         else:
-            st.info("セクター情報が不足しているため、セクター強度は簡易表示/非表示です。")
+            st.info("セクター情報が不足しているため、セクター強度は非表示です（銘柄マスタに33業種が入っているか確認してください）。")
 
         st.subheader("🏆 AI最終選定銘柄（利確スコア統合）")
+        st.caption("※ここは **Stage2（固定TP/SL/最大保有）で“利確が再現しやすい順”** に並べた最終ランキングです。")
         df = out.get("selected")
         if isinstance(df, pd.DataFrame) and len(df):
             df = df.reset_index(drop=True)
             df.insert(0, "順位", range(1, len(df)+1))
-            st.dataframe(df, width="stretch")
+
+            if mobile_cards:
+                render_cards_selected(df)
+                with st.expander("表で見る（PC向け）", expanded=False):
+                    st.dataframe(df, width="stretch")
+            else:
+                st.dataframe(df, width="stretch")
+
             st.download_button(
                 "⬇️ 選定結果をCSVでダウンロード",
                 data=df.to_csv(index=False).encode("utf-8-sig"),
@@ -217,7 +303,12 @@ if run_scan:
         if isinstance(guide, pd.DataFrame) and len(guide):
             guide = guide.reset_index(drop=True)
             guide.insert(0, "順位", range(1, len(guide)+1))
-            st.dataframe(guide, width="stretch")
+            if mobile_cards:
+                render_cards_guide(guide.head(60))
+                with st.expander("表で見る（PC向け）", expanded=False):
+                    st.dataframe(guide, width="stretch")
+            else:
+                st.dataframe(guide, width="stretch")
         else:
             st.info("価格目安の生成に必要なデータが不足しています。")
 
