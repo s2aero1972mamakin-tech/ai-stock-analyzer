@@ -1,335 +1,185 @@
-# -*- coding: utf-8 -*-
-"""
-JPX × SBI 半自動トレード（2ファイル完全版）
-- main.py : Streamlit UI / もしくは --batch で日次OHLC更新（DB作成）
-- logic.py: データ層（SQLite）＋スキャン/最適化/発注CSV生成
-
-実行例:
-  1) 日次バッチ（毎朝1回）
-     python main.py --batch --db ./jpx_ohlc.sqlite --days 730 --max-workers 6
-
-  2) 運用（Streamlit）
-     streamlit run main.py
-"""
-from __future__ import annotations
-
-import sys
-import json
-import argparse
-import traceback
 import os
-import datetime as _dt
+import json
+import time
+import traceback
+from datetime import datetime, timezone, timedelta
 
+import streamlit as st
 import pandas as pd
+
 import logic
 
-APP_BUILD = "2FILE-COMPLETE-2026-03-02"
+JST = timezone(timedelta(hours=9))
 
-def _json_dumps(obj) -> str:
-    def default(o):
+st.set_page_config(page_title="JPX 利確銘柄抽出AI", layout="wide")
+
+st.title("📈 JPX 利確が取れる銘柄抽出AI（数日〜2週間スイング / 固定TP・SL）")
+st.caption("固定条件：最大保有10営業日 / 利確=+1.5ATR(14) / 損切=-1.0ATR(14)  —  DB: Neon(Postgres)")
+
+st.sidebar.header("🗄️ データベース（Neon）")
+
+# Streamlit secrets -> env bridge (Cloudでsecretsを使うため)
+if "NEON_DATABASE_URL" in st.secrets and not os.environ.get("NEON_DATABASE_URL"):
+    os.environ["NEON_DATABASE_URL"] = st.secrets["NEON_DATABASE_URL"]
+
+db_url_ok, db_msg = logic.check_db_config()
+if not db_url_ok:
+    st.sidebar.error(db_msg)
+    st.sidebar.markdown(
+        "**設定方法（Streamlit Cloud）**\n"
+        "- App settings → Secrets に以下を追加\n"
+        "```toml\n"
+        "NEON_DATABASE_URL = \"postgresql://...\"\n"
+        "```"
+    )
+    st.stop()
+else:
+    st.sidebar.success("DB接続設定OK")
+
+with st.sidebar.expander("📌 最終更新状況", expanded=True):
+    status = logic.get_db_status()
+    if status.get("ok"):
+        last_ts = status.get("last_update_utc")
+        last_jst = None
+        if last_ts:
+            try:
+                dt = datetime.fromisoformat(last_ts.replace("Z","+00:00"))
+                last_jst = dt.astimezone(JST).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                last_jst = str(last_ts)
+        st.write(f"最新取引日: **{status.get('latest_trade_date','不明')}**")
+        st.write(f"最終DB更新(JST): **{last_jst or '不明'}**")
+        st.write(f"保存銘柄数: **{status.get('symbols_count','?')}**")
+        st.write(f"保存行数: **{status.get('rows_count','?')}**")
+        stale_hours = st.slider("更新忘れ警告（時間）", 6, 72, 30, 1)
+        if status.get("hours_since_update") is not None and status["hours_since_update"] > stale_hours:
+            st.warning(f"⚠ DB更新が古い可能性：{status['hours_since_update']:.1f} 時間前")
+    else:
+        st.warning(status.get("message","DB状態取得に失敗"))
+
+st.sidebar.markdown("---")
+st.sidebar.header("⚙ スキャン設定（Cloud最適化 3段階）")
+stage0_keep = st.sidebar.slider("Stage0 通過上限（全件→）", 300, 2000, 1200, 100)
+stage1_keep = st.sidebar.slider("Stage1 通過上限（→）", 80, 800, 300, 20)
+stage2_keep = st.sidebar.slider("最終選定数（→）", 20, 200, 60, 10)
+
+min_price = st.sidebar.number_input("最低株価（円）", min_value=0.0, value=300.0, step=50.0)
+min_avg_volume = st.sidebar.number_input("最低出来高（20日平均）", min_value=0.0, value=30000.0, step=5000.0)
+atr_pct_min = st.sidebar.number_input("ATR% 下限（低すぎると利確届かない）", min_value=0.0, value=1.0, step=0.1)
+atr_pct_max = st.sidebar.number_input("ATR% 上限（高すぎるとDD増）", min_value=0.0, value=8.0, step=0.5)
+
+st.sidebar.markdown("---")
+st.sidebar.header("🔄 DB更新（増分）")
+update_days_back = st.sidebar.slider("更新取得日数（直近）", 3, 30, 7, 1)
+keep_days = st.sidebar.slider("DB保持日数（古い分は削除）", 120, 900, 400, 10)
+chunk_size = st.sidebar.slider("一括取得チャンク（大きいほど速いが失敗リスク増）", 50, 600, 200, 50)
+
+col1, col2 = st.sidebar.columns(2)
+with col1:
+    if st.button("🧱 初期化", use_container_width=True):
         try:
-            if isinstance(o, (pd.Timestamp, _dt.datetime, _dt.date)):
-                return str(o)
-            if hasattr(o, "item"):
-                return o.item()
+            logic.ensure_schema()
+            st.success("スキーマOK")
         except Exception:
-            pass
-        return str(o)
-    return json.dumps(obj, ensure_ascii=False, indent=2, default=default)
+            st.error("スキーマ作成に失敗")
+            st.code(traceback.format_exc())
 
-def _run_batch(args: argparse.Namespace) -> int:
-    rep = logic.daily_batch_update(
-        db_path=args.db,
-        days=int(args.days),
-        max_workers=int(args.max_workers),
-        chunk_size=int(args.chunk_size),
-        prefer_provider=str(args.provider),
-        min_rows=int(args.min_rows),
-        sleep_sec=float(args.sleep_sec),
-    )
-    print(_json_dumps(rep))
-    return 0 if rep.get("ok") else 2
+with col2:
+    if st.button("⬇️ 更新", use_container_width=True):
+        t0 = time.time()
+        try:
+            with st.spinner("DB更新中..."):
+                rep = logic.update_db_incremental(days_back=update_days_back, keep_days=keep_days, chunk_size=chunk_size)
+            st.success(f"更新完了: {rep.get('upserted_rows',0)}行 / 失敗{rep.get('failed_symbols',0)}")
+            st.caption(f"所要: {time.time()-t0:.1f} 秒")
+            st.json(rep)
+            st.rerun()
+        except Exception:
+            st.error("DB更新に失敗")
+            st.code(traceback.format_exc())
 
-def _maybe_run_batch_from_cli() -> None:
-    # NOTE: streamlit run では通常 __name__ != "__main__"
-    if __name__ != "__main__":
-        return
-    p = argparse.ArgumentParser(add_help=True)
-    p.add_argument("--batch", action="store_true", help="日次バッチを実行（全銘柄OHLCをDBに保存）")
-    p.add_argument("--db", default=logic.DEFAULT_DB_PATH, help="SQLite DBパス")
-    p.add_argument("--days", type=int, default=730, help="取得する過去日数（例: 730=約2年）")
-    p.add_argument("--max-workers", type=int, default=6, help="並列数（上げすぎ注意）")
-    p.add_argument("--chunk-size", type=int, default=120, help="yfinance multi-download のチャンクサイズ")
-    p.add_argument("--provider", default="yfinance", choices=["yfinance","stooq","auto"], help="優先データ元")
-    p.add_argument("--min-rows", type=int, default=260, help="最低必要本数（不足は失敗扱い）")
-    p.add_argument("--sleep-sec", type=float, default=0.0, help="チャンクごとのスリープ（BAN回避）")
-    args = p.parse_args()
-
-    if args.batch:
-        sys.exit(_run_batch(args))
-
-# ---- CLI batch (must run BEFORE streamlit imports/execution) ----
-_maybe_run_batch_from_cli()
-
-# ---- Streamlit UI ----
-import streamlit as st
-
-# Show full error details in-app (useful for debugging)
-try:
-    st.set_option('client.showErrorDetails', True)
-except Exception:
-    pass
-  # noqa: E402
-
-st.set_page_config(page_title="SBI 半自動プロ仕様（2ファイル完全版）", layout="wide")
-st.title("📈 JPX AIスキャナ（2ファイル完全版）")
-st.caption("スキャン→セクター強度→銘柄選択→WF/MC（可能なら）→『戦略タイプ＋Entry/SL/TPの目安』。 build: " + APP_BUILD)
-
-
-# --- Batch status / stale warning ---
-meta = {}
-try:
-    meta = logic.db_get_meta(st.session_state.get("db_path", getattr(logic, "DEFAULT_DB_PATH", "./jpx_ohlc.sqlite")))
-except Exception:
-    meta = {}
-
-jst = _dt.timezone(_dt.timedelta(hours=9))
-now_jst = _dt.datetime.now(tz=jst)
-
-last_batch_jst = None
-if meta.get("last_batch_jst"):
-    try:
-        last_batch_jst = _dt.datetime.fromisoformat(meta["last_batch_jst"])
-    except Exception:
-        last_batch_jst = None
-
-with st.sidebar.expander("🗓️ データ更新状況（DB）", expanded=True):
-    if last_batch_jst:
-        st.write({
-            "last_batch_jst": last_batch_jst.isoformat(),
-            "rows_upserted": meta.get("last_batch_rows_upserted"),
-            "ok": meta.get("last_batch_ok"),
-        })
-    else:
-        st.warning("まだDB更新履歴が見つかりません。まず `python main.py --batch` を1回実行してください。")
-
-    stale_warn_hours = st.number_input("stale_warn_hours（更新忘れ警告: 時間）", min_value=6, max_value=240, value=30, step=6)
-    if last_batch_jst:
-        age_h = (now_jst - last_batch_jst).total_seconds() / 3600.0
-        if age_h > float(stale_warn_hours):
-            st.warning(f"⚠️ DBの更新が古い可能性があります（経過 {age_h:.1f} 時間）。朝のバッチを忘れている場合は `python main.py --batch` を実行してください。")
-
-    st.code("""推奨: 毎朝1回だけ
-python main.py --batch --db ./jpx_ohlc.sqlite --days 730 --max-workers 6
-""", language="bash")
-
-with st.sidebar.expander("🛠️ デバッグ（エラー詳細）", expanded=False):
-    st.write("Streamlitの赤塗りエラーが出た場合、ここに例外詳細を表示します。")
-    if "last_exception" in st.session_state and st.session_state["last_exception"]:
-        st.code(st.session_state["last_exception"])
-    else:
-        st.caption("（まだエラーは記録されていません）")
-
-
-
-
-prog = st.progress(0)
-status = st.empty()
-detail = st.empty()
-
-def progress_cb(stage: str, payload: dict):
-    stage_map = {
-        "market_vol_fetch": 0.02, "universe": 0.05, "fetch": 0.10, "merge": 0.55,
-        "sector_strength": 0.60, "preselect": 0.65, "heavy_sims": 0.70, "final_rank": 0.92,
-        "done": 1.00, "error": 1.00,
-    }
-    if stage in stage_map:
-        prog.progress(int(stage_map[stage] * 100))
-
-    if stage == "fetch_progress":
-        done = payload.get("done", 0); total = payload.get("total", 1)
-        ok = payload.get("ok", 0); fail = payload.get("fail", 0)
-        prefer_yf = payload.get("prefer_yf", False)
-        used_db = payload.get("db_hit", 0)
-        frac = 0.10 + 0.40 * (done / max(1, total))
-        prog.progress(int(frac * 100))
-        status.write(f"📡 取得中: {done}/{total}  OK={ok} / FAIL={fail} / DB_HIT={used_db}  prefer_yfinance={prefer_yf}")
-        if payload:
-            detail.write(payload)
-        return
-
-    if stage == "heavy_progress":
-        done = payload.get("done", 0); total = payload.get("total", 1)
-        frac = 0.70 + 0.20 * (done / max(1, total))
-        prog.progress(int(frac * 100))
-        status.write(f"🧠 最適化/推定中: {done}/{total}  heavy_ok={payload.get('heavy_ok')} / heavy_fail={payload.get('heavy_fail')}")
-        if payload:
-            detail.write(payload)
-        return
-
-    status.write(f"⏳ stage: {stage}")
-    if payload:
-        detail.write(payload)
-
-if "diag_obj" not in st.session_state:
-    st.session_state["diag_obj"] = {}
-if "diag_text" not in st.session_state:
-    st.session_state["diag_text"] = ""
-if "last_exception" not in st.session_state:
-    st.session_state["last_exception"] = ""
-
-
-with st.sidebar.expander("🧭 使い方 / 設定の意味（必読）", expanded=True):
-    st.markdown(f"""
-### 目的
-JPX全銘柄を前提に、**スキャン→セクター強度→銘柄選択→WF/MC→『戦略タイプ＋価格目安』** を出します。
-
-### Streamlit Cloud運用の注意
-- DB（SQLite）はアプリの実行環境内に保存されます。Cloudは再起動/再デプロイで消えることがあるため、
-  **「毎回オンデマンドでも止まりにくい」ように yfinance の“まとめDL”でヒット数を減らす設計**にしています。
-
-### スキャンが止まらない設計（重要）
-- 日中の Streamlit は **ローカルDB（SQLite）を優先**してOHLCを読むため、外部制限で止まりにくいです。
-- それでもDBに無い銘柄は自動取得（yfinance優先）しますが、失敗しても **部分結果で必ず診断JSON** を出します。
-
-### 推奨運用
-- 毎朝1回: `python main.py --batch` でDB更新（4000銘柄でも安定）
-- 日中: `streamlit run main.py` でスキャン/発注
-
-build: `{APP_BUILD}`
-""")
-
-st.sidebar.header("⚙️ 設定")
-with st.sidebar.form("scan_form", clear_on_submit=False):
-    universe_limit = st.slider("スキャン対象上限", 200, 2500, 800, step=100)
-
-    market_filter = st.selectbox("市場フィルタ（JPXマスターに列がある場合のみ有効）", ["ALL","PRIME","STANDARD","GROWTH"], index=1)
-    size_filter = st.selectbox("規模フィルタ（列がある場合のみ有効）", ["ALL","LARGE","MID","SMALL"], index=0)
-    universe_mode = st.selectbox("ユニバース抽出方式", ["RANDOM_STRATIFIED","HEAD"], index=0)
-
-    min_price = st.number_input("最低株価フィルタ（円）", 0.0, 100000.0, 200.0, step=50.0)
-    min_avg_volume = st.number_input("最低出来高（20日平均）", 0.0, 50000000.0, 50000.0, step=10000.0)
-    cache_days = st.slider("OHLCキャッシュ/DB鮮度（日）", 0, 14, 2)
-
-    sector_top_n = st.slider("上位セクター数", 2, 12, 6)
-    pre_top_m = st.slider("重い計算対象（事前候補M）", 10, 120, 35, step=5)
-    top_n = st.slider("最終採用銘柄数", 3, 10, 6)
-    corr_threshold = st.slider("相関除外しきい値", 0.3, 0.95, 0.70, step=0.05)
-
-    st.markdown("---")
-    st.markdown("---")
-    max_workers = st.slider("並列数（多すぎ注意）", 3, 16, 8)
-    time_budget_sec = st.slider("タイムバジェット（秒）", 20, 180, 70, step=1)
-
-    run = st.form_submit_button("🔥 スキャン開始", type="primary")
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _cached_market_vol():
-    try:
-        return logic.compute_market_vol_ratio(progress_cb=None)
-    except Exception:
-        err = traceback.format_exc()
-        return None, {"error": err}
-
-with st.sidebar.expander("📉 市場ボラ（自動: 1306.T）", expanded=False):
-    if st.button("🔄 市場ボラを再取得（必要時のみ）"):
-        _cached_market_vol.clear()
-    vol_ratio, vol_meta = _cached_market_vol()
-    if vol_ratio is None and isinstance(vol_meta, dict) and vol_meta.get('error'):
-        st.session_state['last_exception'] = vol_meta['error']
-        st.error('市場ボラ計算でエラー（詳細はサイドバーの「デバッグ」へ）')
-    st.write({"vol_ratio": vol_ratio, "meta": vol_meta})
-
-st.sidebar.subheader("🧾 診断JSON")
-if st.session_state["diag_text"]:
+st.sidebar.markdown("---")
+st.sidebar.header("🧾 診断JSON")
+last_diag = logic.load_last_diag()
+if last_diag:
+    st.sidebar.success("前回の診断JSONあり")
     st.sidebar.download_button(
-        "⬇️ 診断JSONをダウンロード",
-        data=st.session_state["diag_text"].encode("utf-8"),
-        file_name="diag.json",
+        "⬇️ 前回の診断JSONをダウンロード",
+        data=json.dumps(last_diag, ensure_ascii=False, indent=2).encode("utf-8"),
+        file_name="diag_last.json",
         mime="application/json",
+        use_container_width=True,
     )
 else:
-    st.sidebar.info("スキャン実行後にここにDLが出ます（失敗でも出ます）。")
+    st.sidebar.info("前回の診断JSONなし（スキャン実行後に保存）")
 
-st.markdown("## 🧾 診断JSON（ダウンロード）")
-if st.session_state["diag_text"]:
-    st.download_button(
-        "⬇️ 診断JSONをダウンロード（メイン）",
-        data=st.session_state["diag_text"].encode("utf-8"),
-        file_name="diag.json",
-        mime="application/json",
-    )
-else:
-    st.caption("未生成（スキャン後に出ます）")
+st.markdown("---")
+colA, colB = st.columns([1,1])
+with colA:
+    run_scan = st.button("🚀 スキャン実行（Stage0→1→2）", use_container_width=True)
+with colB:
+    show_debug = st.toggle("🛠️ デバッグ表示（traceback）", value=False)
 
-if run:
-    prog.progress(1)
-    status.write("開始...")
-    detail.empty()
-
+if run_scan:
+    t0 = time.time()
     try:
-        with st.spinner("スキャン＆最適化中...（進捗は上に表示）"):
-            result = logic.scan_engine(
-                universe_limit=int(universe_limit),
-                market_filter=str(market_filter),
-                size_filter=str(size_filter),
-                universe_mode=str(universe_mode),
-                min_price=float(min_price),
-                min_avg_volume=float(min_avg_volume),
-                cache_days=int(cache_days),
-                sector_top_n=int(sector_top_n),
-                pre_top_m=int(pre_top_m),
-                top_n=int(top_n),
-                corr_threshold=float(corr_threshold),
-                max_workers=int(max_workers),
-                time_budget_sec=int(time_budget_sec),
-                progress_cb=progress_cb,
+        with st.spinner("スキャン中...（DB読み込み→段階絞り込み→利確スコア）"):
+            out = logic.run_scan_3stage(
+                stage0_keep=stage0_keep,
+                stage1_keep=stage1_keep,
+                stage2_keep=stage2_keep,
+                min_price=min_price,
+                min_avg_volume=min_avg_volume,
+                atr_pct_min=atr_pct_min,
+                atr_pct_max=atr_pct_max,
             )
-    except Exception as e:
-        result = {
-            "ok": False,
-            "error": f"main_exception: {type(e).__name__}",
-            "diag": {"stage": "error", "errors": [f"{type(e).__name__}: {e}"]},
-            "sector_ranking": pd.DataFrame(),
-            "candidates": pd.DataFrame(),
-        }
+        elapsed = time.time() - t0
+        diag = out.get("diag", {})
+        diag["elapsed_sec"] = elapsed
+        logic.save_last_diag(diag)
 
-    st.session_state["diag_obj"] = result.get("diag") or {}
-    st.session_state["diag_text"] = _json_dumps(st.session_state["diag_obj"])
+        st.success(f"スキャン完了（{elapsed:.1f}秒） / mode={diag.get('mode','?')}")
+        with st.expander("📊 診断（JSON）", expanded=False):
+            st.json(diag)
 
-    if not result.get("ok"):
-        st.error("スキャンに失敗/部分終了しました。診断JSONをDLして原因を確認できます。")
-        if result.get("error"):
-            st.write({"error": result.get("error")})
-        st.markdown("### 直近の失敗サンプル（最大25件）")
-        st.json((st.session_state["diag_obj"] or {}).get("sample_failures", []))
-        st.markdown("### 診断JSON（表示）")
-        st.json(st.session_state["diag_obj"], expanded=False)
-    else:
-        st.success("完了（タイムバジェットで部分終了でも結果は出ます）")
+        st.subheader("🏁 セクター強度ランキング（Stage0）")
+        sec = out.get("sector_strength")
+        if isinstance(sec, pd.DataFrame) and len(sec):
+            st.dataframe(sec, width="stretch")
+        else:
+            st.info("セクター情報が不足しているため、セクター強度は簡易表示/非表示です。")
 
-        st.markdown("## 🏆 セクター強度ランキング")
-        st.dataframe(result["sector_ranking"], use_container_width=True)
+        st.subheader("🏆 AI最終選定銘柄（利確スコア統合）")
+        df = out.get("selected")
+        if isinstance(df, pd.DataFrame) and len(df):
+            df = df.reset_index(drop=True)
+            df.insert(0, "順位", range(1, len(df)+1))
+            st.dataframe(df, width="stretch")
+            st.download_button(
+                "⬇️ 選定結果をCSVでダウンロード",
+                data=df.to_csv(index=False).encode("utf-8-sig"),
+                file_name="selected.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        else:
+            st.warning("選定結果が空です（DB更新不足・フィルタが厳しすぎる可能性）")
 
-        cands = result["candidates"]
-        st.markdown("## 🎯 AI最終選定銘柄（WF/MC後）")
-        show_cols = [c for c in [
-            "Symbol","name","sector","Close","RET_3M",
-            "wf_oos_mean_exp","wf_oos_wr","wf_oos_rr","wf_oos_trades",
-            "mc_dd_p05","final_score","wf_best"
-        ] if hasattr(cands, "columns") and c in cands.columns]
-        st.dataframe(cands[show_cols], use_container_width=True)
+        st.subheader("🧭 推奨方式と価格目安（Entry/SL/TP）")
+        guide = out.get("guide")
+        if isinstance(guide, pd.DataFrame) and len(guide):
+            guide = guide.reset_index(drop=True)
+            guide.insert(0, "順位", range(1, len(guide)+1))
+            st.dataframe(guide, width="stretch")
+        else:
+            st.info("価格目安の生成に必要なデータが不足しています。")
 
-        st.markdown("## 🧭 推奨方式と価格目安（Entry/SL/TP）")
-        plan_cols = [c for c in [
-            "Symbol","name","sector","strategy","Close","entry","stop_loss","take_profit",
-            "RET_3M","RSI","ATR_PCT","VOL_AVG20",
-            "wf_oos_wr","wf_oos_rr","mc_dd_p05","final_score"
-        ] if c in cands.columns]
-        st.dataframe(cands[plan_cols], use_container_width=True)
+    except Exception:
+        st.error("スキャン中にエラーが発生しました")
+        if show_debug:
+            st.code(traceback.format_exc())
+        else:
+            st.caption("（デバッグ表示をONにすると詳細tracebackを表示します）")
 
-        st.markdown("### 診断JSON（表示）")
-        st.json(st.session_state["diag_obj"], expanded=False)
-else:
-    status.info("左の設定を決めて『スキャン開始』を押してください。")
-    prog.progress(0)
+st.markdown("---")
+st.caption("※注意：本ツールは投資助言ではありません。最終判断はご自身で行ってください。")
