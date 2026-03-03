@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+RATE_LIMIT_SLEEP_SEC = float(os.environ.get('RATE_LIMIT_SLEEP_SEC','0.4'))
+
 LAST_DIAG_PATH = "last_diag.json"
 
 # --- DB URL ---
@@ -351,6 +353,8 @@ def update_db_incremental(days_back: int = 14, keep_days: int = 400, chunk_size:
                 failed += len(chunk)
                 if len(sample_fail) < 50:
                     sample_fail.extend(chunk[: min(10, len(chunk))])
+                # Cloud対策：過剰リクエスト抑制
+                time.sleep(RATE_LIMIT_SLEEP_SEC)
                 continue
 
             rows = []
@@ -390,6 +394,9 @@ def update_db_incremental(days_back: int = 14, keep_days: int = 400, chunk_size:
                     """, rows)
                 upserted += len(rows)
                 conn.commit()
+
+            # Cloud対策：過剰リクエスト抑制
+            time.sleep(RATE_LIMIT_SLEEP_SEC)
 
         cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).date()
         with conn.cursor() as cur:
