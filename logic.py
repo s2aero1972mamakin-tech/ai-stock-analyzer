@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+JST = timezone(timedelta(hours=9))
+
 RATE_LIMIT_SLEEP_SEC = float(os.environ.get('RATE_LIMIT_SLEEP_SEC','0.4'))
 
 LAST_DIAG_PATH = "last_diag.json"
@@ -69,6 +71,7 @@ def _connect():
     )
 
 def ensure_schema() -> None:
+    """DBスキーマを安全に作成/拡張（後方互換）"""
     conn = _connect()
     with conn.cursor() as cur:
         cur.execute("""
@@ -90,14 +93,43 @@ def ensure_schema() -> None:
             v TEXT
         );
         """)
+        # 銘柄マスタ（JPX公式一覧から自動取得する想定）
         cur.execute("""
         CREATE TABLE IF NOT EXISTS universe_symbols (
             symbol TEXT PRIMARY KEY,
+            name TEXT,
+            market TEXT,
+            sector33_code TEXT,
+            sector33_name TEXT,
+            sector17_code TEXT,
+            sector17_name TEXT,
+            scale_code TEXT,
+            scale_name TEXT,
+            updated_utc TIMESTAMP DEFAULT NOW()
+        );
+        """)
+        # 既存DBの後方互換（古いテーブルに列を追加）
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS name TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS market TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector33_code TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector33_name TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector17_code TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector17_name TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS scale_code TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS scale_name TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS updated_utc TIMESTAMP DEFAULT NOW();")
+        # 財務/イベント（簡易）キャッシュ
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS fundamentals_cache (
+            symbol TEXT PRIMARY KEY,
+            asof_date DATE,
+            payload_json TEXT,
             updated_utc TIMESTAMP DEFAULT NOW()
         );
         """)
     conn.commit()
     conn.close()
+
 
 def _set_meta(conn, k: str, v: str):
     with conn.cursor() as cur:
@@ -122,9 +154,9 @@ def universe_count() -> int:
     return n
 
 def universe_upsert(symbols: List[str]) -> int:
+    """後方互換: symbols(文字列)のみを登録。"""
     ensure_schema()
-    # normalize
-    norm = []
+    rows = []
     for s in symbols:
         s = str(s).strip()
         if not s:
@@ -132,30 +164,81 @@ def universe_upsert(symbols: List[str]) -> int:
         s2 = s.replace(" ", "").upper()
         if re.fullmatch(r"\d{4}", s2):
             s2 = s2 + ".T"
-        norm.append(s2)
-    # unique preserve order
+        rows.append({"symbol": s2})
+    if not rows:
+        return 0
+    return universe_upsert_rows(rows)
+
+def universe_upsert_rows(rows: List[Dict[str, Any]]) -> int:
+    """新: symbol + メタ（市場/33業種/銘柄名など）を upsert"""
+    ensure_schema()
+    # normalize + unique by symbol (preserve order)
     seen = set()
-    uniq = []
-    for s in norm:
-        if s not in seen:
-            seen.add(s)
-            uniq.append(s)
-    if not uniq:
+    norm_rows: List[Dict[str, Any]] = []
+    for r in rows:
+        sym = str(r.get("symbol","")).strip().replace(" ", "").upper()
+        if not sym:
+            continue
+        if re.fullmatch(r"\d{4}", sym):
+            sym = sym + ".T"
+        if sym in seen:
+            continue
+        seen.add(sym)
+        rr = dict(r)
+        rr["symbol"] = sym
+        norm_rows.append(rr)
+
+    if not norm_rows:
         return 0
 
     conn = _connect()
     with conn.cursor() as cur:
-        for sym in uniq:
+        for r in norm_rows:
             cur.execute(
-                "INSERT INTO universe_symbols(symbol, updated_utc) VALUES(%s, NOW()) "
-                "ON CONFLICT(symbol) DO UPDATE SET updated_utc=NOW();",
-                (sym,),
+                """
+                INSERT INTO universe_symbols(symbol, name, market, sector33_code, sector33_name, sector17_code, sector17_name, scale_code, scale_name, updated_utc)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW())
+                ON CONFLICT(symbol) DO UPDATE SET
+                    name=COALESCE(EXCLUDED.name, universe_symbols.name),
+                    market=COALESCE(EXCLUDED.market, universe_symbols.market),
+                    sector33_code=COALESCE(EXCLUDED.sector33_code, universe_symbols.sector33_code),
+                    sector33_name=COALESCE(EXCLUDED.sector33_name, universe_symbols.sector33_name),
+                    sector17_code=COALESCE(EXCLUDED.sector17_code, universe_symbols.sector17_code),
+                    sector17_name=COALESCE(EXCLUDED.sector17_name, universe_symbols.sector17_name),
+                    scale_code=COALESCE(EXCLUDED.scale_code, universe_symbols.scale_code),
+                    scale_name=COALESCE(EXCLUDED.scale_name, universe_symbols.scale_name),
+                    updated_utc=NOW();
+                """,
+                (
+                    r.get("symbol"),
+                    r.get("name"),
+                    r.get("market"),
+                    r.get("sector33_code"),
+                    r.get("sector33_name"),
+                    r.get("sector17_code"),
+                    r.get("sector17_name"),
+                    r.get("scale_code"),
+                    r.get("scale_name"),
+                ),
             )
     conn.commit()
     conn.close()
-    return len(uniq)
+    return len(norm_rows)
 
 def universe_load_symbols(limit: Optional[int] = None) -> List[str]:
+    ensure_schema()
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            if limit is None:
+                cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol;")
+            else:
+                cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol LIMIT %s;", (int(limit),))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return [r[0] for r in rows if r and r[0]]
+
     ensure_schema()
     conn = _connect()
     with conn.cursor() as cur:
@@ -202,8 +285,26 @@ def universe_register_from_inputs(uploaded_csv_file, pasted_text: str):
         return 0, f"DB登録に失敗: {e}"
 
 
+def universe_load_meta() -> pd.DataFrame:
+    """universe_symbols からメタ（市場/33業種など）を読み込む。無ければ空DF。"""
+    ensure_schema()
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT symbol, name, market, sector33_code, sector33_name, sector17_code, sector17_name, scale_code, scale_name FROM universe_symbols;")
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return pd.DataFrame(columns=["symbol","name","market","sector33_code","sector33_name","sector17_code","sector17_name","scale_code","scale_name"])
+    return pd.DataFrame(rows, columns=["symbol","name","market","sector33_code","sector33_name","sector17_code","sector17_name","scale_code","scale_name"])
+
 def universe_autofetch_from_jpx() -> Tuple[int, str]:
-    """JPX公式サイトで配布されている『東証上場銘柄一覧（Excel）』を取得し、universe_symbols に登録する。"""
+    """JPX公式サイトの『東証上場銘柄一覧（Excel）』を取得し、銘柄マスタ（universe_symbols）に登録する。
+
+    - 4桁コードは自動で .T を付与
+    - 可能なら 33業種/市場区分/規模 なども保存（Stage0のセクター判定に使用）
+    """
     ensure_schema()
 
     url_candidates = [
@@ -215,7 +316,7 @@ def universe_autofetch_from_jpx() -> Tuple[int, str]:
     for url in url_candidates:
         try:
             import requests  # type: ignore
-            r = requests.get(url, timeout=30)
+            r = requests.get(url, timeout=45)
             r.raise_for_status()
             content = r.content
             break
@@ -232,39 +333,103 @@ def universe_autofetch_from_jpx() -> Tuple[int, str]:
     except Exception as e:
         return 0, f"Excel読込に失敗しました（環境依存）: {e}"
 
-    pick = None
-    # よくある列名（日本語）
+    # 列名の推定（JPXの data_j.xls 前提）
+    col_code = None
+    col_name = None
+    col_market = None
+    col_s33_code = None
+    col_s33_name = None
+    col_s17_code = None
+    col_s17_name = None
+    col_scale_code = None
+    col_scale_name = None
+
     for c in df.columns:
-        if str(c).strip() in ["コード", "銘柄コード"]:
-            pick = c
-            break
-    if pick is None:
-        # 英語/一般
-        for c in df.columns:
-            low = str(c).lower().replace(" ", "").replace("-", "_")
-            if low in ["code", "securitycode", "security_code", "stockcode", "stock_code"]:
-                pick = c
-                break
-    if pick is None:
-        # 4桁比率で推定
+        cs = str(c).strip()
+        if cs in ["コード", "銘柄コード"]:
+            col_code = c
+        elif cs in ["銘柄名", "会社名", "名称"]:
+            col_name = c
+        elif cs in ["市場・商品区分", "市場区分", "市場"]:
+            col_market = c
+        elif cs in ["33業種コード", "33業種"]:
+            col_s33_code = c
+        elif cs in ["33業種区分", "33業種区分（日本語）"]:
+            col_s33_name = c
+        elif cs in ["17業種コード", "17業種"]:
+            col_s17_code = c
+        elif cs in ["17業種区分"]:
+            col_s17_name = c
+        elif cs in ["規模コード", "規模"]:
+            col_scale_code = c
+        elif cs in ["規模区分"]:
+            col_scale_name = c
+
+    # fallback: 4桁比率でコード列推定
+    if col_code is None:
         for c in df.columns:
             ser = df[c].dropna().astype(str).str.replace(r"\D", "", regex=True)
             if len(ser) == 0:
                 continue
             ratio = ser.str.fullmatch(r"\d{4}").mean()
             if ratio > 0.6:
-                pick = c
+                col_code = c
                 break
 
-    if pick is None:
+    if col_code is None:
         return 0, "銘柄コード列を特定できませんでした。手動CSVでの登録をお使いください。"
 
-    codes = df[pick].dropna().astype(str).str.replace(r"\D", "", regex=True)
-    codes = [c for c in codes.tolist() if re.fullmatch(r"\d{4}", c)]
-    if not codes:
+    def _norm_code(x: Any) -> Optional[str]:
+        s = "" if x is None else str(x)
+        s = re.sub(r"\D", "", s)
+        if re.fullmatch(r"\d{4}", s):
+            return s + ".T"
+        return None
+
+    rows: List[Dict[str, Any]] = []
+    for _, r in df.iterrows():
+        sym = _norm_code(r.get(col_code))
+        if not sym:
+            continue
+        row = {"symbol": sym}
+        if col_name is not None:
+            v = r.get(col_name)
+            if pd.notna(v):
+                row["name"] = str(v).strip()
+        if col_market is not None:
+            v = r.get(col_market)
+            if pd.notna(v):
+                row["market"] = str(v).strip()
+        if col_s33_code is not None:
+            v = r.get(col_s33_code)
+            if pd.notna(v):
+                row["sector33_code"] = str(v).strip()
+        if col_s33_name is not None:
+            v = r.get(col_s33_name)
+            if pd.notna(v):
+                row["sector33_name"] = str(v).strip()
+        if col_s17_code is not None:
+            v = r.get(col_s17_code)
+            if pd.notna(v):
+                row["sector17_code"] = str(v).strip()
+        if col_s17_name is not None:
+            v = r.get(col_s17_name)
+            if pd.notna(v):
+                row["sector17_name"] = str(v).strip()
+        if col_scale_code is not None:
+            v = r.get(col_scale_code)
+            if pd.notna(v):
+                row["scale_code"] = str(v).strip()
+        if col_scale_name is not None:
+            v = r.get(col_scale_name)
+            if pd.notna(v):
+                row["scale_name"] = str(v).strip()
+        rows.append(row)
+
+    if not rows:
         return 0, "銘柄コードが抽出できませんでした。"
 
-    n = universe_upsert(codes)
+    n = universe_upsert_rows(rows)
     return n, "ok"
 
 
@@ -530,6 +695,9 @@ def fetch_last_n_days(symbols: List[str], n_days: int = 80) -> pd.DataFrame:
     return df
 
 def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    """Stage0: DBにある最新2営業日のスナップショット+20日平均出来高だけで全件を軽量スクリーニング。
+    33業種（JPX公式一覧）をDBに持てている場合は、セクター強度ランキングも出す。
+    """
     ensure_schema()
     universe = universe_load_symbols()
     t0 = time.time()
@@ -538,60 +706,123 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
         latest, prev = _read_latest_dates(conn)
         if not latest or not prev:
             return pd.DataFrame(), pd.DataFrame(), {"ok": False, "reason": "db_has_no_latest_prev"}
+
         with conn.cursor() as cur:
-            cur.execute("""
-            WITH last2 AS (
-                SELECT symbol, trade_date, close, volume
-                FROM ohlc_daily
-                WHERE trade_date IN (%s, %s)
-            ),
-            piv AS (
-                SELECT symbol,
-                       MAX(CASE WHEN trade_date=%s THEN close END) AS close_latest,
-                       MAX(CASE WHEN trade_date=%s THEN close END) AS close_prev
-                FROM last2
-                GROUP BY symbol
+            cur.execute(
+                """
+                WITH last2 AS (
+                    SELECT symbol, trade_date, close, volume
+                    FROM ohlc_daily
+                    WHERE trade_date IN (%s, %s)
+                ),
+                piv AS (
+                    SELECT symbol,
+                           MAX(CASE WHEN trade_date=%s THEN close END) AS close_latest,
+                           MAX(CASE WHEN trade_date=%s THEN close END) AS close_prev
+                    FROM last2
+                    GROUP BY symbol
+                )
+                SELECT symbol, close_latest, close_prev
+                FROM piv;
+                """,
+                (latest, prev, latest, prev),
             )
-            SELECT symbol, close_latest, close_prev
-            FROM piv;
-            """, (latest, prev, latest, prev))
             snap = cur.fetchall()
 
             cutoff20 = (datetime.fromisoformat(latest).date() - timedelta(days=40)).isoformat()
-            cur.execute("""
-            SELECT symbol, AVG(volume)::float AS avg_vol20
-            FROM ohlc_daily
-            WHERE symbol = ANY(%s) AND trade_date >= %s
-            GROUP BY symbol;
-            """, (universe, cutoff20))
+            cur.execute(
+                """
+                SELECT symbol, AVG(volume)::float AS avg_vol20
+                FROM ohlc_daily
+                WHERE symbol = ANY(%s) AND trade_date >= %s
+                GROUP BY symbol;
+                """,
+                (universe, cutoff20),
+            )
             vol20 = cur.fetchall()
     finally:
         conn.close()
 
-    snap_df = pd.DataFrame(snap, columns=["symbol","close_latest","close_prev"])
-    vol20_df = pd.DataFrame(vol20, columns=["symbol","avg_vol20"])
+    snap_df = pd.DataFrame(snap, columns=["symbol", "close_latest", "close_prev"])
+    vol20_df = pd.DataFrame(vol20, columns=["symbol", "avg_vol20"])
     df = snap_df.merge(vol20_df, on="symbol", how="left")
-    df["pct_change_1d"] = (df["close_latest"]/(df["close_prev"]+1e-12)-1.0)*100.0
+    df["pct_change_1d"] = (df["close_latest"] / (df["close_prev"] + 1e-12) - 1.0) * 100.0
 
     df = df[pd.notna(df["close_latest"])]
     df = df[df["close_latest"] >= float(min_price)]
     df = df[pd.notna(df["avg_vol20"])]
     df = df[df["avg_vol20"] >= float(min_avg_volume)]
 
-    sec = (df.groupby("symbol", dropna=False)["pct_change_1d"].median().sort_values(ascending=False).reset_index())
-    sec.columns = ["銘柄","前日比（%）"]
-    sec = sec.head(30)
-    sec.insert(0, "順位", range(1, len(sec)+1))
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame(), {"ok": True, "latest_trade_date": latest, "elapsed_sec": time.time() - t0, "stage0_candidates": 0}
 
-    # Stage0 score: simple (no sector without master)
-    df["stage0_score"] = 0.7*df["pct_change_1d"].fillna(0.0) + 0.3*np.log10(df["avg_vol20"].fillna(1.0))
-    df = df.sort_values("stage0_score", ascending=False).head(int(keep)).copy()
+    # Stage0 基本スコア（OHLCを追加取得しない軽量スコア）
+    df["stage0_score"] = 0.7 * df["pct_change_1d"].fillna(0.0) + 0.3 * np.log10(df["avg_vol20"].fillna(1.0))
 
-    out = df.rename(columns={"symbol":"銘柄","close_latest":"現在値（終値）","pct_change_1d":"前日比（%）","avg_vol20":"平均出来高20日"})[["銘柄","現在値（終値）","前日比（%）","平均出来高20日","stage0_score"]]
+    # 33業種メタ（あれば）
+    meta_df = universe_load_meta()
+    if not meta_df.empty and "sector33_name" in meta_df.columns:
+        df = df.merge(meta_df[["symbol", "sector33_name"]], on="symbol", how="left")
+    df["sector33_name"] = df.get("sector33_name").fillna("不明")
+
+    sec = (
+        df.groupby("sector33_name", dropna=False)["stage0_score"]
+        .median()
+        .sort_values(ascending=False)
+        .reset_index()
+    )
+    sec.columns = ["セクター（33業種）", "強度（中央値）"]
+    sec.insert(0, "順位", range(1, len(sec) + 1))
+
+    # セクター比率を維持しつつ上位抽出
+    keep = int(keep)
+    df2 = df.sort_values(["sector33_name", "stage0_score"], ascending=[True, False]).copy()
+    counts = df2["sector33_name"].value_counts()
+    total = int(counts.sum()) if len(counts) else 0
+    min_per = 3
+    alloc: Dict[str, int] = {}
+    if total > 0:
+        for sn, cnt in counts.items():
+            alloc[sn] = max(min_per, int(round(keep * (cnt / total))))
+
+        def _sum_alloc() -> int:
+            return int(sum(alloc.values()))
+
+        while _sum_alloc() > keep:
+            k_max = max(alloc, key=lambda k: alloc[k])
+            if alloc[k_max] > min_per:
+                alloc[k_max] -= 1
+            else:
+                break
+        while _sum_alloc() < keep:
+            k_max = max(alloc, key=lambda k: counts.get(k, 0))
+            alloc[k_max] += 1
+
+    picks = []
+    for sn, k in alloc.items():
+        picks.append(df2[df2["sector33_name"] == sn].head(int(k)))
+    picked = pd.concat(picks, ignore_index=True) if picks else df2.head(keep)
+
+    picked = picked.sort_values("stage0_score", ascending=False)
+    picked_syms = set(picked["symbol"].tolist())
+    if len(picked) < keep:
+        rest = df2[~df2["symbol"].isin(picked_syms)].sort_values("stage0_score", ascending=False)
+        picked = pd.concat([picked, rest.head(keep - len(picked))], ignore_index=True)
+
+    picked = picked.sort_values("stage0_score", ascending=False).head(keep).copy()
+
+    out = picked.rename(
+        columns={
+            "symbol": "銘柄",
+            "close_latest": "現在値（終値）",
+            "pct_change_1d": "前日比（%）",
+            "avg_vol20": "平均出来高20日",
+        }
+    )[["銘柄", "現在値（終値）", "前日比（%）", "平均出来高20日", "stage0_score", "sector33_name"]]
     out["stage0_score"] = out["stage0_score"].astype(float).round(4)
 
-    meta = {"ok": True, "latest_trade_date": latest, "elapsed_sec": time.time()-t0, "stage0_candidates": int(len(out))}
-    return out, pd.DataFrame(), meta
+    meta = {"ok": True, "latest_trade_date": latest, "elapsed_sec": time.time() - t0, "stage0_candidates": int(len(out))}
+    return out, sec, meta
 
 def stage1_select(stage0_df: pd.DataFrame, keep: int, atr_pct_min: float, atr_pct_max: float) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     t0 = time.time()
@@ -625,7 +856,139 @@ def stage1_select(stage0_df: pd.DataFrame, keep: int, atr_pct_min: float, atr_pc
     df["現在値（終値）"] = df["現在値（終値）"].round(2)
     return df, {"ok": True, "elapsed_sec": time.time()-t0, "stage1_candidates": int(len(df))}
 
-def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_bars: int = 60) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+def _fundamentals_get_cached(symbol: str) -> Optional[Dict[str, Any]]:
+    """yfinanceの info/calendar を使った簡易財務/イベント。RateLimit時はNone。"""
+    ensure_schema()
+    symbol = str(symbol).strip().upper()
+    if not symbol:
+        return None
+
+    today = datetime.now(JST).date()
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT asof_date, payload_json FROM fundamentals_cache WHERE symbol=%s;", (symbol,))
+            row = cur.fetchone()
+        if row and row[0] == today and row[1]:
+            try:
+                return json.loads(row[1])
+            except Exception:
+                pass
+    finally:
+        conn.close()
+
+    # fetch
+    try:
+        import yfinance as yf  # type: ignore
+        tk = yf.Ticker(symbol)
+        info = {}
+        try:
+            info = tk.info or {}
+        except Exception:
+            info = {}
+        cal = {}
+        try:
+            cal = getattr(tk, "calendar", None)
+            if hasattr(cal, "to_dict"):
+                cal = cal.to_dict()
+            if isinstance(cal, pd.DataFrame):
+                cal = cal.to_dict()
+        except Exception:
+            cal = {}
+
+        payload = {
+            "symbol": symbol,
+            "asof": str(today),
+            "info": info,
+            "calendar": cal,
+        }
+    except Exception:
+        return None
+
+    # cache
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO fundamentals_cache(symbol, asof_date, payload_json, updated_utc)
+                VALUES(%s,%s,%s,NOW())
+                ON CONFLICT(symbol) DO UPDATE SET asof_date=EXCLUDED.asof_date, payload_json=EXCLUDED.payload_json, updated_utc=NOW();
+                """,
+                (symbol, today, json.dumps(payload, ensure_ascii=False)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return payload
+
+def _buffett_score(payload: Dict[str, Any]) -> Tuple[Optional[float], str]:
+    """超簡易の“バフェット風”評価（データが無ければNone）。"""
+    info = payload.get("info") or {}
+    try:
+        roe = info.get("returnOnEquity")
+        pm = info.get("profitMargins")
+        de = info.get("debtToEquity")
+        fcf = info.get("freeCashflow")
+        mc = info.get("marketCap")
+        score = 0.0
+        used = 0
+        if isinstance(roe, (int,float)) and roe == roe:
+            score += max(-1.0, min(1.0, float(roe))) * 1.5
+            used += 1
+        if isinstance(pm, (int,float)) and pm == pm:
+            score += max(-1.0, min(1.0, float(pm))) * 1.0
+            used += 1
+        if isinstance(de, (int,float)) and de == de:
+            # 低いほど良い
+            score += max(-1.0, min(1.0, (1.0 - float(de)/200.0))) * 1.0
+            used += 1
+        if isinstance(fcf, (int,float)) and isinstance(mc, (int,float)) and mc and mc == mc and fcf == fcf:
+            # FCF利回りっぽい
+            yld = float(fcf)/float(mc)
+            score += max(-1.0, min(1.0, yld*10.0)) * 1.0
+            used += 1
+        if used == 0:
+            return None, "財務データ不足"
+        return round(score, 3), f"指標使用={used}"
+    except Exception:
+        return None, "計算失敗"
+
+def _event_alert(payload: Dict[str, Any], days_earn: int = 10, days_exdiv: int = 7) -> str:
+    """決算/権利落ちなど、取得できる範囲での注意喚起。"""
+    info = payload.get("info") or {}
+    today = datetime.now(JST).date()
+    notes = []
+    # earningsDate
+    ed = info.get("earningsDate") or info.get("earningsTimestamp")
+    try:
+        if isinstance(ed, (list, tuple)) and ed:
+            ed = ed[0]
+        if isinstance(ed, (int,float)):
+            d = datetime.fromtimestamp(ed, tz=timezone.utc).astimezone(JST).date()
+            if 0 <= (d - today).days <= days_earn:
+                notes.append(f"決算接近({d})")
+        elif isinstance(ed, str):
+            d = pd.to_datetime(ed, errors="coerce")
+            if pd.notna(d):
+                d = d.tz_localize("UTC") if getattr(d, "tzinfo", None) is None else d
+                d = d.tz_convert(JST).date()
+                if 0 <= (d - today).days <= days_earn:
+                    notes.append(f"決算接近({d})")
+    except Exception:
+        pass
+    # exDividendDate
+    exd = info.get("exDividendDate")
+    try:
+        if isinstance(exd, (int,float)):
+            d = datetime.fromtimestamp(exd, tz=timezone.utc).astimezone(JST).date()
+            if 0 <= (d - today).days <= days_exdiv:
+                notes.append(f"権利落ち接近({d})")
+    except Exception:
+        pass
+    return " / ".join(notes) if notes else "-"
+
+def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_bars: int = 60, include_fundamentals: bool = True, fundamentals_top_n: int = 20) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     t0 = time.time()
     syms = stage1_df["銘柄"].astype(str).tolist()
     hist = fetch_last_n_days(syms, n_days=int(stage2_days))
@@ -677,11 +1040,37 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_
     df["総合スコア"] = 0.55*df["利確スコア"] + 0.20*df["TP到達率"] + 0.15*df["期待値EV(R)"] - 0.10*df["平均逆行(R)"]
     df = df.sort_values("総合スコア", ascending=False).head(int(keep)).copy()
 
+# --- 財務/イベント（簡易）を上位Nだけ付与（RateLimit時はスキップ） ---
+    if include_fundamentals and fundamentals_top_n and len(df):
+        topn = int(min(len(df), max(0, fundamentals_top_n)))
+        scores = []
+        alerts = []
+        memos = []
+        for i, sym in enumerate(df["銘柄"].tolist()):
+            if i >= topn:
+                scores.append(None); alerts.append("-"); memos.append("未取得（上位のみ）"); 
+                continue
+            payload = _fundamentals_get_cached(sym)
+            if payload is None:
+                scores.append(None); alerts.append("-"); memos.append("取得失敗（RateLimit等）")
+                continue
+            sc, memo = _buffett_score(payload)
+            scores.append(sc)
+            alerts.append(_event_alert(payload))
+            memos.append(memo)
+        df["バフェット簡易スコア"] = scores
+        df["イベント注意"] = alerts
+        df["財務メモ"] = memos
+    else:
+        df["バフェット簡易スコア"] = None
+        df["イベント注意"] = "-"
+        df["財務メモ"] = "OFF"
+
     for c in ["利確スコア","TP到達率","期待値EV(R)","平均利確日数","平均逆行(R)","総合スコア"]:
         df[c] = df[c].astype(float).round(4)
     df["TP到達率"] = (df["TP到達率"]*100.0).round(2)
 
-    cols = ["銘柄","推奨方式","現在値（終値）","TP目安","SL目安","TP到達率","期待値EV(R)","平均利確日数","平均逆行(R)","検証回数","利確スコア","総合スコア"]
+    cols = ["銘柄","推奨方式","現在値（終値）","TP目安","SL目安","TP到達率","期待値EV(R)","平均利確日数","平均逆行(R)","検証回数","利確スコア","総合スコア","バフェット簡易スコア","イベント注意","財務メモ"]
     df = df[cols]
 
     meta = {"ok": True, "elapsed_sec": time.time()-t0, "errors": errors, "sample_failures": sample_fail, "stage2_selected": int(len(df)), "diag": diag}
@@ -690,7 +1079,8 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_
 def run_scan_3stage(stage0_keep: int = 1200, stage1_keep: int = 300, stage2_keep: int = 60,
                     min_price: float = 300.0, min_avg_volume: float = 30000.0,
                     atr_pct_min: float = 1.0, atr_pct_max: float = 8.0,
-                    stage2_days: int = 180, stage2_min_bars: int = 60) -> Dict[str, Any]:
+                    stage2_days: int = 180, stage2_min_bars: int = 60,
+                    include_fundamentals: bool = True, fundamentals_top_n: int = 20) -> Dict[str, Any]:
     ensure_schema()
     diag: Dict[str, Any] = {"ok": True, "stage": "start", "mode": "stable", "errors": [], "sample_failures": []}
 
@@ -708,7 +1098,7 @@ def run_scan_3stage(stage0_keep: int = 1200, stage1_keep: int = 300, stage2_keep
         diag["errors"].append("Stage1 empty: ATR%条件/履歴不足")
         return {"selected": pd.DataFrame(), "guide": pd.DataFrame(), "sector_strength": sec, "diag": diag}
 
-    sel, guide, m2 = stage2_rank(s1, keep=stage2_keep, stage2_days=int(stage2_days), min_bars=int(stage2_min_bars))
+    sel, guide, m2 = stage2_rank(s1, keep=stage2_keep, stage2_days=int(stage2_days), min_bars=int(stage2_min_bars), include_fundamentals=include_fundamentals, fundamentals_top_n=int(fundamentals_top_n))
     diag["stage2"] = m2
     if sel.empty:
         diag["mode"] = "degraded"
