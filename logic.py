@@ -20,7 +20,6 @@ def check_db_config() -> Tuple[bool, str]:
         return False, "Neonの接続URLが見つかりません（NEON_DATABASE_URL）。"
     return True, "ok"
 
-
 def driver_diagnostics() -> Dict[str, Any]:
     info: Dict[str, Any] = {"python": None, "psycopg": None, "psycopg2": None}
     try:
@@ -39,7 +38,6 @@ def driver_diagnostics() -> Dict[str, Any]:
     except Exception as e:
         info["psycopg2"] = {"error": repr(e)}
     return info
-
 
 def _connect():
     url = _get_db_url()
@@ -64,12 +62,9 @@ def _connect():
         psycopg2_err = repr(e)
 
     raise RuntimeError(
-        "Postgresドライバをimportできませんでした。
-"
-        "推奨: requirements.txt に『psycopg[binary]』(または psycopg-binary) を追加し、psycopg2-binary は削除してください。
-"
-        f"psycopg import error: {psycopg_err}
-"
+        "Postgresドライバをimportできませんでした。\n"
+        "推奨: requirements.txt に『psycopg[binary]』（または psycopg-binary）を追加し、psycopg2-binary は削除してください。\n"
+        f"psycopg import error: {psycopg_err}\n"
         f"psycopg2 import error: {psycopg2_err}"
     )
 
