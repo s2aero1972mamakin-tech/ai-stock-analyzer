@@ -36,6 +36,12 @@ if not db_url_ok:
 else:
     st.sidebar.success("DB接続設定OK")
 
+    # ドライバ自己診断
+    with st.expander("🔧 ドライバ診断（psycopg/psycopg2）", expanded=False):
+        drv = logic.driver_diagnostics()
+        st.json(drv)
+
+
 with st.sidebar.expander("📌 最終更新状況", expanded=True):
     status = logic.get_db_status()
     if status.get("ok"):
