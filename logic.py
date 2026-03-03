@@ -39,6 +39,105 @@ def driver_diagnostics() -> Dict[str, Any]:
         info["psycopg2"] = {"error": repr(e)}
     return info
 
+
+def universe_count() -> int:
+    try:
+        conn = _connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM universe_symbols")
+            n = int(cur.fetchone()[0])
+        conn.close()
+        return n
+    except Exception:
+        return 0
+
+
+def universe_upsert(symbols, name_map=None, market_map=None, sector_map=None) -> int:
+    name_map = name_map or {}
+    market_map = market_map or {}
+    sector_map = sector_map or {}
+    symbols = [s.strip() for s in symbols if str(s).strip()]
+    # normalize: add .T if looks like 4-digit code
+    norm = []
+    for s in symbols:
+        s2 = s.replace(" ", "").upper()
+        if re.fullmatch(r"\d{4}", s2):
+            s2 = s2 + ".T"
+        norm.append(s2)
+    # unique
+    uniq = []
+    seen = set()
+    for s in norm:
+        if s and s not in seen:
+            seen.add(s)
+            uniq.append(s)
+
+    if not uniq:
+        return 0
+
+    conn = _connect()
+    with conn.cursor() as cur:
+        for sym in uniq:
+            cur.execute(
+                "INSERT INTO universe_symbols(symbol, name, market, sector, updated_utc) "
+                "VALUES(%s,%s,%s,%s,NOW()) "
+                "ON CONFLICT(symbol) DO UPDATE SET "
+                "name=EXCLUDED.name, market=EXCLUDED.market, sector=EXCLUDED.sector, updated_utc=NOW()",
+                (sym, name_map.get(sym), market_map.get(sym), sector_map.get(sym)),
+            )
+    conn.commit()
+    conn.close()
+    return len(uniq)
+
+
+def universe_load_symbols(limit=None):
+    conn = _connect()
+    with conn.cursor() as cur:
+        if limit:
+            cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol LIMIT %s", (int(limit),))
+        else:
+            cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol")
+        rows = cur.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def universe_register_from_inputs(uploaded_csv_file, pasted_text: str):
+    # returns (count, message)
+    symbols = []
+    try:
+        if uploaded_csv_file is not None:
+            import pandas as pd
+            df = pd.read_csv(uploaded_csv_file)
+            cols = [c.lower() for c in df.columns]
+            pick = None
+            for c in ["ticker", "symbol", "code"]:
+                if c in cols:
+                    pick = df.columns[cols.index(c)]
+                    break
+            if pick is None:
+                return 0, "CSVに ticker / symbol / code 列が見つかりません。"
+            symbols += [str(x).strip() for x in df[pick].dropna().tolist()]
+    except Exception as e:
+        return 0, f"CSV読込に失敗: {e}"
+
+    if pasted_text and pasted_text.strip():
+        for line in pasted_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # allow comma-separated on a line
+            parts = [p.strip() for p in re.split(r"[\s,]+", line) if p.strip()]
+            symbols += parts
+
+    if not symbols:
+        return 0, "入力が空です。CSVをアップロードするか、銘柄を貼り付けてください。"
+
+    try:
+        n = universe_upsert(symbols)
+        return n, "ok"
+    except Exception as e:
+        return 0, f"DB登録に失敗: {e}"
 def _connect():
     url = _get_db_url()
     if not url:
