@@ -44,7 +44,17 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("📥 銘柄マスタ登録（初回だけ）")
 with st.sidebar.expander("銘柄リストを登録/更新", expanded=False):
     st.write("Neon側に銘柄マスタが **0件だと更新もスキャンもできません**。初回だけ登録してください。")
-    st.caption("形式: 1行1銘柄（例: 7203.T） or CSV（列名: ticker / symbol / code）")
+    st.caption("形式: 1行1銘柄（例: 7203.T） or CSV（列名: ticker / symbol / code）。手動が面倒ならJPX公式の一覧（Excel）から自動取得できます。")
+    if st.button("🌐 JPX公式一覧から自動取得して登録", use_container_width=True, key="btn_universe_autofetch"):
+        try:
+            n, msg = logic.universe_autofetch_from_jpx()
+            if n > 0:
+                st.success(f"JPXから取得して登録しました: {n} 件")
+            else:
+                st.error(msg)
+        except Exception:
+            st.error("自動取得に失敗")
+            st.code(traceback.format_exc())
     uploaded = st.file_uploader("CSVをアップロード", type=["csv"], key="upl_universe_csv")
     text_in = st.text_area("または貼り付け（改行区切り）", value="", height=140, key="universe_paste")
     c1, c2 = st.columns(2)
