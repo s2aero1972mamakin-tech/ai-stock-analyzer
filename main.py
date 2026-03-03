@@ -16,6 +16,8 @@ from __future__ import annotations
 import sys
 import json
 import argparse
+import traceback
+import os
 import datetime as _dt
 
 import pandas as pd
@@ -70,11 +72,66 @@ def _maybe_run_batch_from_cli() -> None:
 _maybe_run_batch_from_cli()
 
 # ---- Streamlit UI ----
-import streamlit as st  # noqa: E402
+import streamlit as st
+
+# Show full error details in-app (useful for debugging)
+try:
+    st.set_option('client.showErrorDetails', True)
+except Exception:
+    pass
+  # noqa: E402
 
 st.set_page_config(page_title="SBI 半自動プロ仕様（2ファイル完全版）", layout="wide")
-st.title("📈 SBI 半自動プロ仕様（2ファイル完全版）")
-st.caption("スキャン→セクター強度→銘柄選択→WF/MC→RoR→DD/市場ボラ制御→注文書CSV。 build: " + APP_BUILD)
+st.title("📈 JPX AIスキャナ（2ファイル完全版）")
+st.caption("スキャン→セクター強度→銘柄選択→WF/MC（可能なら）→『戦略タイプ＋Entry/SL/TPの目安』。 build: " + APP_BUILD)
+
+
+# --- Batch status / stale warning ---
+meta = {}
+try:
+    meta = logic.db_get_meta(st.session_state.get("db_path", getattr(logic, "DEFAULT_DB_PATH", "./jpx_ohlc.sqlite")))
+except Exception:
+    meta = {}
+
+jst = _dt.timezone(_dt.timedelta(hours=9))
+now_jst = _dt.datetime.now(tz=jst)
+
+last_batch_jst = None
+if meta.get("last_batch_jst"):
+    try:
+        last_batch_jst = _dt.datetime.fromisoformat(meta["last_batch_jst"])
+    except Exception:
+        last_batch_jst = None
+
+with st.sidebar.expander("🗓️ データ更新状況（DB）", expanded=True):
+    if last_batch_jst:
+        st.write({
+            "last_batch_jst": last_batch_jst.isoformat(),
+            "rows_upserted": meta.get("last_batch_rows_upserted"),
+            "ok": meta.get("last_batch_ok"),
+        })
+    else:
+        st.warning("まだDB更新履歴が見つかりません。まず `python main.py --batch` を1回実行してください。")
+
+    stale_warn_hours = st.number_input("stale_warn_hours（更新忘れ警告: 時間）", min_value=6, max_value=240, value=30, step=6)
+    if last_batch_jst:
+        age_h = (now_jst - last_batch_jst).total_seconds() / 3600.0
+        if age_h > float(stale_warn_hours):
+            st.warning(f"⚠️ DBの更新が古い可能性があります（経過 {age_h:.1f} 時間）。朝のバッチを忘れている場合は `python main.py --batch` を実行してください。")
+
+    st.code("""推奨: 毎朝1回だけ
+python main.py --batch --db ./jpx_ohlc.sqlite --days 730 --max-workers 6
+""", language="bash")
+
+with st.sidebar.expander("🛠️ デバッグ（エラー詳細）", expanded=False):
+    st.write("Streamlitの赤塗りエラーが出た場合、ここに例外詳細を表示します。")
+    if "last_exception" in st.session_state and st.session_state["last_exception"]:
+        st.code(st.session_state["last_exception"])
+    else:
+        st.caption("（まだエラーは記録されていません）")
+
+
+
 
 prog = st.progress(0)
 status = st.empty()
@@ -118,11 +175,18 @@ if "diag_obj" not in st.session_state:
     st.session_state["diag_obj"] = {}
 if "diag_text" not in st.session_state:
     st.session_state["diag_text"] = ""
+if "last_exception" not in st.session_state:
+    st.session_state["last_exception"] = ""
+
 
 with st.sidebar.expander("🧭 使い方 / 設定の意味（必読）", expanded=True):
     st.markdown(f"""
 ### 目的
-JPX全銘柄を前提に、**スキャン→セクター強度→銘柄選択→WF/MC→RoR→DD/市場ボラ制御→SBI注文書CSV** を出します。
+JPX全銘柄を前提に、**スキャン→セクター強度→銘柄選択→WF/MC→『戦略タイプ＋価格目安』** を出します。
+
+### Streamlit Cloud運用の注意
+- DB（SQLite）はアプリの実行環境内に保存されます。Cloudは再起動/再デプロイで消えることがあるため、
+  **「毎回オンデマンドでも止まりにくい」ように yfinance の“まとめDL”でヒット数を減らす設計**にしています。
 
 ### スキャンが止まらない設計（重要）
 - 日中の Streamlit は **ローカルDB（SQLite）を優先**してOHLCを読むため、外部制限で止まりにくいです。
@@ -153,10 +217,6 @@ with st.sidebar.form("scan_form", clear_on_submit=False):
     corr_threshold = st.slider("相関除外しきい値", 0.3, 0.95, 0.70, step=0.05)
 
     st.markdown("---")
-    capital = st.number_input("運用資金（円）", 100_000, 50_000_000, 1_000_000, step=100_000)
-    risk_pct = st.slider("1トレード許容リスク%", 0.3, 3.0, 1.0, step=0.1) / 100.0
-    current_dd = st.slider("現在DD%", 0.0, 30.0, 0.0, step=0.5) / 100.0
-
     st.markdown("---")
     max_workers = st.slider("並列数（多すぎ注意）", 3, 16, 8)
     time_budget_sec = st.slider("タイムバジェット（秒）", 20, 180, 70, step=1)
@@ -165,12 +225,19 @@ with st.sidebar.form("scan_form", clear_on_submit=False):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_market_vol():
-    return logic.compute_market_vol_ratio(progress_cb=None)
+    try:
+        return logic.compute_market_vol_ratio(progress_cb=None)
+    except Exception:
+        err = traceback.format_exc()
+        return None, {"error": err}
 
 with st.sidebar.expander("📉 市場ボラ（自動: 1306.T）", expanded=False):
     if st.button("🔄 市場ボラを再取得（必要時のみ）"):
         _cached_market_vol.clear()
     vol_ratio, vol_meta = _cached_market_vol()
+    if vol_ratio is None and isinstance(vol_meta, dict) and vol_meta.get('error'):
+        st.session_state['last_exception'] = vol_meta['error']
+        st.error('市場ボラ計算でエラー（詳細はサイドバーの「デバッグ」へ）')
     st.write({"vol_ratio": vol_ratio, "meta": vol_meta})
 
 st.sidebar.subheader("🧾 診断JSON")
@@ -253,22 +320,13 @@ if run:
         ] if hasattr(cands, "columns") and c in cands.columns]
         st.dataframe(cands[show_cols], use_container_width=True)
 
-        out = logic.build_orders(
-            cands,
-            capital_yen=int(capital),
-            risk_pct_per_trade=float(risk_pct),
-            current_dd=float(current_dd),
-            vol_ratio=float(vol_ratio),
-        )
-
-        st.markdown("## 🧠 ポートフォリオ統合リスク（RoR等）")
-        st.json(out["portfolio"])
-
-        st.markdown("## 📝 SBI用 注文書（CSV出力）")
-        orders = out["orders"]
-        st.dataframe(orders, use_container_width=True)
-        csv = orders.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ 注文書CSVダウンロード", data=csv, file_name="sbi_orders.csv", mime="text/csv")
+        st.markdown("## 🧭 推奨方式と価格目安（Entry/SL/TP）")
+        plan_cols = [c for c in [
+            "Symbol","name","sector","strategy","Close","entry","stop_loss","take_profit",
+            "RET_3M","RSI","ATR_PCT","VOL_AVG20",
+            "wf_oos_wr","wf_oos_rr","mc_dd_p05","final_score"
+        ] if c in cands.columns]
+        st.dataframe(cands[plan_cols], use_container_width=True)
 
         st.markdown("### 診断JSON（表示）")
         st.json(st.session_state["diag_obj"], expanded=False)
