@@ -242,7 +242,7 @@ def _has_universe_col(col: str) -> bool:
                         WHERE table_name='universe_symbols' AND column_name=%s
                         LIMIT 1;""",
                     (col,),
-                )
+    )
                 ok = cur.fetchone() is not None
         finally:
             conn.close()
@@ -318,7 +318,7 @@ def universe_upsert(symbols: List[str], meta: Optional[Dict[str, Dict[str, Any]]
                      lot_size=COALESCE(EXCLUDED.lot_size, universe_symbols.lot_size),
                      updated_utc=NOW();""",
                 (sym, m.get("name"), m.get("market"), m.get("sector33_code"), m.get("sector33_name"), int(m.get("lot_size") or 100)),
-            )
+    )
     conn.commit()
     conn.close()
     return len(uniq)
@@ -374,7 +374,7 @@ def universe_upsert_rows(rows: List[Dict[str, Any]]) -> int:
                     r.get("scale_code"),
                     r.get("scale_name"),
                 ),
-            )
+    )
     conn.commit()
     conn.close()
     return len(norm_rows)
@@ -765,7 +765,7 @@ def update_sector33_from_jpx() -> Tuple[int, str]:
                          updated_utc = NOW()
                        WHERE symbol = %s;""",
                     [(name, market, sec_code, sec_name, sym) for (sym, name, market, sec_code, sec_name) in part],
-                )
+    )
                 updated += cur.rowcount
         conn.commit()
     finally:
@@ -1061,12 +1061,12 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
                            MAX(CASE WHEN trade_date=%s THEN close END) AS close_prev
                     FROM last2
                     GROUP BY symbol
-                )
+    )
                 SELECT symbol, close_latest, close_prev
                 FROM piv;
                 """,
                 (latest, prev, latest, prev),
-            )
+    )
             snap = cur.fetchall()
 
             cutoff20 = (datetime.fromisoformat(latest).date() - timedelta(days=40)).isoformat()
@@ -1078,7 +1078,7 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
                 GROUP BY symbol;
                 """,
                 (universe, cutoff20),
-            )
+    )
             vol20 = cur.fetchall()
     finally:
         conn.close()
@@ -1096,19 +1096,19 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
                         "SELECT symbol, name, sector33_name, sector33_code, COALESCE(lot_size,100) "
                         "FROM universe_symbols WHERE symbol = ANY(%s);",
                         (universe,),
-                    )
+    )
                 else:
                     cur_u.execute(
                         "SELECT symbol, name, sector33_name, sector33_code, 100 "
                         "FROM universe_symbols WHERE symbol = ANY(%s);",
                         (universe,),
-                    )
+    )
             except Exception:
                 cur_u.execute(
                     "SELECT symbol, name, sector33_name, sector33_code, 100 "
                     "FROM universe_symbols WHERE symbol = ANY(%s);",
                     (universe,),
-                )
+    )
             urows = cur_u.fetchall()
     finally:
         conn_u.close()
@@ -1150,20 +1150,20 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
 
     # Stage0 基本スコア（OHLCを追加取得しない軽量スコア）
     # Stage0 score (AI-lite): momentum(1d) + liquidity + sector rotation
-df["stage0_score_raw"] = 0.7 * df["pct_change_1d"].fillna(0.0) + 0.3 * np.log10(df["avg_vol20"].fillna(1.0))
-# Sector rotation score (0..1)
-df["sector_rot"] = sector_rotation_ai(df)
-df["stage0_score"] = df["stage0_score_raw"] + 2.0 * (df["sector_rot"] - 0.5)
+    df["stage0_score_raw"] = 0.7 * df["pct_change_1d"].fillna(0.0) + 0.3 * np.log10(df["avg_vol20"].fillna(1.0))
+    # Sector rotation score (0..1)
+    df["sector_rot"] = sector_rotation_ai(df)
+    df["stage0_score"] = df["stage0_score_raw"] + 2.0 * (df["sector_rot"] - 0.5)
 
     # 33業種メタ（あれば）
     meta_df = universe_load_meta()
     if not meta_df.empty and "sector33_name" in meta_df.columns:
         df = df.merge(
-    meta_df[["symbol","sector33_name"]],
-    on="symbol",
-    how="left",
-    suffixes=("","_meta")
-)
+        meta_df[["symbol","sector33_name"]],
+        on="symbol",
+        how="left",
+        suffixes=("","_meta")
+    )
 
 # =========================
 # COMPLETE AI BLOCK (2-file)
@@ -1562,7 +1562,7 @@ def _fundamentals_get_cached(symbol: str) -> Optional[Dict[str, Any]]:
                 ON CONFLICT(symbol) DO UPDATE SET asof_date=EXCLUDED.asof_date, payload_json=EXCLUDED.payload_json, updated_utc=NOW();
                 """,
                 (symbol, today, json.dumps(payload, ensure_ascii=False, default=_json_safe)),
-            )
+    )
         conn.commit()
     finally:
         conn.close()
@@ -1814,7 +1814,7 @@ def run_scan_3stage(
                 cur.execute(
                     "SELECT symbol, COALESCE(lot_size,100) FROM universe_symbols WHERE symbol = ANY(%s);",
                     (sel["銘柄"].astype(str).tolist(),),
-                )
+    )
                 lot_rows = cur.fetchall()
         finally:
             conn_l.close()
@@ -1881,7 +1881,7 @@ def run_scan_3stage(
         sel["資金最適スコア"] = np.round(
             0.35 * eff_n + 0.20 * daily_n + 0.20 * ev_n + 0.15 * wr_n + 0.10 * dd_n,
             6,
-        )
+    )
         sel = sel.sort_values("資金最適スコア", ascending=False).reset_index(drop=True)
         sel.insert(0, "順位", range(1, len(sel) + 1))
     except Exception as e:
