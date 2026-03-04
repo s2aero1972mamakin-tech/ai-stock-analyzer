@@ -127,8 +127,44 @@ def ensure_schema() -> None:
             updated_utc TIMESTAMP DEFAULT NOW()
         );
         """)
+        # --- universe_symbols columns migration (idempotent) ---
+        try:
+            cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS name TEXT;")
+            cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS market TEXT;")
+            cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector33_code TEXT;")
+            cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector33_name TEXT;")
+            cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS lot_size INTEGER DEFAULT 100;")
+        except Exception:
+            pass
+
     conn.commit()
     conn.close()
+
+
+_universe_col_cache: Dict[str, bool] = {}
+
+def _has_universe_col(col: str) -> bool:
+    if col in _universe_col_cache:
+        return _universe_col_cache[col]
+    try:
+        conn = _connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_name='universe_symbols' AND column_name=%s
+                        LIMIT 1;""",
+                    (col,),
+                )
+                ok = cur.fetchone() is not None
+        finally:
+            conn.close()
+    except Exception:
+        ok = False
+    _universe_col_cache[col] = ok
+    return ok
+
 
 
 def _set_meta(conn, k: str, v: str):
@@ -779,7 +815,26 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
     conn_u = _connect()
     try:
         with conn_u.cursor() as cur_u:
-            cur_u.execute("SELECT symbol, sector33_name, sector33_code, COALESCE(lot_size,100) FROM universe_symbols WHERE symbol = ANY(%s);", (universe,))
+            # lot_size列が無いDBでも落ちないように吸収
+            try:
+                if _has_universe_col("lot_size"):
+                    cur_u.execute(
+                        "SELECT symbol, sector33_name, sector33_code, COALESCE(lot_size,100) "
+                        "FROM universe_symbols WHERE symbol = ANY(%s);",
+                        (universe,),
+                    )
+                else:
+                    cur_u.execute(
+                        "SELECT symbol, sector33_name, sector33_code, 100 "
+                        "FROM universe_symbols WHERE symbol = ANY(%s);",
+                        (universe,),
+                    )
+            except Exception:
+                cur_u.execute(
+                    "SELECT symbol, sector33_name, sector33_code, 100 "
+                    "FROM universe_symbols WHERE symbol = ANY(%s);",
+                    (universe,),
+                )
             urows = cur_u.fetchall()
     finally:
         conn_u.close()
