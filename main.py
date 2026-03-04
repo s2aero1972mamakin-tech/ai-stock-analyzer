@@ -88,8 +88,10 @@ if "NEON_DATABASE_URL" in st.secrets and not os.environ.get("NEON_DATABASE_URL")
 
 st.sidebar.header("💰 資金設定")
 capital_total = st.sidebar.number_input("運用資金（円）", min_value=50000.0, value=300000.0, step=10000.0)
-max_positions = st.sidebar.selectbox("同時保有数（最大）", [1,2,3], index=1)
+max_positions = st.sidebar.selectbox("同時保有数（最大）", [1,2,3], index=0, key="max_positions")
 mobile_mode = st.sidebar.toggle("📱スマホ表示（カード）", value=True)
+
+show_top_n = st.sidebar.slider("表示する上位銘柄数", min_value=1, max_value=20, value=int(max(5, max_positions*5)), step=1)
 
 st.sidebar.header("🗄️ データベース（Neon）")
 if st.sidebar.button("🔁 33業種を再同期（JPX）", use_container_width=True):
@@ -275,6 +277,7 @@ if run_scan:
         with st.expander("📊 診断（JSON）", expanded=False):
             st.json(diag)
         st.subheader("🏁 セクター強度ランキング（Stage0）")
+        st.caption("（補足）セクターが「不明」ばかりの場合は、銘柄マスタの33業種がDBに入っていません。サイドバーの『33業種を再同期（JPX）』を実行してください。")
         st.caption("※ここは **33業種ごとの“強度（中央値）”** ランキングです。銘柄ランキングではありません。")
         sec = out.get("sector_strength")
         if isinstance(sec, pd.DataFrame) and len(sec):
@@ -300,7 +303,7 @@ if run_scan:
             df.insert(0, "順位", range(1, len(df)+1))
 
             if mobile_cards:
-                render_cards_selected(df)
+                render_cards_selected(df.head(show_top_n))
                 with st.expander("表で見る（PC向け）", expanded=False):
                     st.dataframe(df, width="stretch")
             else:
@@ -323,7 +326,7 @@ if run_scan:
             guide = guide.reset_index(drop=True)
             guide.insert(0, "順位", range(1, len(guide)+1))
             if mobile_cards:
-                render_cards_guide(guide.head(60))
+                render_cards_guide(guide.head(show_top_n))
                 with st.expander("表で見る（PC向け）", expanded=False):
                     st.dataframe(guide, width="stretch")
             else:
