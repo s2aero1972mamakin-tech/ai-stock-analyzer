@@ -239,7 +239,9 @@ def universe_upsert(symbols: List[str], meta: Optional[Dict[str, Dict[str, Any]]
     conn = _connect()
     with conn.cursor() as cur:
         for sym in uniq:
-            m = meta.get(sym, {}) or {}
+            # meta は '1301' / '1301.T' どちらのキーでも来うるので吸収する
+            base = sym[:-2] if sym.endswith(".T") else sym
+            m = meta.get(sym) or meta.get(base) or meta.get(base + ".T") or {}
             cur.execute(
                 """INSERT INTO universe_symbols(symbol, name, market, sector33_code, sector33_name, lot_size, updated_utc)
                    VALUES(%s,%s,%s,%s,%s,%s,NOW())
@@ -1026,27 +1028,29 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
             try:
                 if _has_universe_col("lot_size"):
                     cur_u.execute(
-                        "SELECT symbol, sector33_name, sector33_code, COALESCE(lot_size,100) "
+                        "SELECT symbol, name, sector33_name, sector33_code, COALESCE(lot_size,100) "
                         "FROM universe_symbols WHERE symbol = ANY(%s);",
                         (universe,),
                     )
                 else:
                     cur_u.execute(
-                        "SELECT symbol, sector33_name, sector33_code, 100 "
+                        "SELECT symbol, name, sector33_name, sector33_code, 100 "
                         "FROM universe_symbols WHERE symbol = ANY(%s);",
                         (universe,),
                     )
             except Exception:
                 cur_u.execute(
-                    "SELECT symbol, sector33_name, sector33_code, 100 "
+                    "SELECT symbol, name, sector33_name, sector33_code, 100 "
                     "FROM universe_symbols WHERE symbol = ANY(%s);",
                     (universe,),
                 )
             urows = cur_u.fetchall()
     finally:
         conn_u.close()
-    u_df = pd.DataFrame(urows, columns=["symbol","sector33_name","sector33_code","lot_size"]) if urows else pd.DataFrame(columns=["symbol","sector33_name","sector33_code","lot_size"])
+    u_df = pd.DataFrame(urows, columns=["symbol","sector33_name","sector33_code","lot_size"]) if urows else pd.DataFrame(columns=["symbol","name","sector33_name","sector33_code","lot_size"])
     df = df.merge(u_df, on="symbol", how="left")
+    df["sector33_name"] = df.get("sector33_name").fillna("不明")
+    df["name"] = df.get("name").fillna("")
     df["pct_change_1d"] = (df["close_latest"] / (df["close_prev"] + 1e-12) - 1.0) * 100.0
 
     df = df[pd.notna(df["close_latest"])]
@@ -1122,7 +1126,8 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
             "pct_change_1d": "前日比（%）",
             "avg_vol20": "平均出来高20日",
         }
-    )[["銘柄", "現在値（終値）", "前日比（%）", "平均出来高20日", "stage0_score", "sector33_name"]]
+    )[["銘柄", "現在値（終値）", "前日比（%）", "平均出来高20日", "stage0_score", "name", "sector33_name"]]
+    out = out.rename(columns={"name":"銘柄名","sector33_name":"セクター"})
     out["stage0_score"] = out["stage0_score"].astype(float).round(4)
 
     meta = {"ok": True, "latest_trade_date": latest, "elapsed_sec": time.time() - t0, "stage0_candidates": int(len(out))}
@@ -1130,6 +1135,21 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
 
 def stage1_select(stage0_df: pd.DataFrame, keep: int, atr_pct_min: float, atr_pct_max: float) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     t0 = time.time()
+    # stage0 からセクター/銘柄名を引き継ぐ（無ければ空）
+    sec_map = {}
+    name_map = {}
+    try:
+        if "セクター" in stage0_df.columns:
+            sec_map = stage0_df.set_index("銘柄")["セクター"].to_dict()
+        elif "sector33_name" in stage0_df.columns:
+            sec_map = stage0_df.set_index("銘柄")["sector33_name"].fillna("不明").to_dict()
+        if "銘柄名" in stage0_df.columns:
+            name_map = stage0_df.set_index("銘柄")["銘柄名"].fillna("").to_dict()
+        elif "name" in stage0_df.columns:
+            name_map = stage0_df.set_index("銘柄")["name"].fillna("").to_dict()
+    except Exception:
+        pass
+
     syms = stage0_df["銘柄"].astype(str).tolist()
     hist = fetch_last_n_days(syms, n_days=80)
     if hist.empty:
@@ -1374,7 +1394,19 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_
         df[c] = df[c].astype(float).round(4)
     df["TP到達率"] = (df["TP到達率"]*100.0).round(2)
 
-    cols = ["銘柄","推奨方式","現在値（終値）","TP目安","SL目安","TP到達率","期待値EV(R)","平均利確日数","平均逆行(R)","検証回数","利確スコア","総合スコア","バフェット簡易スコア","イベント注意","財務メモ"]
+    # 表示用: セクター/銘柄名（無い場合は空）
+    if "セクター" not in df.columns:
+        if "sector33_name" in df.columns:
+            df["セクター"] = df["sector33_name"].fillna("不明")
+        else:
+            df["セクター"] = "不明"
+    if "銘柄名" not in df.columns:
+        if "name" in df.columns:
+            df["銘柄名"] = df["name"].fillna("")
+        else:
+            df["銘柄名"] = ""
+
+    cols = ["銘柄","銘柄名","セクター","推奨方式","現在値（終値）","TP目安","SL目安","TP到達率","期待値EV(R)","平均利確日数","平均逆行(R)","検証回数","利確スコア","総合スコア","バフェット簡易スコア","イベント注意","財務メモ"]
     df = df[cols]
 
     meta = {"ok": True, "elapsed_sec": time.time()-t0, "errors": errors, "sample_failures": sample_fail, "stage2_selected": int(len(df)), "diag": diag}
