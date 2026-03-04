@@ -242,7 +242,7 @@ def _has_universe_col(col: str) -> bool:
                         WHERE table_name='universe_symbols' AND column_name=%s
                         LIMIT 1;""",
                     (col,),
-    )
+                )
                 ok = cur.fetchone() is not None
         finally:
             conn.close()
@@ -318,7 +318,7 @@ def universe_upsert(symbols: List[str], meta: Optional[Dict[str, Dict[str, Any]]
                      lot_size=COALESCE(EXCLUDED.lot_size, universe_symbols.lot_size),
                      updated_utc=NOW();""",
                 (sym, m.get("name"), m.get("market"), m.get("sector33_code"), m.get("sector33_name"), int(m.get("lot_size") or 100)),
-    )
+            )
     conn.commit()
     conn.close()
     return len(uniq)
@@ -374,7 +374,7 @@ def universe_upsert_rows(rows: List[Dict[str, Any]]) -> int:
                     r.get("scale_code"),
                     r.get("scale_name"),
                 ),
-    )
+            )
     conn.commit()
     conn.close()
     return len(norm_rows)
@@ -765,7 +765,7 @@ def update_sector33_from_jpx() -> Tuple[int, str]:
                          updated_utc = NOW()
                        WHERE symbol = %s;""",
                     [(name, market, sec_code, sec_name, sym) for (sym, name, market, sec_code, sec_name) in part],
-    )
+                )
                 updated += cur.rowcount
         conn.commit()
     finally:
@@ -1061,12 +1061,12 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
                            MAX(CASE WHEN trade_date=%s THEN close END) AS close_prev
                     FROM last2
                     GROUP BY symbol
-    )
+                )
                 SELECT symbol, close_latest, close_prev
                 FROM piv;
                 """,
                 (latest, prev, latest, prev),
-    )
+            )
             snap = cur.fetchall()
 
             cutoff20 = (datetime.fromisoformat(latest).date() - timedelta(days=40)).isoformat()
@@ -1078,7 +1078,7 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
                 GROUP BY symbol;
                 """,
                 (universe, cutoff20),
-    )
+            )
             vol20 = cur.fetchall()
     finally:
         conn.close()
@@ -1096,19 +1096,19 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
                         "SELECT symbol, name, sector33_name, sector33_code, COALESCE(lot_size,100) "
                         "FROM universe_symbols WHERE symbol = ANY(%s);",
                         (universe,),
-    )
+                    )
                 else:
                     cur_u.execute(
                         "SELECT symbol, name, sector33_name, sector33_code, 100 "
                         "FROM universe_symbols WHERE symbol = ANY(%s);",
                         (universe,),
-    )
+                    )
             except Exception:
                 cur_u.execute(
                     "SELECT symbol, name, sector33_name, sector33_code, 100 "
                     "FROM universe_symbols WHERE symbol = ANY(%s);",
                     (universe,),
-    )
+                )
             urows = cur_u.fetchall()
     finally:
         conn_u.close()
@@ -1128,12 +1128,11 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
                     u_df = pd.DataFrame(urows)
             else:
                 u_df = pd.DataFrame(columns=['symbol','name','sector33_name','sector33_code','lot_size'])
-            u_df['symbol'] = u_df['symbol'].astype(str).map(_norm_symbol)
+    u_df['symbol'] = u_df['symbol'].astype(str).map(_norm_symbol)
     u_df['_key'] = u_df['symbol'].astype(str).map(_sym_key)
     ukeys = set([_sym_key(x) for x in universe])
     u_df = u_df[u_df['_key'].isin(ukeys)].copy()
     u_df['_sym_norm'] = u_df['symbol'].astype(str).map(_norm_symbol)
-    df["symbol"] = df["symbol"].astype(str).map(_norm_symbol)
     df["_key"] = df["symbol"].astype(str).map(_sym_key)
     df = df.merge(u_df.drop(columns=["symbol","_sym_norm"], errors="ignore"), left_on="_key", right_on="_key", how="left")
     df["sector33_name"] = df.get("sector33_name").replace("", None).fillna("不明")
@@ -1149,247 +1148,20 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
         return pd.DataFrame(), pd.DataFrame(), {"ok": True, "latest_trade_date": latest, "elapsed_sec": time.time() - t0, "stage0_candidates": 0}
 
     # Stage0 基本スコア（OHLCを追加取得しない軽量スコア）
-    # Stage0 score (AI-lite): momentum(1d) + liquidity + sector rotation
-    df["stage0_score_raw"] = 0.7 * df["pct_change_1d"].fillna(0.0) + 0.3 * np.log10(df["avg_vol20"].fillna(1.0))
-    # Sector rotation score (0..1)
-    df["sector_rot"] = sector_rotation_ai(df)
-    df["stage0_score"] = df["stage0_score_raw"] + 2.0 * (df["sector_rot"] - 0.5)
+    df["stage0_score"] = 0.7 * df["pct_change_1d"].fillna(0.0) + 0.3 * np.log10(df["avg_vol20"].fillna(1.0))
 
     # 33業種メタ（あれば）
     meta_df = universe_load_meta()
     if not meta_df.empty and "sector33_name" in meta_df.columns:
         df = df.merge(
-        meta_df[["symbol","sector33_name"]],
-        on="symbol",
-        how="left",
-        suffixes=("","_meta")
-    )
-
-# =========================
-# COMPLETE AI BLOCK (2-file)
-# =========================
-
-def _safe_float(x, default=np.nan):
-    try:
-        v = float(x)
-        return v
-    except Exception:
-        return default
-
-def _clip01(x):
-    try:
-        return float(max(0.0, min(1.0, x)))
-    except Exception:
-        return 0.0
-
-def _ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-def detect_trend_ai(df: pd.DataFrame) -> Dict[str, float]:
-    """AIトレンド検出（軽量・Cloud向け）
-    - EMA(20/60)クロス
-    - 20日リターン
-    - 傾き(EMA20)
-    出力: trend_score 0..1 / trend_dir -1..+1 / regime_vol (ATR%相当)
-    """
-    out = {"trend_score": 0.5, "trend_dir": 0.0, "regime_vol": np.nan}
-    if df is None or df.empty or "Close" not in df.columns:
-        return out
-    d = df.copy()
-    c = d["Close"].astype(float)
-    if len(c) < 70:
-        return out
-
-    ema20 = _ema(c, 20)
-    ema60 = _ema(c, 60)
-    # direction
-    dir_raw = 1.0 if float(ema20.iloc[-1]) > float(ema60.iloc[-1]) else -1.0
-    # momentum (20d)
-    r20 = (float(c.iloc[-1]) / float(c.iloc[-21]) - 1.0) if len(c) > 21 else 0.0
-    # slope of ema20 over 5 days
-    s20 = (float(ema20.iloc[-1]) - float(ema20.iloc[-6])) / (abs(float(ema20.iloc[-6])) + 1e-12)
-
-    # ATR% proxy: 14-day true range / close
-    try:
-        atr = _atr14(d).iloc[-1]
-        atr_pct = float(atr) / (float(c.iloc[-1]) + 1e-12) * 100.0
-    except Exception:
-        atr_pct = np.nan
-
-    # score 0..1 (uptrend + momentum + slope)
-    base = 0.5
-    base += 0.25 * np.tanh(6.0 * r20)   # momentum
-    base += 0.15 * np.tanh(10.0 * s20)  # slope
-    base += 0.10 * (1.0 if dir_raw > 0 else -1.0)
-    trend_score = _clip01((base + 1.0) / 2.0)  # map from ~[-1,1] to [0,1]
-
-    out["trend_score"] = float(trend_score)
-    out["trend_dir"] = float(dir_raw)
-    out["regime_vol"] = float(atr_pct) if np.isfinite(atr_pct) else np.nan
-    return out
-
-def volatility_adjustment(atr_pct: float, target_atr_pct: float = 3.0) -> float:
-    """ボラ調整係数（高ボラはサイズ/スコアを抑える）"""
-    if atr_pct is None or not np.isfinite(atr_pct) or atr_pct <= 0:
-        return 1.0
-    # lower atr -> boost, higher atr -> reduce
-    adj = target_atr_pct / atr_pct
-    return float(max(0.35, min(1.65, adj)))
-
-def sector_rotation_ai(df: pd.DataFrame) -> pd.Series:
-    """セクター回転AI（簡易）
-    - セクター別に 20日・60日モメンタム（中央値）を合成
-    - 各銘柄に sector_momo_score を割り当て
-    """
-    if df is None or df.empty:
-        return pd.Series(dtype=float)
-    d = df.copy()
-    for col in ["sector33_name", "RET_3M"]:
-        if col not in d.columns:
-            d[col] = None
-    # 3Mが無い場合は0で
-    ret3m = pd.to_numeric(d["RET_3M"], errors="coerce").fillna(0.0)
-    d["_ret3m"] = ret3m
-    # 1D変化も使えるなら軽く加点
-    if "pct_change_1d" in d.columns:
-        pc1 = pd.to_numeric(d["pct_change_1d"], errors="coerce").fillna(0.0) / 100.0
-    else:
-        pc1 = 0.0
-    d["_pc1"] = pc1
-    grp = d.groupby("sector33_name", dropna=False)
-    sec_strength = (0.85 * grp["_ret3m"].median() + 0.15 * grp["_pc1"].median()).to_dict()
-    # normalize to 0..1
-    vals = np.array(list(sec_strength.values()), dtype=float)
-    if len(vals) == 0:
-        return pd.Series([0.5]*len(d), index=d.index)
-    vmin, vmax = float(np.nanmin(vals)), float(np.nanmax(vals))
-    def norm(v):
-        if not np.isfinite(v) or vmax - vmin < 1e-12:
-            return 0.5
-        return float((v - vmin) / (vmax - vmin))
-    return d["sector33_name"].map(lambda s: norm(sec_strength.get(s, np.nan))).astype(float)
-
-def _walk_forward_swing_oos(df: pd.DataFrame,
-                           hold_days: int = 10,
-                           tp_atr: float = 1.5,
-                           sl_atr: float = 1.0,
-                           train_days: int = 120,
-                           test_days: int = 40,
-                           step_days: int = 40) -> Dict[str, Any]:
-    """WalkForward（OOS）: 価格系列から簡易スイング戦略の再現性を評価
-    - train/test をローリング
-    - entry は各日の終値買い（方向はトレンドで決める）
-    - tp/sl はATR基準
-    返り値: wf_oos_wr / wf_oos_rr / trials
-    """
-    if df is None or df.empty or len(df) < (train_days + test_days + 60):
-        return {"ok": False, "wf_oos_wr": np.nan, "wf_oos_rr": np.nan, "trials": 0}
-
-    d = df.copy().dropna(subset=["Close","High","Low"])
-    d["ATR14"] = _atr14(d)
-    d = d.dropna()
-    if len(d) < (train_days + test_days + 30):
-        return {"ok": False, "wf_oos_wr": np.nan, "wf_oos_rr": np.nan, "trials": 0}
-
-    wins = 0
-    losses = 0
-
-    # decide direction from EMA trend at each step start
-    closes = d["Close"].astype(float)
-
-    # rolling windows by index
-    start = 0
-    while start + train_days + test_days < len(d):
-        train = d.iloc[start:start+train_days]
-        test = d.iloc[start+train_days:start+train_days+test_days]
-
-        # direction by train EMA cross
-        ema20 = _ema(train["Close"].astype(float), 20)
-        ema60 = _ema(train["Close"].astype(float), 60)
-        direction_long = bool(float(ema20.iloc[-1]) >= float(ema60.iloc[-1]))
-
-        # OOS simulate on test window
-        H = int(hold_days)
-        for i in range(0, len(test)-H-1):
-            entry = float(test["Close"].iloc[i])
-            atr = float(test["ATR14"].iloc[i])
-            if not np.isfinite(atr) or atr <= 0:
-                continue
-
-            if direction_long:
-                tp = entry + tp_atr*atr
-                sl = entry - sl_atr*atr
-                fut = test.iloc[i+1:i+1+H]
-                hit = None
-                for j in range(len(fut)):
-                    if float(fut["High"].iloc[j]) >= tp:
-                        hit = "win"; break
-                    if float(fut["Low"].iloc[j]) <= sl:
-                        hit = "loss"; break
-                if hit == "win":
-                    wins += 1
-                else:
-                    losses += 1
-            else:
-                # short
-                tp = entry - tp_atr*atr
-                sl = entry + sl_atr*atr
-                fut = test.iloc[i+1:i+1+H]
-                hit = None
-                for j in range(len(fut)):
-                    if float(fut["Low"].iloc[j]) <= tp:
-                        hit = "win"; break
-                    if float(fut["High"].iloc[j]) >= sl:
-                        hit = "loss"; break
-                if hit == "win":
-                    wins += 1
-                else:
-                    losses += 1
-
-        start += step_days
-
-    n = wins + losses
-    if n <= 0:
-        return {"ok": False, "wf_oos_wr": np.nan, "wf_oos_rr": np.nan, "trials": 0}
-
-    p = wins / n
-    rr = float(tp_atr / max(sl_atr, 1e-9))
-    return {"ok": True, "wf_oos_wr": float(p), "wf_oos_rr": float(rr), "trials": int(n)}
-
-def montecarlo_dd5(p_win: float, rr: float, trades: int = 60, paths: int = 400, seed: int = 7) -> float:
-    """MonteCarlo DD: 勝率pとRRから、損益系列を乱数生成して最大DDの5%点を返す（負値）"""
-    if not np.isfinite(p_win) or not np.isfinite(rr) or trades <= 10:
-        return float("nan")
-    p = float(max(0.01, min(0.99, p_win)))
-    b = float(max(0.2, rr))
-    rng = np.random.default_rng(seed)
-    dds = []
-    for _ in range(int(paths)):
-        # outcomes in R units: win=+b, loss=-1
-        wins = rng.random(int(trades)) < p
-        r = np.where(wins, b, -1.0).astype(float)
-        eq = np.cumsum(r)
-        peak = np.maximum.accumulate(eq)
-        dd = eq - peak  # <=0
-        dds.append(float(np.min(dd)))
-    dds = np.array(dds, dtype=float)
-    # 5% worst dd (more negative)
-    return float(np.quantile(dds, 0.05))
-
-def kelly_fraction(p_win: float, rr: float) -> float:
-    """Kelly最適化（fraction）。b=RR, q=1-p -> f* = (bp - q)/b"""
-    if not np.isfinite(p_win) or not np.isfinite(rr) or rr <= 0:
-        return 0.0
-    p = float(p_win)
-    q = 1.0 - p
-    b = float(rr)
-    f = (b*p - q) / b
-    # conservative clip for retail
-    return float(max(0.0, min(0.25, f)))
-
-df["sector33_name"] = df["sector33_name"].fillna(df.get("sector33_name_meta"))
-if "sector33_name_meta" in df.columns:
-    df.drop(columns=["sector33_name_meta"], inplace=True)
+            meta_df[["symbol","sector33_name"]],
+            on="symbol",
+            how="left",
+            suffixes=("","_meta"),
+        )
+        if "sector33_name_meta" in df.columns:
+            df["sector33_name"] = df["sector33_name"].fillna(df["sector33_name_meta"])
+            df.drop(columns=["sector33_name_meta"], inplace=True)
     if "sector33_name" not in df.columns:
         df["sector33_name"] = "不明"
     else:
@@ -1562,7 +1334,7 @@ def _fundamentals_get_cached(symbol: str) -> Optional[Dict[str, Any]]:
                 ON CONFLICT(symbol) DO UPDATE SET asof_date=EXCLUDED.asof_date, payload_json=EXCLUDED.payload_json, updated_utc=NOW();
                 """,
                 (symbol, today, json.dumps(payload, ensure_ascii=False, default=_json_safe)),
-    )
+            )
         conn.commit()
     finally:
         conn.close()
@@ -1634,6 +1406,118 @@ def _event_alert(payload: Dict[str, Any], days_earn: int = 10, days_exdiv: int =
         pass
     return " / ".join(notes) if notes else "-"
 
+
+# =========================
+# COMPLETE AI HELPERS
+# =========================
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+def detect_trend_ai_01(g: pd.DataFrame) -> float:
+    """AIトレンド検出: 0..1"""
+    try:
+        c = g["Close"].astype(float)
+        if len(c) < 70:
+            return 0.5
+        ema20 = _ema(c, 20)
+        ema60 = _ema(c, 60)
+        dir_up = 1.0 if float(ema20.iloc[-1]) >= float(ema60.iloc[-1]) else -1.0
+        r20 = (float(c.iloc[-1]) / float(c.iloc[-21]) - 1.0) if len(c) > 21 else 0.0
+        slope = (float(ema20.iloc[-1]) - float(ema20.iloc[-6])) / (abs(float(ema20.iloc[-6])) + 1e-12)
+        x = 0.0
+        x += 0.55 * (1.0 / (1.0 + np.exp(-10.0 * r20)) - 0.5) * 2.0
+        x += 0.25 * np.tanh(8.0 * slope)
+        x += 0.20 * (1.0 if dir_up > 0 else -1.0)
+        return float(max(0.0, min(1.0, (x + 1.0) / 2.0)))
+    except Exception:
+        return 0.5
+
+def walk_forward_oos(g: pd.DataFrame, hold_days: int = 10, tp_atr: float = 1.5, sl_atr: float = 1.0,
+                     train_days: int = 120, test_days: int = 40, step_days: int = 40):
+    """WalkForward OOS: (winrate, rr). 失敗時は (nan,nan)"""
+    try:
+        d = g.copy().dropna(subset=["Close","High","Low"])
+        d["ATR14"] = _atr14(d)
+        d = d.dropna()
+        if len(d) < (train_days + test_days + 40):
+            return float("nan"), float("nan")
+        wins = 0
+        losses = 0
+        start = 0
+        while start + train_days + test_days < len(d):
+            train = d.iloc[start:start+train_days]
+            test = d.iloc[start+train_days:start+train_days+test_days]
+            ema20 = _ema(train["Close"].astype(float), 20)
+            ema60 = _ema(train["Close"].astype(float), 60)
+            direction_long = bool(float(ema20.iloc[-1]) >= float(ema60.iloc[-1]))
+            H = int(hold_days)
+            for i in range(0, len(test)-H-1):
+                entry = float(test["Close"].iloc[i])
+                atr = float(test["ATR14"].iloc[i])
+                if not np.isfinite(atr) or atr <= 0:
+                    continue
+                fut = test.iloc[i+1:i+1+H]
+                if direction_long:
+                    tp = entry + tp_atr*atr
+                    sl = entry - sl_atr*atr
+                    hit = None
+                    for j in range(len(fut)):
+                        if float(fut["High"].iloc[j]) >= tp:
+                            hit = "win"; break
+                        if float(fut["Low"].iloc[j]) <= sl:
+                            hit = "loss"; break
+                else:
+                    tp = entry - tp_atr*atr
+                    sl = entry + sl_atr*atr
+                    hit = None
+                    for j in range(len(fut)):
+                        if float(fut["Low"].iloc[j]) <= tp:
+                            hit = "win"; break
+                        if float(fut["High"].iloc[j]) >= sl:
+                            hit = "loss"; break
+                if hit == "win":
+                    wins += 1
+                else:
+                    losses += 1
+            start += step_days
+        n = wins + losses
+        if n <= 0:
+            return float("nan"), float("nan")
+        return float(wins/n), float(tp_atr/max(sl_atr,1e-9))
+    except Exception:
+        return float("nan"), float("nan")
+
+def montecarlo_dd5(p_win: float, rr: float, trades: int = 60, paths: int = 400, seed: int = 7) -> float:
+    """MonteCarlo DD（R単位）5%点。負の値。"""
+    try:
+        if not np.isfinite(p_win) or not np.isfinite(rr) or trades < 10:
+            return float("nan")
+        p = float(max(0.01, min(0.99, p_win)))
+        b = float(max(0.2, rr))
+        rng = np.random.default_rng(seed)
+        dds = []
+        for _ in range(int(paths)):
+            wins = rng.random(int(trades)) < p
+            r = np.where(wins, b, -1.0).astype(float)
+            eq = np.cumsum(r)
+            peak = np.maximum.accumulate(eq)
+            dd = eq - peak
+            dds.append(float(np.min(dd)))
+        return float(np.quantile(np.array(dds, dtype=float), 0.05))
+    except Exception:
+        return float("nan")
+
+def kelly_fraction(p_win: float, rr: float) -> float:
+    """Kelly最適化（保守クリップ0..0.25）"""
+    try:
+        if not np.isfinite(p_win) or not np.isfinite(rr) or rr <= 0:
+            return 0.0
+        p = float(p_win); q = 1.0 - p; b = float(rr)
+        f = (b*p - q) / b
+        return float(max(0.0, min(0.25, f)))
+    except Exception:
+        return 0.0
+
 def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_bars: int = 60, include_fundamentals: bool = True, fundamentals_top_n: int = 20) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     t0 = time.time()
     syms = stage1_df["銘柄"].astype(str).tolist()
@@ -1685,6 +1569,55 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_
 
     df["総合スコア"] = 0.55*df["利確スコア"] + 0.20*df["TP到達率"] + 0.15*df["期待値EV(R)"] - 0.10*df["平均逆行(R)"]
     df = df.sort_values("総合スコア", ascending=False).head(int(keep)).copy()
+    # --- COMPLETE AI: WalkForward / MonteCarlo / Kelly ---
+    try:
+        wf_wr_list = []
+        wf_rr_list = []
+        mc_list = []
+        k_list = []
+        for sym2 in df["銘柄"].astype(str).tolist():
+            g2 = hist[hist["Symbol"] == sym2].sort_values("Date")
+            wr, rr = walk_forward_oos(g2, hold_days=10, tp_atr=1.5, sl_atr=1.0, train_days=120, test_days=40, step_days=40)
+            wf_wr_list.append(wr)
+            wf_rr_list.append(rr)
+            mc_list.append(montecarlo_dd5(wr, rr, trades=60, paths=400, seed=7))
+            k_list.append(kelly_fraction(wr, rr))
+    
+        df["WF勝率（OOS）"] = wf_wr_list
+        df["WF損益比RR（OOS）"] = wf_rr_list
+        df["MC DD 5%（推定）"] = mc_list
+        df["Kelly最適化（f）"] = k_list
+    
+        # ボラ調整（ATR%があれば）
+        if "ATR%" in stage1_df.columns:
+            atr_map = stage1_df.set_index("銘柄")["ATR%"].to_dict()
+            atrs = df["銘柄"].map(lambda s: float(atr_map.get(s, np.nan)))
+        else:
+            atrs = np.nan
+        vol_adj = pd.to_numeric(atrs, errors="coerce")
+        vol_adj = (3.0 / vol_adj).where(np.isfinite(vol_adj) & (vol_adj > 0), 1.0).clip(0.35, 1.65)
+    
+        # AI総合スコア（置換）
+        ret3m = pd.to_numeric(df["3ヶ月リターン"], errors="coerce").fillna(0.0)
+        trend = pd.to_numeric(df["AIトレンド"], errors="coerce").fillna(0.5)
+        wf = pd.to_numeric(df["WF勝率（OOS）"], errors="coerce").fillna(0.5)
+        rr = pd.to_numeric(df["WF損益比RR（OOS）"], errors="coerce").fillna(1.5)
+        dd5 = pd.to_numeric(df["MC DD 5%（推定）"], errors="coerce").fillna(-5.0)
+        dd_score = 1.0/(1.0+np.exp(-(dd5+3.0)))
+        kelly = pd.to_numeric(df["Kelly最適化（f）"], errors="coerce").fillna(0.0)
+    
+        base = (
+            0.28 * np.tanh(4.0*ret3m) +
+            0.22 * (trend-0.5)*2.0 +
+            0.22 * (wf-0.5)*2.0 +
+            0.10 * np.tanh(rr-1.0) +
+            0.12 * (dd_score-0.5)*2.0 +
+            0.06 * (kelly/0.25)
+        )
+        df["総合スコア"] = (base * vol_adj).astype(float)
+        df = df.sort_values("総合スコア", ascending=False).copy()
+    except Exception:
+        pass
 
 # --- 財務/イベント（簡易）を上位Nだけ付与（RateLimit時はスキップ） ---
     if include_fundamentals and fundamentals_top_n and len(df):
@@ -1728,7 +1661,7 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_
         else:
             df["銘柄名"] = ""
 
-    cols = ["銘柄","銘柄名","セクター","推奨方式","現在値（終値）","TP目安","SL目安","TP到達率","期待値EV(R)","平均利確日数","平均逆行(R)","検証回数","利確スコア","総合スコア","バフェット簡易スコア","イベント注意","財務メモ"]
+    cols = ["銘柄","銘柄名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式","Kelly最適化（f）","AIトレンド","現在値（終値）","TP目安","SL目安","TP到達率","期待値EV(R)","平均利確日数","平均逆行(R)","検証回数","利確スコア","バフェット簡易スコア","イベント注意","財務メモ"]
     df = df[cols]
 
     meta = {"ok": True, "elapsed_sec": time.time()-t0, "errors": errors, "sample_failures": sample_fail, "stage2_selected": int(len(df)), "diag": diag}
@@ -1814,7 +1747,7 @@ def run_scan_3stage(
                 cur.execute(
                     "SELECT symbol, COALESCE(lot_size,100) FROM universe_symbols WHERE symbol = ANY(%s);",
                     (sel["銘柄"].astype(str).tolist(),),
-    )
+                )
                 lot_rows = cur.fetchall()
         finally:
             conn_l.close()
@@ -1881,7 +1814,7 @@ def run_scan_3stage(
         sel["資金最適スコア"] = np.round(
             0.35 * eff_n + 0.20 * daily_n + 0.20 * ev_n + 0.15 * wr_n + 0.10 * dd_n,
             6,
-    )
+        )
         sel = sel.sort_values("資金最適スコア", ascending=False).reset_index(drop=True)
         sel.insert(0, "順位", range(1, len(sel) + 1))
     except Exception as e:
