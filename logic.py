@@ -1047,7 +1047,18 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
             urows = cur_u.fetchall()
     finally:
         conn_u.close()
-    u_df = pd.DataFrame(urows, columns=["symbol","sector33_name","sector33_code","lot_size"]) if urows else pd.DataFrame(columns=["symbol","name","sector33_name","sector33_code","lot_size"])
+    if urows:
+        # urows の列数はDBスキーマ/SELECTにより変わる可能性があるため動的に吸収
+        first_len = len(urows[0])
+        if first_len == 5:
+            u_df = pd.DataFrame(urows, columns=["symbol","name","sector33_name","sector33_code","lot_size"])
+        elif first_len == 4:
+            u_df = pd.DataFrame(urows, columns=["symbol","sector33_name","sector33_code","lot_size"])
+            u_df["name"] = None
+        else:
+            u_df = pd.DataFrame(urows)
+    else:
+        u_df = pd.DataFrame(columns=["symbol","name","sector33_name","sector33_code","lot_size"])
     df = df.merge(u_df, on="symbol", how="left")
     df["sector33_name"] = df.get("sector33_name").fillna("不明")
     df["name"] = df.get("name").fillna("")
