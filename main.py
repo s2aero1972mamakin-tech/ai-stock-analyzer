@@ -92,6 +92,11 @@ max_positions = st.sidebar.selectbox("同時保有数（最大）", [1,2,3], ind
 mobile_mode = st.sidebar.toggle("📱スマホ表示（カード）", value=True)
 
 st.sidebar.header("🗄️ データベース（Neon）")
+if st.sidebar.button("🔁 33業種を再同期（JPX）", use_container_width=True):
+    with st.spinner("JPXマスタから33業種を更新中..."):
+        upd, stt = logic.update_sector33_from_jpx()
+    st.sidebar.success(f"33業種 更新: {upd} ({stt})")
+
 
 db_url_ok, db_msg = logic.check_db_config()
 if not db_url_ok:
@@ -288,6 +293,10 @@ if run_scan:
         df = out.get("selected")
         if isinstance(df, pd.DataFrame) and len(df):
             df = df.reset_index(drop=True)
+            if "順位" in df.columns:
+
+                df = df.drop(columns=["順位"])
+
             df.insert(0, "順位", range(1, len(df)+1))
 
             if mobile_cards:
