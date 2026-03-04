@@ -496,8 +496,139 @@ def universe_autofetch_from_jpx() -> Tuple[int, str]:
         return 0, "銘柄コードが抽出できませんでした。"
 
     n = universe_upsert_rows(rows)
+    update_sector33_from_jpx()
     return n, "ok"
 
+
+
+
+
+def update_sector33_from_jpx() -> Tuple[int, str]:
+    """
+    Download JPX listed issues master (Excel) and update universe_symbols.sector33_*.
+    Returns (updated_rows, status_str).
+    """
+    ensure_schema()
+
+    # JPX official file (frequently updated). We keep robust fallbacks.
+    urls = [
+        "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls",
+        "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls?download=1",
+        "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html",
+    ]
+
+    # try direct excel first
+    df = None
+    last_err = ""
+    for u in urls[:2]:
+        try:
+            df = pd.read_excel(u)
+            if df is not None and len(df) > 1000:
+                break
+        except Exception as e:
+            last_err = str(e)
+            df = None
+
+    # if failed, try to scrape the page for xls link
+    if df is None:
+        try:
+            import pandas as _pd
+            import requests
+            import re as _re
+            html = requests.get(urls[2], timeout=20).text
+            m = _re.search(r'href="([^"]+data_j\.xls[^"]*)"', html)
+            if m:
+                link = m.group(1)
+                if link.startswith("/"):
+                    link = "https://www.jpx.co.jp" + link
+                df = _pd.read_excel(link)
+        except Exception as e:
+            last_err = str(e)
+            df = None
+
+    if df is None or df.empty:
+        return 0, f"jpx_master_download_failed: {last_err}"
+
+    # normalize columns
+    cols = {str(c).strip(): c for c in df.columns}
+    # required: code
+    code_col = None
+    for k in ["コード", "銘柄コード", "Code"]:
+        if k in cols:
+            code_col = cols[k]
+            break
+    if code_col is None:
+        # fallback: first column with 4-digit-like
+        code_col = df.columns[0]
+
+    sec_code_col = None
+    sec_name_col = None
+    market_col = None
+    name_col = None
+
+    for c in df.columns:
+        s = str(c).strip()
+        if s in ["33業種コード", "33業種コード（東証）", "33業種コード(東証)"]:
+            sec_code_col = c
+        if s in ["33業種区分", "33業種名", "33業種区分（日本語）"]:
+            sec_name_col = c
+        if s in ["市場・商品区分", "市場区分"]:
+            market_col = c
+        if s in ["銘柄名", "名称"]:
+            name_col = c
+
+    # if sector columns not found, we can't update
+    if sec_code_col is None and sec_name_col is None:
+        return 0, "jpx_master_has_no_sector33_columns"
+
+    tmp_cols = [code_col]
+    for c in [name_col, market_col, sec_code_col, sec_name_col]:
+        if c is not None and c not in tmp_cols:
+            tmp_cols.append(c)
+    tmp = df[tmp_cols].copy()
+    tmp[code_col] = tmp[code_col].astype(str).str.replace(r"\D", "", regex=True).str.zfill(4)
+    tmp = tmp[tmp[code_col].str.fullmatch(r"\d{4}")].copy()
+    tmp["symbol"] = tmp[code_col] + ".T"
+
+    # build update rows
+    rows = []
+    for _, r in tmp.iterrows():
+        sym = r["symbol"]
+        sec_code = str(r[sec_code_col]).strip() if sec_code_col is not None and pd.notna(r.get(sec_code_col)) else None
+        sec_name = str(r[sec_name_col]).strip() if sec_name_col is not None and pd.notna(r.get(sec_name_col)) else None
+        name = str(r[name_col]).strip() if name_col is not None and pd.notna(r.get(name_col)) else None
+        market = str(r[market_col]).strip() if market_col is not None and pd.notna(r.get(market_col)) else None
+        rows.append((sym, name, market, sec_code, sec_name))
+
+    conn = _connect()
+    updated = 0
+    try:
+        with conn.cursor() as cur:
+            # update in chunks; only overwrite when null/empty
+            chunk = 2000
+            for i in range(0, len(rows), chunk):
+                part = rows[i:i+chunk]
+                cur.executemany(
+                    """UPDATE universe_symbols
+                       SET
+                         name = COALESCE(universe_symbols.name, %s),
+                         market = COALESCE(universe_symbols.market, %s),
+                         sector33_code = CASE
+                           WHEN universe_symbols.sector33_code IS NULL OR universe_symbols.sector33_code='' THEN %s
+                           ELSE universe_symbols.sector33_code END,
+                         sector33_name = CASE
+                           WHEN universe_symbols.sector33_name IS NULL OR universe_symbols.sector33_name='' THEN %s
+                           ELSE universe_symbols.sector33_name END,
+                         updated_utc = NOW()
+                       WHERE symbol = %s;""",
+                    [(name, market, sec_code, sec_name, sym) for (sym, name, market, sec_code, sec_name) in part],
+                )
+                updated += cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+
+    return updated, "ok"
 
 def get_db_status() -> Dict[str, Any]:
     try:
