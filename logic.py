@@ -153,10 +153,13 @@ def universe_count() -> int:
     conn.close()
     return n
 
-def universe_upsert(symbols: List[str]) -> int:
-    """後方互換: symbols(文字列)のみを登録。"""
+
+def universe_upsert(symbols: List[str], meta: Optional[Dict[str, Dict[str, Any]]] = None) -> int:
+    """Upsert universe symbols with optional metadata."""
     ensure_schema()
-    rows = []
+    meta = meta or {}
+
+    norm: List[str] = []
     for s in symbols:
         s = str(s).strip()
         if not s:
@@ -164,10 +167,37 @@ def universe_upsert(symbols: List[str]) -> int:
         s2 = s.replace(" ", "").upper()
         if re.fullmatch(r"\d{4}", s2):
             s2 = s2 + ".T"
-        rows.append({"symbol": s2})
-    if not rows:
+        norm.append(s2)
+
+    seen = set()
+    uniq: List[str] = []
+    for s in norm:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
+
+    if not uniq:
         return 0
-    return universe_upsert_rows(rows)
+
+    conn = _connect()
+    with conn.cursor() as cur:
+        for sym in uniq:
+            m = meta.get(sym, {}) or {}
+            cur.execute(
+                """INSERT INTO universe_symbols(symbol, name, market, sector33_code, sector33_name, lot_size, updated_utc)
+                   VALUES(%s,%s,%s,%s,%s,%s,NOW())
+                   ON CONFLICT(symbol) DO UPDATE SET
+                     name=COALESCE(EXCLUDED.name, universe_symbols.name),
+                     market=COALESCE(EXCLUDED.market, universe_symbols.market),
+                     sector33_code=COALESCE(EXCLUDED.sector33_code, universe_symbols.sector33_code),
+                     sector33_name=COALESCE(EXCLUDED.sector33_name, universe_symbols.sector33_name),
+                     lot_size=COALESCE(EXCLUDED.lot_size, universe_symbols.lot_size),
+                     updated_utc=NOW();""",
+                (sym, m.get("name"), m.get("market"), m.get("sector33_code"), m.get("sector33_name"), int(m.get("lot_size") or 100)),
+            )
+    conn.commit()
+    conn.close()
+    return len(uniq)
 
 def universe_upsert_rows(rows: List[Dict[str, Any]]) -> int:
     """新: symbol + メタ（市場/33業種/銘柄名など）を upsert"""
@@ -746,6 +776,15 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
     snap_df = pd.DataFrame(snap, columns=["symbol", "close_latest", "close_prev"])
     vol20_df = pd.DataFrame(vol20, columns=["symbol", "avg_vol20"])
     df = snap_df.merge(vol20_df, on="symbol", how="left")
+    conn_u = _connect()
+    try:
+        with conn_u.cursor() as cur_u:
+            cur_u.execute("SELECT symbol, sector33_name, sector33_code, COALESCE(lot_size,100) FROM universe_symbols WHERE symbol = ANY(%s);", (universe,))
+            urows = cur_u.fetchall()
+    finally:
+        conn_u.close()
+    u_df = pd.DataFrame(urows, columns=["symbol","sector33_name","sector33_code","lot_size"]) if urows else pd.DataFrame(columns=["symbol","sector33_name","sector33_code","lot_size"])
+    df = df.merge(u_df, on="symbol", how="left")
     df["pct_change_1d"] = (df["close_latest"] / (df["close_prev"] + 1e-12) - 1.0) * 100.0
 
     df = df[pd.notna(df["close_latest"])]
@@ -1104,6 +1143,44 @@ def run_scan_3stage(stage0_keep: int = 1200, stage1_keep: int = 300, stage2_keep
         diag["mode"] = "degraded"
         diag["errors"].append("Stage2 empty: 利確評価失敗")
     diag["stage"] = "done"
+        # --- Stage3: 資金効率最適化（買える銘柄だけを上位化） ---
+    if isinstance(sel, pd.DataFrame) and len(sel):
+        conn_l = _connect()
+        try:
+            with conn_l.cursor() as cur:
+                cur.execute("SELECT symbol, COALESCE(lot_size,100) FROM universe_symbols WHERE symbol = ANY(%s);", (sel["銘柄"].astype(str).tolist(),))
+                lot_rows = cur.fetchall()
+        finally:
+            conn_l.close()
+        lot_map = {r[0]: int(r[1] or 100) for r in lot_rows} if lot_rows else {}
+        per_pos = float(capital_total) / max(int(max_positions), 1)
+        shares_list=[]; use_list=[]; prof_list=[]; daily_list=[]; eff_list=[]
+        for _, r in sel.iterrows():
+            sym=str(r['銘柄']); entry=float(r['現在値（終値）']); tp=float(r['TP目安']); lot=lot_map.get(sym,100)
+            lots=int(per_pos // (entry*lot)); shares=lots*lot
+            use=shares*entry; prof=shares*(tp-entry)
+            avg_days=float(r.get('平均利確日数',10.0)); daily=prof/max(avg_days,1.0)
+            eff=prof/max(use,1.0)
+            shares_list.append(shares); use_list.append(use); prof_list.append(prof); daily_list.append(daily); eff_list.append(eff)
+        sel['推奨株数']=shares_list
+        sel['想定投入額(円)']=np.round(use_list,0)
+        sel['想定利確額(円)']=np.round(prof_list,0)
+        sel['想定日次利確(円/日)']=np.round(daily_list,0)
+        sel['資金効率(利確/投入)']=np.round(np.array(eff_list)*100.0,3)
+        sel=sel[sel['推奨株数']>0].copy()
+        if len(sel):
+            def _z(x):
+                x=np.asarray(x,dtype=float)
+                if np.nanmax(x)-np.nanmin(x)<1e-9:
+                    return np.zeros_like(x)
+                return (x-np.nanmin(x))/(np.nanmax(x)-np.nanmin(x))
+            eff_n=_z(sel['資金効率(利確/投入)'].values)
+            daily_n=_z(sel['想定日次利確(円/日)'].values)
+            ev_n=_z(sel['期待値EV(R)'].values)
+            wr_n=_z(sel['TP到達率'].values)
+            dd_n=1.0-_z(sel['平均逆行(R)'].values)
+            sel['資金最適スコア']=np.round(0.35*eff_n+0.20*daily_n+0.20*ev_n+0.15*wr_n+0.10*dd_n,6)
+            sel=sel.sort_values('資金最適スコア',ascending=False).copy()
     return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
 
 # --- diag persistence ---
