@@ -857,7 +857,10 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
     meta_df = universe_load_meta()
     if not meta_df.empty and "sector33_name" in meta_df.columns:
         df = df.merge(meta_df[["symbol", "sector33_name"]], on="symbol", how="left")
-    df["sector33_name"] = df.get("sector33_name").fillna("不明")
+    if "sector33_name" not in df.columns:
+        df["sector33_name"] = "不明"
+    else:
+        df["sector33_name"] = df["sector33_name"].fillna("不明")
 
     sec = (
         df.groupby("sector33_name", dropna=False)["stage0_score"]
