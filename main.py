@@ -91,7 +91,7 @@ capital_total = st.sidebar.number_input("運用資金（円）", min_value=50000
 max_positions = st.sidebar.selectbox("同時保有数（最大）", [1,2,3], index=0, key="max_positions")
 mobile_mode = st.sidebar.toggle("📱スマホ表示（カード）", value=True)
 
-show_top_n = st.sidebar.slider("表示する上位銘柄数", min_value=1, max_value=20, value=int(max(5, max_positions*5)), step=1)
+show_top_n = st.sidebar.slider("表示する上位銘柄数", 1, 15, 5, step=1)
 
 st.sidebar.header("🗄️ データベース（Neon）")
 if st.sidebar.button("🔁 33業種を再同期（JPX）", use_container_width=True):
@@ -301,6 +301,32 @@ if run_scan:
                 df = df.drop(columns=["順位"])
 
             df.insert(0, "順位", range(1, len(df)+1))
+            # 表示列を必要最低限に絞る（スマホ前提）
+            col_map = {
+                "symbol":"銘柄",
+                "sector33_name":"セクター",
+                "RET_3M":"3ヶ月リターン",
+                "wf_oos_wr":"WF勝率（OOS）",
+                "wf_oos_rr":"WF損益比RR（OOS）",
+                "mc_dd5":"MC DD 5%（推定）",
+                "final_score":"総合スコア",
+                "strategy_name":"推奨方式",
+            }
+            for k,v in list(col_map.items()):
+                if k in df.columns and v not in df.columns:
+                    df[v] = df[k]
+            # 列が無い場合は作る（落ちない）
+            for v in ["銘柄","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式"]:
+                if v not in df.columns:
+                    df[v] = None
+            show_cols = ["順位","銘柄","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式"]
+            df = df[show_cols]
+            try:
+                for c in ["3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア"]:
+                    df[c] = pd.to_numeric(df[c], errors="coerce").round(4)
+            except Exception:
+                pass
+
 
             if mobile_cards:
                 render_cards_selected(df.head(show_top_n))
@@ -323,6 +349,11 @@ if run_scan:
         st.caption("どう買うか？（Entry/SL/TP と最大保有日数の具体案）")
         guide = out.get("guide")
         if isinstance(guide, pd.DataFrame) and len(guide):
+            # 表示は同時保有数ぶんだけ（実用優先）
+            try:
+                guide = guide.head(int(max_positions))
+            except Exception:
+                pass
             guide = guide.reset_index(drop=True)
             guide.insert(0, "順位", range(1, len(guide)+1))
             if mobile_cards:
