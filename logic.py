@@ -1115,75 +1115,164 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_
     meta = {"ok": True, "elapsed_sec": time.time()-t0, "errors": errors, "sample_failures": sample_fail, "stage2_selected": int(len(df)), "diag": diag}
     return df, guide, meta
 
-def run_scan_3stage(stage0_keep: int = 1200, stage1_keep: int = 300, stage2_keep: int = 60,
-                    min_price: float = 300.0, min_avg_volume: float = 30000.0,
-                    atr_pct_min: float = 1.0, atr_pct_max: float = 8.0,
-                    stage2_days: int = 180, stage2_min_bars: int = 60,
-                    include_fundamentals: bool = True, fundamentals_top_n: int = 20) -> Dict[str, Any]:
-    ensure_schema()
-    diag: Dict[str, Any] = {"ok": True, "stage": "start", "mode": "stable", "errors": [], "sample_failures": []}
 
-    s0, sec, m0 = stage0_select(min_price=min_price, min_avg_volume=min_avg_volume, keep=stage0_keep)
+def run_scan_3stage(
+    stage0_keep: int = 1200,
+    stage1_keep: int = 300,
+    stage2_keep: int = 60,
+    min_price: float = 300.0,
+    min_avg_volume: float = 30000.0,
+    atr_pct_min: float = 1.0,
+    atr_pct_max: float = 8.0,
+    # Stage2 profit-eval config
+    stage2_days: int = 180,
+    stage2_min_bars: int = 60,
+    include_fundamentals: bool = True,
+    fundamentals_top_n: int = 20,
+    # Stage3 capital optimization
+    capital_total: float = 300000.0,
+    max_positions: int = 1,
+    capital_mode: str = "growth",
+    **_ignored: Any,
+) -> Dict[str, Any]:
+    """
+    4000銘柄網羅の3段階スキャン + 資金効率最適化(Stage3)。
+    main.py 側から未知の引数が渡っても落ちないよう **_ignored を受ける。
+    """
+    ensure_schema()
+    t0 = time.time()
+    diag: Dict[str, Any] = {
+        "ok": True,
+        "stage": "start",
+        "mode": "stable",
+        "errors": [],
+        "sample_failures": [],
+    }
+
+    # Stage0
+    s0, sec, m0 = stage0_select(min_price=min_price, min_avg_volume=min_avg_volume, keep=int(stage0_keep))
     diag["stage0"] = m0
     if s0.empty:
-        diag["stage"] = "done"; diag["mode"] = "degraded"
+        diag["stage"] = "done"
+        diag["mode"] = "degraded"
         diag["errors"].append("Stage0 empty: DB更新不足 or フィルタが厳しすぎます")
+        diag["elapsed_sec"] = time.time() - t0
         return {"selected": pd.DataFrame(), "guide": pd.DataFrame(), "sector_strength": sec, "diag": diag}
 
-    s1, m1 = stage1_select(s0, keep=stage1_keep, atr_pct_min=atr_pct_min, atr_pct_max=atr_pct_max)
+    # Stage1
+    s1, m1 = stage1_select(s0, keep=int(stage1_keep), atr_pct_min=float(atr_pct_min), atr_pct_max=float(atr_pct_max))
     diag["stage1"] = m1
     if s1.empty:
-        diag["stage"] = "done"; diag["mode"] = "degraded"
+        diag["stage"] = "done"
+        diag["mode"] = "degraded"
         diag["errors"].append("Stage1 empty: ATR%条件/履歴不足")
+        diag["elapsed_sec"] = time.time() - t0
         return {"selected": pd.DataFrame(), "guide": pd.DataFrame(), "sector_strength": sec, "diag": diag}
 
-    sel, guide, m2 = stage2_rank(s1, keep=stage2_keep, stage2_days=int(stage2_days), min_bars=int(stage2_min_bars), include_fundamentals=include_fundamentals, fundamentals_top_n=int(fundamentals_top_n))
+    # Stage2
+    sel, guide, m2 = stage2_rank(
+        s1,
+        keep=int(stage2_keep),
+        stage2_days=int(stage2_days),
+        min_bars=int(stage2_min_bars),
+        include_fundamentals=bool(include_fundamentals),
+        fundamentals_top_n=int(fundamentals_top_n),
+    )
     diag["stage2"] = m2
     if sel.empty:
         diag["mode"] = "degraded"
         diag["errors"].append("Stage2 empty: 利確評価失敗")
-    diag["stage"] = "done"
-        # --- Stage3: 資金効率最適化（買える銘柄だけを上位化） ---
-    if isinstance(sel, pd.DataFrame) and len(sel):
+        diag["stage"] = "done"
+        diag["elapsed_sec"] = time.time() - t0
+        return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
+
+    # Stage3: capital efficiency (資金効率最優先)
+    try:
+        # lot size from universe table
         conn_l = _connect()
         try:
             with conn_l.cursor() as cur:
-                cur.execute("SELECT symbol, COALESCE(lot_size,100) FROM universe_symbols WHERE symbol = ANY(%s);", (sel["銘柄"].astype(str).tolist(),))
+                cur.execute(
+                    "SELECT symbol, COALESCE(lot_size,100) FROM universe_symbols WHERE symbol = ANY(%s);",
+                    (sel["銘柄"].astype(str).tolist(),),
+                )
                 lot_rows = cur.fetchall()
         finally:
             conn_l.close()
         lot_map = {r[0]: int(r[1] or 100) for r in lot_rows} if lot_rows else {}
-        per_pos = float(capital_total) / max(int(max_positions), 1)
-        shares_list=[]; use_list=[]; prof_list=[]; daily_list=[]; eff_list=[]
+
+        mp = max(int(max_positions), 1)
+        per_pos = float(capital_total) / mp
+
+        shares_list = []
+        use_list = []
+        prof_list = []
+        daily_list = []
+        eff_list = []
         for _, r in sel.iterrows():
-            sym=str(r['銘柄']); entry=float(r['現在値（終値）']); tp=float(r['TP目安']); lot=lot_map.get(sym,100)
-            lots=int(per_pos // (entry*lot)); shares=lots*lot
-            use=shares*entry; prof=shares*(tp-entry)
-            avg_days=float(r.get('平均利確日数',10.0)); daily=prof/max(avg_days,1.0)
-            eff=prof/max(use,1.0)
-            shares_list.append(shares); use_list.append(use); prof_list.append(prof); daily_list.append(daily); eff_list.append(eff)
-        sel['推奨株数']=shares_list
-        sel['想定投入額(円)']=np.round(use_list,0)
-        sel['想定利確額(円)']=np.round(prof_list,0)
-        sel['想定日次利確(円/日)']=np.round(daily_list,0)
-        sel['資金効率(利確/投入)']=np.round(np.array(eff_list)*100.0,3)
-        sel=sel[sel['推奨株数']>0].copy()
-        if len(sel):
-            def _z(x):
-                x=np.asarray(x,dtype=float)
-                if np.nanmax(x)-np.nanmin(x)<1e-9:
-                    return np.zeros_like(x)
-                return (x-np.nanmin(x))/(np.nanmax(x)-np.nanmin(x))
-            eff_n=_z(sel['資金効率(利確/投入)'].values)
-            daily_n=_z(sel['想定日次利確(円/日)'].values)
-            ev_n=_z(sel['期待値EV(R)'].values)
-            wr_n=_z(sel['TP到達率'].values)
-            dd_n=1.0-_z(sel['平均逆行(R)'].values)
-            sel['資金最適スコア']=np.round(0.35*eff_n+0.20*daily_n+0.20*ev_n+0.15*wr_n+0.10*dd_n,6)
-            sel=sel.sort_values('資金最適スコア',ascending=False).copy()
+            sym = str(r["銘柄"])
+            entry = float(r["現在値（終値）"])
+            tp = float(r["TP目安"])
+            lot = lot_map.get(sym, 100)
+
+            lots = int(per_pos // (entry * lot))
+            shares = lots * lot
+            use = shares * entry
+            prof = shares * (tp - entry)
+            avg_days = float(r.get("平均利確日数", 10.0))
+            daily = prof / max(avg_days, 1.0)
+            eff = prof / max(use, 1.0)
+
+            shares_list.append(shares)
+            use_list.append(use)
+            prof_list.append(prof)
+            daily_list.append(daily)
+            eff_list.append(eff)
+
+        sel["推奨株数"] = shares_list
+        sel["想定投入額(円)"] = np.round(use_list, 0)
+        sel["想定利確額(円)"] = np.round(prof_list, 0)
+        sel["想定日次利確(円/日)"] = np.round(daily_list, 0)
+        sel["資金効率(利確/投入)"] = np.round(np.array(eff_list) * 100.0, 3)  # %
+
+        # drop unaffordable
+        sel = sel[sel["推奨株数"] > 0].copy()
+        if sel.empty:
+            diag["mode"] = "degraded"
+            diag["errors"].append("Stage3: 資金制約により購入可能な銘柄がありません（単元が高すぎます）")
+            diag["stage"] = "done"
+            diag["elapsed_sec"] = time.time() - t0
+            return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
+
+        def _z(x: np.ndarray) -> np.ndarray:
+            x = np.asarray(x, dtype=float)
+            mn = np.nanmin(x)
+            mx = np.nanmax(x)
+            if not np.isfinite(mn) or not np.isfinite(mx) or (mx - mn) < 1e-9:
+                return np.zeros_like(x)
+            return (x - mn) / (mx - mn)
+
+        eff_n = _z(sel["資金効率(利確/投入)"].values)
+        daily_n = _z(sel["想定日次利確(円/日)"].values)
+        ev_n = _z(sel["期待値EV(R)"].values)
+        wr_n = _z(sel["TP到達率"].values)
+        dd_n = 1.0 - _z(sel["平均逆行(R)"].values)
+
+        # weights: growth-first (資金効率最優先)
+        sel["資金最適スコア"] = np.round(
+            0.35 * eff_n + 0.20 * daily_n + 0.20 * ev_n + 0.15 * wr_n + 0.10 * dd_n,
+            6,
+        )
+        sel = sel.sort_values("資金最適スコア", ascending=False).reset_index(drop=True)
+        sel.insert(0, "順位", range(1, len(sel) + 1))
+    except Exception as e:
+        diag["mode"] = "degraded"
+        diag["errors"].append(f"Stage3 warning: 資金最適化で例外（ランキングはStage2のまま）: {type(e).__name__}: {e}")
+
+    diag["stage"] = "done"
+    diag["elapsed_sec"] = time.time() - t0
     return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
 
-# --- diag persistence ---
 def save_last_diag(diag: Dict[str, Any]) -> None:
     try:
         with open(LAST_DIAG_PATH, "w", encoding="utf-8") as f:
