@@ -43,7 +43,7 @@ def _get_db_url() -> Optional[str]:
 def check_db_config() -> Tuple[bool, str]:
     url = _get_db_url()
     if not url or "postgres" not in url:
-        return False, "Neonの接続URLが見つかりません（NEON_DATABASE_URL）。"
+        return False, "Neonの接続URLが見つかりません（NEON_DATABASE_URL）."
     return True, "ok"
 
 def driver_diagnostics() -> Dict[str, Any]:
@@ -86,7 +86,7 @@ def _connect():
         psycopg2_err = repr(e)
 
     raise RuntimeError(
-        "Postgresドライバをimport/接続できませんでした。\n"
+        "Postgresドライバをimport/接続できませんでした.\n"
         f"psycopg error: {psycopg_err}\n"
         f"psycopg2 error: {psycopg2_err}"
     )
@@ -320,9 +320,9 @@ def universe_load_symbols(limit: Optional[int] = None) -> List[str]:
     try:
         with conn.cursor() as cur:
             if limit is None:
-                cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol;")
+                cur.execute("SELECT symbol, COALESCE(name,'') AS name, COALESCE(sector33_name,'') AS sector33_name, COALESCE(sector33_code,'') AS sector33_code, COALESCE(lot_size,100) AS lot_size FROM universe_symbols ORDER BY symbol;")
             else:
-                cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol LIMIT %s;", (int(limit),))
+                cur.execute("SELECT symbol, COALESCE(name,'') AS name, COALESCE(sector33_name,'') AS sector33_name, COALESCE(sector33_code,'') AS sector33_code, COALESCE(lot_size,100) AS lot_size FROM universe_symbols ORDER BY symbol LIMIT %s;", (int(limit),))
             rows = cur.fetchall()
     finally:
         conn.close()
@@ -332,9 +332,9 @@ def universe_load_symbols(limit: Optional[int] = None) -> List[str]:
     conn = _connect()
     with conn.cursor() as cur:
         if limit:
-            cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol LIMIT %s;", (int(limit),))
+            cur.execute("SELECT symbol, COALESCE(name,'') AS name, COALESCE(sector33_name,'') AS sector33_name, COALESCE(sector33_code,'') AS sector33_code, COALESCE(lot_size,100) AS lot_size FROM universe_symbols ORDER BY symbol LIMIT %s;", (int(limit),))
         else:
-            cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol;")
+            cur.execute("SELECT symbol, COALESCE(name,'') AS name, COALESCE(sector33_name,'') AS sector33_name, COALESCE(sector33_code,'') AS sector33_code, COALESCE(lot_size,100) AS lot_size FROM universe_symbols ORDER BY symbol;")
         rows = cur.fetchall()
     conn.close()
     return [r[0] for r in rows]
@@ -351,7 +351,7 @@ def universe_register_from_inputs(uploaded_csv_file, pasted_text: str):
                     pick = df.columns[cols.index(c)]
                     break
             if pick is None:
-                return 0, "CSVに ticker / symbol / code 列が見つかりません。"
+                return 0, "CSVに ticker / symbol / code 列が見つかりません."
             symbols += [str(x).strip() for x in df[pick].dropna().tolist()]
         except Exception as e:
             return 0, f"CSV読込に失敗: {e}"
@@ -365,7 +365,7 @@ def universe_register_from_inputs(uploaded_csv_file, pasted_text: str):
             symbols += parts
 
     if not symbols:
-        return 0, "入力が空です。CSVをアップロードするか、銘柄を貼り付けてください。"
+        return 0, "入力が空です.CSVをアップロードするか、銘柄を貼り付けてください."
 
     try:
         n = universe_upsert(symbols)
@@ -375,12 +375,12 @@ def universe_register_from_inputs(uploaded_csv_file, pasted_text: str):
 
 
 def universe_load_meta() -> pd.DataFrame:
-    """universe_symbols からメタ（市場/33業種など）を読み込む。無ければ空DF。"""
+    """universe_symbols からメタ（市場/33業種など）を読み込む.無ければ空DF."""
     ensure_schema()
     conn = _connect()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT symbol, name, market, sector33_code, sector33_name, sector17_code, sector17_name, scale_code, scale_name FROM universe_symbols;")
+            cur.execute("SELECT symbol, COALESCE(name,'') AS name, COALESCE(sector33_name,'') AS sector33_name, COALESCE(sector33_code,'') AS sector33_code, COALESCE(lot_size,100) AS lot_size FROM universe_symbols;")
             rows = cur.fetchall()
     finally:
         conn.close()
@@ -389,7 +389,7 @@ def universe_load_meta() -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["symbol","name","market","sector33_code","sector33_name","sector17_code","sector17_name","scale_code","scale_name"])
 
 def universe_autofetch_from_jpx() -> Tuple[int, str]:
-    """JPX公式サイトの『東証上場銘柄一覧（Excel）』を取得し、銘柄マスタ（universe_symbols）に登録する。
+    """JPX公式サイトの『東証上場銘柄一覧（Excel）』を取得し、銘柄マスタ（universe_symbols）に登録する.
 
     - 4桁コードは自動で .T を付与
     - 可能なら 33業種/市場区分/規模 なども保存（Stage0のセクター判定に使用）
@@ -491,7 +491,7 @@ def universe_autofetch_from_jpx() -> Tuple[int, str]:
                 break
 
     if col_code is None:
-        return 0, "銘柄コード列を特定できませんでした。手動CSVでの登録をお使いください。"
+        return 0, "銘柄コード列を特定できませんでした.手動CSVでの登録をお使いください."
 
     def _norm_code(x: Any) -> Optional[str]:
         s = "" if x is None else str(x)
@@ -541,7 +541,7 @@ def universe_autofetch_from_jpx() -> Tuple[int, str]:
         rows.append(row)
 
     if not rows:
-        return 0, "銘柄コードが抽出できませんでした。"
+        return 0, "銘柄コードが抽出できませんでした."
 
     n = universe_upsert_rows(rows)
     update_sector33_from_jpx()
@@ -772,7 +772,7 @@ def update_db_incremental(days_back: int = 14, keep_days: int = 400, chunk_size:
     ensure_schema()
     universe = universe_load_symbols()
     if not universe:
-        return {"upserted_rows": 0, "failed_symbols": 0, "message": "銘柄マスタが0件です。先に『銘柄マスタ登録』を行ってください。"}
+        return {"upserted_rows": 0, "failed_symbols": 0, "message": "銘柄マスタが0件です.先に『銘柄マスタ登録』を行ってください."}
 
     start_dt = (datetime.now(timezone.utc) - timedelta(days=days_back + 5)).date()
     start = str(start_dt)
@@ -955,93 +955,17 @@ def fetch_last_n_days(symbols: List[str], n_days: int = 80) -> pd.DataFrame:
         cutoff = (datetime.fromisoformat(latest).date() - timedelta(days=int(n_days*2))).isoformat()
         with conn.cursor() as cur:
             cur.execute("""
-            SELECT symbol, trade_date, open, high, low, close, volume
-            FROM ohlc_daily
-            WHERE symbol = ANY(%s) AND trade_date >= %s
-            ORDER BY symbol, trade_date;
-            """, (symbols, cutoff))
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows, columns=["Symbol","Date","Open","High","Low","Close","Volume"])
-    df["Date"] = pd.to_datetime(df["Date"])
-    return df
-
-def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
-    """Stage0: DBにある最新2営業日のスナップショット+20日平均出来高だけで全件を軽量スクリーニング。
-    33業種（JPX公式一覧）をDBに持てている場合は、セクター強度ランキングも出す。
-    """
-    ensure_schema()
-    universe = universe_load_symbols()
-    t0 = time.time()
-    conn = _connect()
-    try:
-        latest, prev = _read_latest_dates(conn)
-        if not latest or not prev:
-            return pd.DataFrame(), pd.DataFrame(), {"ok": False, "reason": "db_has_no_latest_prev"}
-
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                WITH last2 AS (
-                    SELECT symbol, trade_date, close, volume
-                    FROM ohlc_daily
-                    WHERE trade_date IN (%s, %s)
-                ),
-                piv AS (
-                    SELECT symbol,
-                           MAX(CASE WHEN trade_date=%s THEN close END) AS close_latest,
-                           MAX(CASE WHEN trade_date=%s THEN close END) AS close_prev
-                    FROM last2
-                    GROUP BY symbol
-                )
-                SELECT symbol, close_latest, close_prev
-                FROM piv;
-                """,
-                (latest, prev, latest, prev),
-            )
-            snap = cur.fetchall()
-
-            cutoff20 = (datetime.fromisoformat(latest).date() - timedelta(days=40)).isoformat()
-            cur.execute(
-                """
-                SELECT symbol, AVG(volume)::float AS avg_vol20
-                FROM ohlc_daily
-                WHERE symbol = ANY(%s) AND trade_date >= %s
-                GROUP BY symbol;
-                """,
-                (universe, cutoff20),
-            )
-            vol20 = cur.fetchall()
-    finally:
-        conn.close()
-
-    snap_df = pd.DataFrame(snap, columns=["symbol", "close_latest", "close_prev"])
-    vol20_df = pd.DataFrame(vol20, columns=["symbol", "avg_vol20"])
-    df = snap_df.merge(vol20_df, on="symbol", how="left")
-    conn_u = _connect()
-    try:
-        with conn_u.cursor() as cur_u:
-            # lot_size列が無いDBでも落ちないように吸収
-            try:
-                if _has_universe_col("lot_size"):
-                    cur_u.execute(
-                        "SELECT symbol, name, sector33_name, sector33_code, COALESCE(lot_size,100) "
-                        "FROM universe_symbols WHERE symbol = ANY(%s);",
+            SELECT symbol, COALESCE(name,'') AS name, COALESCE(sector33_name,'') AS sector33_name, COALESCE(sector33_code,'') AS sector33_code, COALESCE(lot_size,100) AS lot_size FROM universe_symbols WHERE symbol = ANY(%s);",
                         (universe,),
                     )
                 else:
                     cur_u.execute(
-                        "SELECT symbol, name, sector33_name, sector33_code, 100 "
-                        "FROM universe_symbols WHERE symbol = ANY(%s);",
+                        "SELECT symbol, COALESCE(name,'') AS name, COALESCE(sector33_name,'') AS sector33_name, COALESCE(sector33_code,'') AS sector33_code, COALESCE(lot_size,100) AS lot_size FROM universe_symbols WHERE symbol = ANY(%s);",
                         (universe,),
                     )
             except Exception:
                 cur_u.execute(
-                    "SELECT symbol, name, sector33_name, sector33_code, 100 "
-                    "FROM universe_symbols WHERE symbol = ANY(%s);",
+                    "SELECT symbol, COALESCE(name,'') AS name, COALESCE(sector33_name,'') AS sector33_name, COALESCE(sector33_code,'') AS sector33_code, COALESCE(lot_size,100) AS lot_size FROM universe_symbols WHERE symbol = ANY(%s);",
                     (universe,),
                 )
             urows = cur_u.fetchall()
@@ -1053,14 +977,14 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
         if first_len == 5:
             u_df = pd.DataFrame(urows, columns=["symbol","name","sector33_name","sector33_code","lot_size"])
         elif first_len == 4:
-            u_df = pd.DataFrame(urows, columns=["symbol","sector33_name","sector33_code","lot_size"])
+            u_df = pd.DataFrame(urows, columns=["symbol","name","sector33_name","sector33_code","lot_size"])
             u_df["name"] = None
         else:
             u_df = pd.DataFrame(urows)
     else:
         u_df = pd.DataFrame(columns=["symbol","name","sector33_name","sector33_code","lot_size"])
     df = df.merge(u_df, on="symbol", how="left")
-    df["sector33_name"] = df.get("sector33_name").fillna("不明")
+    df["sector33_name"] = df.get("sector33_name").replace("", None).fillna("不明")
     df["name"] = df.get("name").fillna("")
     df["pct_change_1d"] = (df["close_latest"] / (df["close_prev"] + 1e-12) - 1.0) * 100.0
 
@@ -1192,7 +1116,7 @@ def stage1_select(stage0_df: pd.DataFrame, keep: int, atr_pct_min: float, atr_pc
     return df, {"ok": True, "elapsed_sec": time.time()-t0, "stage1_candidates": int(len(df))}
 
 def _fundamentals_get_cached(symbol: str) -> Optional[Dict[str, Any]]:
-    """yfinanceの info/calendar を使った簡易財務/イベント。RateLimit時はNone。"""
+    """yfinanceの info/calendar を使った簡易財務/イベント.RateLimit時はNone."""
     ensure_schema()
     symbol = str(symbol).strip().upper()
     if not symbol:
@@ -1258,7 +1182,7 @@ def _fundamentals_get_cached(symbol: str) -> Optional[Dict[str, Any]]:
     return payload
 
 def _buffett_score(payload: Dict[str, Any]) -> Tuple[Optional[float], str]:
-    """超簡易の“バフェット風”評価（データが無ければNone）。"""
+    """超簡易の“バフェット風”評価（データが無ければNone）."""
     info = payload.get("info") or {}
     try:
         roe = info.get("returnOnEquity")
@@ -1290,7 +1214,7 @@ def _buffett_score(payload: Dict[str, Any]) -> Tuple[Optional[float], str]:
         return None, "計算失敗"
 
 def _event_alert(payload: Dict[str, Any], days_earn: int = 10, days_exdiv: int = 7) -> str:
-    """決算/権利落ちなど、取得できる範囲での注意喚起。"""
+    """決算/権利落ちなど、取得できる範囲での注意喚起."""
     info = payload.get("info") or {}
     today = datetime.now(JST).date()
     notes = []
@@ -1444,8 +1368,8 @@ def run_scan_3stage(
     **_ignored: Any,
 ) -> Dict[str, Any]:
     """
-    4000銘柄網羅の3段階スキャン + 資金効率最適化(Stage3)。
-    main.py 側から未知の引数が渡っても落ちないよう **_ignored を受ける。
+    4000銘柄網羅の3段階スキャン + 資金効率最適化(Stage3).
+    main.py 側から未知の引数が渡っても落ちないよう **_ignored を受ける.
     """
     ensure_schema()
     t0 = time.time()
@@ -1501,7 +1425,7 @@ def run_scan_3stage(
         try:
             with conn_l.cursor() as cur:
                 cur.execute(
-                    "SELECT symbol, COALESCE(lot_size,100) FROM universe_symbols WHERE symbol = ANY(%s);",
+                    "SELECT symbol, COALESCE(name,'') AS name, COALESCE(sector33_name,'') AS sector33_name, COALESCE(sector33_code,'') AS sector33_code, COALESCE(lot_size,100) AS lot_size FROM universe_symbols WHERE symbol = ANY(%s);",
                     (sel["銘柄"].astype(str).tolist(),),
                 )
                 lot_rows = cur.fetchall()
