@@ -294,6 +294,19 @@ if run_scan:
         st.caption("どれを買うか？（利確評価＋資金効率でランキング）")
         st.caption("※ここは **Stage2（固定TP/SL/最大保有）で“利確が再現しやすい順”** に並べた最終ランキングです。")
         df = out.get("selected")
+        # --- column bridge (logic.py output may use JP labels) ---
+        if isinstance(df, pd.DataFrame) and len(df):
+            if "銘柄" in df.columns and "symbol" not in df.columns: df["symbol"] = df["銘柄"]
+            if "銘柄名" in df.columns and "name" not in df.columns: df["name"] = df["銘柄名"]
+            if "セクター" in df.columns and "sector33_name" not in df.columns: df["sector33_name"] = df["セクター"]
+            if "3ヶ月リターン" in df.columns and "RET_3M" not in df.columns: df["RET_3M"] = df["3ヶ月リターン"]
+            if "WF勝率（OOS）" in df.columns and "wf_oos_wr" not in df.columns: df["wf_oos_wr"] = df["WF勝率（OOS）"]
+            if "WF損益比RR（OOS）" in df.columns and "wf_oos_rr" not in df.columns: df["wf_oos_rr"] = df["WF損益比RR（OOS）"]
+            if "MC DD 5%（推定）" in df.columns and "mc_dd5" not in df.columns: df["mc_dd5"] = df["MC DD 5%（推定）"]
+            if "Kelly最適化（f）" in df.columns and "kelly_f" not in df.columns: df["kelly_f"] = df["Kelly最適化（f）"]
+            if "AIトレンド" in df.columns and "trend_score" not in df.columns: df["trend_score"] = df["AIトレンド"]
+            if "推奨方式" in df.columns and "strategy_name" not in df.columns: df["strategy_name"] = df["推奨方式"]
+            if "総合スコア" in df.columns and "final_score" not in df.columns: df["final_score"] = df["総合スコア"]
         if isinstance(df, pd.DataFrame) and len(df):
             df = df.reset_index(drop=True)
             if "順位" in df.columns:
@@ -304,7 +317,6 @@ if run_scan:
             # 表示列を必要最低限に絞る（スマホ前提）
             col_map = {
                 "symbol":"銘柄",
-                "name":"企業名",
                 "sector33_name":"セクター",
                 "RET_3M":"3ヶ月リターン",
                 "wf_oos_wr":"WF勝率（OOS）",
@@ -312,8 +324,6 @@ if run_scan:
                 "mc_dd5":"MC DD 5%（推定）",
                 "final_score":"総合スコア",
                 "strategy_name":"推奨方式",
-                "kelly_f":"Kelly最適化（f）",
-                "trend_score":"AIトレンド",
             }
             for k,v in list(col_map.items()):
                 if k in df.columns and v not in df.columns:
@@ -324,8 +334,6 @@ if run_scan:
                     df[v] = None
             show_cols = ["順位","銘柄","企業名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式","Kelly最適化（f）","AIトレンド"]
             df = df[show_cols]
-            df = df.replace({None:""})
-            df = df.replace({"None":""})
             try:
                 for c in ["3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","Kelly最適化（f）","AIトレンド"]:
                     df[c] = pd.to_numeric(df[c], errors="coerce").round(4)
