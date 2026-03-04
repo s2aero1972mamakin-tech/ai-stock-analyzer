@@ -316,10 +316,10 @@ if run_scan:
                 if k in df.columns and v not in df.columns:
                     df[v] = df[k]
             # 列が無い場合は作る（落ちない）
-            for v in ["銘柄","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式"]:
+            for v in ["銘柄","企業名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式"]:
                 if v not in df.columns:
                     df[v] = None
-            show_cols = ["順位","銘柄","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式"]
+            show_cols = ["順位","銘柄","企業名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式"]
             df = df[show_cols]
             try:
                 for c in ["3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア"]:
