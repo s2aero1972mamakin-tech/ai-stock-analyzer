@@ -5,6 +5,27 @@ import re
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+
+def _json_safe(obj: Any):
+    """json.dumps default helper (date/datetime/numpy)."""
+    try:
+        import datetime as _dt
+        if isinstance(obj, (_dt.date, _dt.datetime)):
+            return obj.isoformat()
+    except Exception:
+        pass
+    try:
+        import numpy as _np
+        if isinstance(obj, (_np.integer,)):
+            return int(obj)
+        if isinstance(obj, (_np.floating,)):
+            return float(obj)
+        if isinstance(obj, (_np.bool_,)):
+            return bool(obj)
+    except Exception:
+        pass
+    return str(obj)
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -1198,7 +1219,7 @@ def _fundamentals_get_cached(symbol: str) -> Optional[Dict[str, Any]]:
                 VALUES(%s,%s,%s,NOW())
                 ON CONFLICT(symbol) DO UPDATE SET asof_date=EXCLUDED.asof_date, payload_json=EXCLUDED.payload_json, updated_utc=NOW();
                 """,
-                (symbol, today, json.dumps(payload, ensure_ascii=False)),
+                (symbol, today, json.dumps(payload, ensure_ascii=False, default=_json_safe)),
             )
         conn.commit()
     finally:
