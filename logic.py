@@ -6,6 +6,59 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 
+def compute_buffett_score(payload: dict) -> Optional[float]:
+    """Simple heuristic score 0..1. Missing -> None."""
+    if not isinstance(payload, dict) or not payload:
+        return None
+    def g(*keys):
+        for k in keys:
+            if k in payload and payload[k] not in (None, "", "None"):
+                return payload[k]
+        return None
+    try:
+        scores=[]
+        pe = g("trailingPE","pe","PER","per")
+        pb = g("priceToBook","pb","PBR","pbr")
+        de = g("debtToEquity","debt_equity","DE")
+        margin = g("profitMargins","netMargin","margin")
+        roe = g("returnOnEquity","roe")
+        if pe is not None:
+            pe=float(pe)
+            if pe>0: scores.append(max(0.0, min(1.0, (30.0-pe)/30.0)))
+        if pb is not None:
+            pb=float(pb)
+            if pb>0: scores.append(max(0.0, min(1.0, (3.0-pb)/3.0)))
+        if de is not None:
+            de=float(de)
+            scores.append(max(0.0, min(1.0, (200.0-de)/200.0)))
+        if margin is not None:
+            margin=float(margin)
+            if margin<=1.0: scores.append(max(0.0, min(1.0, margin/0.15)))
+            else: scores.append(max(0.0, min(1.0, (margin/100.0)/0.15)))
+        if roe is not None:
+            roe=float(roe)
+            if roe<=1.0: scores.append(max(0.0, min(1.0, roe/0.15)))
+            else: scores.append(max(0.0, min(1.0, (roe/100.0)/0.15)))
+        if not scores:
+            return None
+        return float(sum(scores)/len(scores))
+    except Exception:
+        return None
+
+
+def _sym_key(sym: str) -> str:
+    """Join key for JP symbols: strip suffix and non-digits, keep last 4 digits, zfill(4)."""
+    s = (sym or "").strip()
+    if not s:
+        return s
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if not digits:
+        return s
+    if len(digits) >= 4:
+        digits = digits[-4:]
+    return digits.zfill(4)
+
+
 def _norm_symbol(sym: str) -> str:
     """Normalize symbol to JP format: '1301' -> '1301.T'."""
     s = (sym or "").strip()
@@ -1075,16 +1128,12 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
                     u_df = pd.DataFrame(urows)
             else:
                 u_df = pd.DataFrame(columns=['symbol','name','sector33_name','sector33_code','lot_size'])
-            u_df['_sym_norm'] = u_df['symbol'].astype(str).map(_norm_symbol)
-        elif first_len == 4:
-            u_df = pd.DataFrame(urows, columns=["symbol","sector33_name","sector33_code","lot_size"])
-            u_df["name"] = None
-        else:
-            u_df = pd.DataFrame(urows)
-    else:
-        u_df = pd.DataFrame(columns=["symbol","name","sector33_name","sector33_code","lot_size"])
-    df["_sym_norm"] = df["symbol"].astype(str).map(_norm_symbol)
-    df = df.merge(u_df.drop(columns=["symbol"]), on="_sym_norm", how="left")
+            u_df['_key'] = u_df['symbol'].astype(str).map(_sym_key)
+    ukeys = set([_sym_key(x) for x in universe])
+    u_df = u_df[u_df['_key'].isin(ukeys)].copy()
+    u_df['_sym_norm'] = u_df['symbol'].astype(str).map(_norm_symbol)
+    df["_key"] = df["symbol"].astype(str).map(_sym_key)
+    df = df.merge(u_df.drop(columns=["symbol","_sym_norm"], errors="ignore"), left_on="_key", right_on="_key", how="left")
     df["sector33_name"] = df.get("sector33_name").replace("", None).fillna("不明")
     df["name"] = df.get("name").fillna("")
     df["pct_change_1d"] = (df["close_latest"] / (df["close_prev"] + 1e-12) - 1.0) * 100.0
