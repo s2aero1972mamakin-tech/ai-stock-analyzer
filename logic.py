@@ -410,28 +410,53 @@ def universe_autofetch_from_jpx() -> Tuple[int, str]:
     col_scale_code = None
     col_scale_name = None
 
+    def _norm_col(x: Any) -> str:
+        return str(x).strip().replace("（", "(").replace("）", ")")
+
+    # まずは“完全一致”に近いものを拾う
     for c in df.columns:
-        cs = str(c).strip()
-        if cs in ["コード", "銘柄コード"]:
+        cs = _norm_col(c)
+        if cs in ["コード", "銘柄コード", "Code"]:
             col_code = c
-        elif cs in ["銘柄名", "会社名", "名称"]:
+        elif cs in ["銘柄名", "会社名", "名称", "銘柄名(日本語)"]:
             col_name = c
-        elif cs in ["市場・商品区分", "市場区分", "市場"]:
+        elif cs in ["市場・商品区分", "市場区分", "市場", "市場・商品区分(日本語)"]:
             col_market = c
-        elif cs in ["33業種コード", "33業種"]:
+        elif cs in ["33業種コード", "33業種コード(東証)", "33業種コード（東証）"]:
             col_s33_code = c
-        elif cs in ["33業種区分", "33業種区分（日本語）"]:
+        elif cs in ["33業種区分", "33業種名", "33業種区分(日本語)", "33業種区分（日本語）"]:
             col_s33_name = c
-        elif cs in ["17業種コード", "17業種"]:
+        elif cs in ["17業種コード", "17業種コード(東証)", "17業種コード（東証）"]:
             col_s17_code = c
-        elif cs in ["17業種区分"]:
+        elif cs in ["17業種区分", "17業種名", "17業種区分(日本語)", "17業種区分（日本語）"]:
             col_s17_name = c
         elif cs in ["規模コード", "規模"]:
             col_scale_code = c
-        elif cs in ["規模区分"]:
+        elif cs in ["規模区分", "規模区分(日本語)", "規模区分（日本語）"]:
             col_scale_name = c
 
-    # fallback: 4桁比率でコード列推定
+    # 次に“部分一致”で補完（JPXの列名が微妙に変わることがあるため）
+    def _find_by_contains(must: List[str], must_not: List[str] = []) -> Optional[Any]:
+        for c in df.columns:
+            cs = _norm_col(c)
+            ok = all(k in cs for k in must) and all(k not in cs for k in must_not)
+            if ok:
+                return c
+        return None
+
+    if col_s33_code is None:
+        col_s33_code = _find_by_contains(["33", "業種", "コード"])
+    if col_s33_name is None:
+        col_s33_name = _find_by_contains(["33", "業種"], must_not=["コード"])
+    if col_market is None:
+        col_market = _find_by_contains(["市場"])
+    if col_name is None:
+        col_name = _find_by_contains(["銘柄", "名"]) or _find_by_contains(["名称"])
+    if col_scale_code is None:
+        col_scale_code = _find_by_contains(["規模", "コード"])
+    if col_scale_name is None:
+        col_scale_name = _find_by_contains(["規模"], must_not=["コード"])
+# fallback: 4桁比率でコード列推定
     if col_code is None:
         for c in df.columns:
             ser = df[c].dropna().astype(str).str.replace(r"\D", "", regex=True)
@@ -549,8 +574,12 @@ def update_sector33_from_jpx() -> Tuple[int, str]:
     if df is None or df.empty:
         return 0, f"jpx_master_download_failed: {last_err}"
 
-    # normalize columns
-    cols = {str(c).strip(): c for c in df.columns}
+    # normalize columns（JPXの列名は微妙に変わることがあるので“部分一致”も使う）
+    def _norm_col(x: Any) -> str:
+        return str(x).strip().replace("（", "(").replace("）", ")")
+
+    cols = {_norm_col(c): c for c in df.columns}
+
     # required: code
     code_col = None
     for k in ["コード", "銘柄コード", "Code"]:
@@ -558,26 +587,52 @@ def update_sector33_from_jpx() -> Tuple[int, str]:
             code_col = cols[k]
             break
     if code_col is None:
-        # fallback: first column with 4-digit-like
+        # fallback: 4桁比率で推定
+        for c in df.columns:
+            ser = df[c].dropna().astype(str).str.replace(r"\D", "", regex=True)
+            if len(ser) == 0:
+                continue
+            if (ser.str.fullmatch(r"\d{4}").mean() or 0.0) > 0.6:
+                code_col = c
+                break
+    if code_col is None:
         code_col = df.columns[0]
+
+    def _find_by_contains(must: List[str], must_not: List[str] = []) -> Optional[Any]:
+        for c in df.columns:
+            cs = _norm_col(c)
+            ok = all(k in cs for k in must) and all(k not in cs for k in must_not)
+            if ok:
+                return c
+        return None
 
     sec_code_col = None
     sec_name_col = None
     market_col = None
     name_col = None
 
+    # exact-ish
     for c in df.columns:
-        s = str(c).strip()
-        if s in ["33業種コード", "33業種コード（東証）", "33業種コード(東証)"]:
+        s = _norm_col(c)
+        if s in ["33業種コード", "33業種コード(東証)", "33業種コード（東証）"]:
             sec_code_col = c
-        if s in ["33業種区分", "33業種名", "33業種区分（日本語）"]:
+        elif s in ["33業種区分", "33業種名", "33業種区分(日本語)", "33業種区分（日本語）"]:
             sec_name_col = c
-        if s in ["市場・商品区分", "市場区分"]:
+        elif s in ["市場・商品区分", "市場区分", "市場"]:
             market_col = c
-        if s in ["銘柄名", "名称"]:
+        elif s in ["銘柄名", "名称", "会社名"]:
             name_col = c
 
-    # if sector columns not found, we can't update
+    # contains fallback
+    if sec_code_col is None:
+        sec_code_col = _find_by_contains(["33", "業種", "コード"])
+    if sec_name_col is None:
+        sec_name_col = _find_by_contains(["33", "業種"], must_not=["コード"])
+    if market_col is None:
+        market_col = _find_by_contains(["市場"])
+    if name_col is None:
+        name_col = _find_by_contains(["銘柄", "名"]) or _find_by_contains(["名称"])
+# if sector columns not found, we can't update
     if sec_code_col is None and sec_name_col is None:
         return 0, "jpx_master_has_no_sector33_columns"
 
