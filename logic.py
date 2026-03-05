@@ -1569,43 +1569,63 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_
 
     df["総合スコア"] = 0.55*df["利確スコア"] + 0.20*df["TP到達率"] + 0.15*df["期待値EV(R)"] - 0.10*df["平均逆行(R)"]
     df = df.sort_values("総合スコア", ascending=False).head(int(keep)).copy()
-    # --- COMPLETE AI: WalkForward / MonteCarlo / Kelly ---
+    # --- COMPLETE AI: WalkForward / MonteCarlo / Kelly (budgeted) ---
     try:
-        wf_wr_list = []
-        wf_rr_list = []
-        mc_list = []
-        k_list = []
-        for sym2 in df["銘柄"].astype(str).tolist():
+        # Streamlit Cloud対策：重い計算は上位N件だけ＆時間予算で打ち切り
+        top_n = int(os.environ.get("AI_EXTRA_TOP_N", "8"))
+        time_budget_s = float(os.environ.get("AI_EXTRA_BUDGET_S", "18"))
+        _t_ai0 = time.time()
+
+        n_all = int(len(df))
+        n_do = max(0, min(n_all, top_n))
+
+        wf_wr_list = [float("nan")] * n_all
+        wf_rr_list = [float("nan")] * n_all
+        mc_list    = [float("nan")] * n_all
+        k_list     = [float("nan")] * n_all
+
+        syms = df["銘柄"].astype(str).tolist()
+        for i_sym, sym2 in enumerate(syms[:n_do]):
+            if (time.time() - _t_ai0) > time_budget_s:
+                break
             g2 = hist[hist["Symbol"] == sym2].sort_values("Date")
-            wr, rr = walk_forward_oos(g2, hold_days=10, tp_atr=1.5, sl_atr=1.0, train_days=120, test_days=40, step_days=40)
-            wf_wr_list.append(wr)
-            wf_rr_list.append(rr)
-            mc_list.append(montecarlo_dd5(wr, rr, trades=60, paths=400, seed=7))
-            k_list.append(kelly_fraction(wr, rr))
-    
+            wr, rr = walk_forward_oos(
+                g2,
+                hold_days=10,
+                tp_atr=1.5,
+                sl_atr=1.0,
+                train_days=120,
+                test_days=40,
+                step_days=40,
+            )
+            wf_wr_list[i_sym] = wr
+            wf_rr_list[i_sym] = rr
+            mc_list[i_sym] = montecarlo_dd5(wr, rr, trades=60, paths=250, seed=7)  # paths軽量化
+            k_list[i_sym] = kelly_fraction(wr, rr)
+
         df["WF勝率（OOS）"] = wf_wr_list
         df["WF損益比RR（OOS）"] = wf_rr_list
         df["MC DD 5%（推定）"] = mc_list
         df["Kelly最適化（f）"] = k_list
-    
+
         # ボラ調整（ATR%があれば）
         if "ATR%" in stage1_df.columns:
             atr_map = stage1_df.set_index("銘柄")["ATR%"].to_dict()
-            atrs = df["銘柄"].map(lambda s: float(atr_map.get(s, np.nan)))
+            atrs = df["銘柄"].map(lambda s: float(atr_map.get(s, float("nan"))))
         else:
-            atrs = np.nan
+            atrs = float("nan")
         vol_adj = pd.to_numeric(atrs, errors="coerce")
         vol_adj = (3.0 / vol_adj).where(np.isfinite(vol_adj) & (vol_adj > 0), 1.0).clip(0.35, 1.65)
-    
-        # AI総合スコア（置換）
-        ret3m = pd.to_numeric(df["3ヶ月リターン"], errors="coerce").fillna(0.0)
-        trend = pd.to_numeric(df["AIトレンド"], errors="coerce").fillna(0.5)
-        wf = pd.to_numeric(df["WF勝率（OOS）"], errors="coerce").fillna(0.5)
-        rr = pd.to_numeric(df["WF損益比RR（OOS）"], errors="coerce").fillna(1.5)
-        dd5 = pd.to_numeric(df["MC DD 5%（推定）"], errors="coerce").fillna(-5.0)
+
+        # AI総合スコア（置換：欠損は中立値）
+        ret3m = pd.to_numeric(df.get("3ヶ月リターン", np.nan), errors="coerce").fillna(0.0)
+        trend = pd.to_numeric(df.get("AIトレンド", np.nan), errors="coerce").fillna(0.5)
+        wf = pd.to_numeric(df.get("WF勝率（OOS）", np.nan), errors="coerce").fillna(0.5)
+        rr = pd.to_numeric(df.get("WF損益比RR（OOS）", np.nan), errors="coerce").fillna(1.5)
+        dd5 = pd.to_numeric(df.get("MC DD 5%（推定）", np.nan), errors="coerce").fillna(-5.0)
         dd_score = 1.0/(1.0+np.exp(-(dd5+3.0)))
-        kelly = pd.to_numeric(df["Kelly最適化（f）"], errors="coerce").fillna(0.0)
-    
+        kelly = pd.to_numeric(df.get("Kelly最適化（f）", np.nan), errors="coerce").fillna(0.0)
+
         base = (
             0.28 * np.tanh(4.0*ret3m) +
             0.22 * (trend-0.5)*2.0 +
@@ -1619,7 +1639,7 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_
     except Exception:
         pass
 
-# --- 財務/イベント（簡易）を上位Nだけ付与（RateLimit時はスキップ） ---
+        # --- 財務/イベント（簡易）を上位Nだけ付与（RateLimit時はスキップ） ---
     if include_fundamentals and fundamentals_top_n and len(df):
         topn = int(min(len(df), max(0, fundamentals_top_n)))
         scores = []
