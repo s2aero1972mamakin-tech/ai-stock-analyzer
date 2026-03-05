@@ -1261,7 +1261,7 @@ def stage1_select(stage0_df: pd.DataFrame, keep: int, atr_pct_min: float, atr_pc
             continue
         feats = _trend_features(g)
         score = 0.40*(feats.get("ret_20",0.0) if np.isfinite(feats.get("ret_20",np.nan)) else 0.0) + 0.20*(feats.get("ret_60",0.0) if np.isfinite(feats.get("ret_60",np.nan)) else 0.0) + 0.20*(feats.get("slope20",0.0) if np.isfinite(feats.get("slope20",np.nan)) else 0.0) + 0.20*(atr_pct/10.0 if np.isfinite(atr_pct) else 0.0)
-        rows.append({"銘柄": sym, "ATR%": atr_pct, "20日騰落": feats.get("ret_20",np.nan), "60日騰落": feats.get("ret_60",np.nan), "MA20傾き": feats.get("slope20",np.nan), "stage1_score": score, "現在値（終値）": close_last})
+        rows.append({"銘柄": sym, "銘柄名": name_map.get(sym,""), "セクター": sec_map.get(sym,"不明"), "ATR%": atr_pct, "20日騰落": feats.get("ret_20",np.nan), "60日騰落": feats.get("ret_60",np.nan), "MA20傾き": feats.get("slope20",np.nan), "stage1_score": score, "現在値（終値）": close_last})
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(), {"ok": False}
@@ -1529,6 +1529,18 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_
     errors, sample_fail = 0, []
     diag = {"hist_symbols": int(len(syms)), "hist_days": int(stage2_days), "ok_eval": 0, "fallback_eval": 0, "skipped_no_atr": 0}
 
+    # v13 fix: carry company/sector from Stage1
+    _name_map = {}
+    _sec_map = {}
+    try:
+        if "セクター" in stage1_df.columns:
+            _sec_map = stage1_df.set_index("銘柄")["セクター"].fillna("不明").to_dict()
+        if "銘柄名" in stage1_df.columns:
+            _name_map = stage1_df.set_index("銘柄")["銘柄名"].fillna("").to_dict()
+    except Exception:
+        pass
+
+
     for sym, g in hist.groupby("Symbol"):
         try:
             g = g.sort_values("Date")
@@ -1548,10 +1560,10 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_
             atr_pct = float(stage1_df.loc[stage1_df["銘柄"]==sym, "ATR%"].iloc[0]) if len(stage1_df.loc[stage1_df["銘柄"]==sym]) else np.nan
             strat = _pick_strategy(_trend_features(g), atr_pct)
 
-            rows.append({"銘柄": sym, "推奨方式": strat, "現在値（終値）": round(close_last,2), "TP目安": round(tp,2), "SL目安": round(sl,2),
+            rows.append({"銘柄": sym, "銘柄名": _name_map.get(sym,""), "セクター": _sec_map.get(sym,"不明"), "推奨方式": strat, "現在値（終値）": round(close_last,2), "TP目安": round(tp,2), "SL目安": round(sl,2),
                          "TP到達率": res["tp_hit_rate"], "期待値EV(R)": res["ev_r"], "平均利確日数": res["avg_tp_days"],
                          "平均逆行(R)": res["avg_dd_r"], "検証回数": res.get("trials",0), "利確スコア": res.get("swing_score", float("nan")), "備考": res.get("note","")})
-            guides.append({"銘柄": sym, "推奨方式": strat, "Entry目安": round(close_last,2), "SL目安": round(sl,2), "TP目安": round(tp,2), "最大保有": "10営業日"})
+            guides.append({"銘柄": sym, "銘柄名": _name_map.get(sym,""), "セクター": _sec_map.get(sym,"不明"), "推奨方式": strat, "Entry目安": round(close_last,2), "SL目安": round(sl,2), "TP目安": round(tp,2), "最大保有": "10営業日"})
         except Exception:
             errors += 1
             if len(sample_fail) < 20:
@@ -1767,7 +1779,131 @@ def run_scan_3stage(
         diag["elapsed_sec"] = time.time() - t0
         return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
 
-    # Stage3: capital efficiency (資金効率最優先)
+    
+    # ---- v13 Institutional Engines: integrate into per-symbol ranking (safe; skip on error) ----
+    try:
+        # Build per-symbol features (top N only to keep Cloud fast)
+        topN = min(int(stage2_keep), max(30, int(stage2_keep)))
+        tmp = sel.head(topN).copy()
+
+        liq_list=[]
+        sharpe_list=[]
+        mc_port_list=[]
+        ruin_list=[]
+        transf_list=[]
+        macro_list=[]
+        risk_list=[]
+        # fetch recent bars per symbol from DB (already cached)
+        for sym in tmp["銘柄"].astype(str).tolist():
+            dfh = fetch_last_n_days([sym], n_days=120)
+            if dfh is None or dfh.empty:
+                liq_list.append(0.0); sharpe_list.append(0.0); mc_port_list.append(0.0); ruin_list.append(0.0)
+                transf_list.append(0.0); macro_list.append(0.0); risk_list.append(0.0)
+                continue
+            # Normalize columns for engines
+            dfh2 = dfh.rename(columns={"Close":"Close","Volume":"Volume"}).copy()
+            # Ensure expected casing
+            if "Close" not in dfh2.columns and "close" in dfh2.columns:
+                dfh2["Close"]=dfh2["close"]
+            if "Volume" not in dfh2.columns and "volume" in dfh2.columns:
+                dfh2["Volume"]=dfh2["volume"]
+            # returns
+            try:
+                rets = dfh2["Close"].astype(float).pct_change().dropna().values
+            except Exception:
+                rets = np.array([])
+
+            liq_list.append(liquidity_flow_ai(dfh2))
+            sharpe_list.append(sharpe_optimize(rets) if len(rets) else 0.0)
+            mc_port_list.append(montecarlo_portfolio(rets, n=1500) if len(rets) else 0.0)
+            ruin_list.append(bankruptcy_probability(rets) if len(rets) else 0.0)
+            # transformer: predict "next" as weighted recent return proxy
+            transf_list.append(transformer_predict(pd.Series(rets[-60:])) if len(rets) else 0.0)
+            # macro proxy: use recent ret windows + volatility (no external macro feed)
+            try:
+                r20 = float(pd.Series(rets[-21:]).sum()) if len(rets) >= 21 else 0.0
+                r60 = float(pd.Series(rets[-61:]).sum()) if len(rets) >= 61 else 0.0
+                vol20 = float(pd.Series(rets[-21:]).std()) if len(rets) >= 21 else 0.0
+                macro_list.append(macro_factor_ai([r20, r60, -vol20]))
+            except Exception:
+                macro_list.append(0.0)
+            risk_list.append(institutional_risk_engine(rets) if len(rets) else 0.0)
+
+        tmp["liquidity_flow"] = liq_list
+        tmp["sharpe_opt"] = sharpe_list
+        tmp["mc_port"] = mc_port_list
+        tmp["bankruptcy_p"] = ruin_list
+        tmp["transformer_pred"] = transf_list
+        tmp["macro_factor"] = macro_list
+        tmp["risk_score_v13"] = risk_list
+
+        # sector flow / rotation scores (if available)
+        try:
+            if "3ヶ月リターン" in tmp.columns and "RET_3M" not in tmp.columns:
+                tmp["RET_3M"] = tmp["3ヶ月リターン"]
+            if "セクター" in tmp.columns and "sector33_name" not in tmp.columns:
+                tmp["sector33_name"] = tmp["セクター"]
+            sec_rank = ai_sector_rotation(tmp)
+            if sec_rank is not None and isinstance(sec_rank, (pd.Series,)):
+                rank_map = {k: float(v) for k, v in sec_rank.items()}
+                tmp["sector_flow"] = tmp["sector33_name"].map(rank_map).fillna(0.0)
+            else:
+                tmp["sector_flow"] = 0.0
+        except Exception:
+            tmp["sector_flow"] = 0.0
+
+        # final institutional score (add-on) + ranking
+        tmp["institutional_score"] = tmp.apply(lambda r: institutional_score(r.to_dict()), axis=1)
+
+        # sanitize
+        tmp = tmp.replace([np.inf, -np.inf], np.nan)
+
+        # merge back into sel (align by 銘柄)
+        sel = sel.merge(tmp[["銘柄","liquidity_flow","sharpe_opt","mc_port","bankruptcy_p","transformer_pred","macro_factor","risk_score_v13","sector_flow","institutional_score"]],
+                        on="銘柄", how="left")
+
+        # portfolio suggestion using correlation + BL + RL (on top candidates)
+        try:
+            syms = tmp["銘柄"].astype(str).tolist()
+            # build returns matrix (align by date)
+            dfs = []
+            for sym in syms:
+                d = fetch_last_n_days([sym], n_days=180)
+                if d is None or d.empty:
+                    continue
+                d = d.copy()
+                d["ret"] = d["Close"].astype(float).pct_change()
+                dfs.append(d[["Date","Symbol","ret"]])
+            if dfs:
+                allr = pd.concat(dfs, ignore_index=True)
+                piv = allr.pivot_table(index="Date", columns="Symbol", values="ret").dropna()
+                if piv.shape[1] >= 2 and piv.shape[0] >= 30:
+                    R = piv.values
+                    w0 = correlation_portfolio(R)
+                    if w0 is not None:
+                        # BL views: use institutional_score as view signal
+                        cov = np.cov(R.T)
+                        mw = np.ones(cov.shape[0]) / cov.shape[0]
+                        views = np.array([float(x) for x in tmp.set_index("銘柄").loc[piv.columns]["institutional_score"].values])
+                        bl = black_litterman(cov, mw, views)
+                        # RL step: nudge weights by recent mean returns
+                        recent = piv.tail(20).mean().values
+                        w1 = rl_portfolio(np.array(w0, dtype=float), recent, lr=0.05)
+                        diag["portfolio_v13"] = {
+                            "symbols": [str(s) for s in piv.columns.tolist()],
+                            "w_corr": [float(x) for x in np.array(w0).tolist()],
+                            "w_rl": [float(x) for x in np.array(w1).tolist()],
+                            "bl_posterior": [float(x) for x in (np.array(bl).tolist() if bl is not None else [])],
+                        }
+        except Exception as _e_pf:
+            diag["portfolio_v13"] = {"error": f"{type(_e_pf).__name__}: {_e_pf}"}
+
+        diag["v13_engines_integrated"] = True
+    except Exception as _e_v13:
+        diag["v13_engines_integrated"] = False
+        diag["errors"].append(f"v13 engines skipped: {type(_e_v13).__name__}: {_e_v13}")
+
+# Stage3: capital efficiency (資金効率最優先)
     try:
         # lot size from universe table
         conn_l = _connect()
@@ -1873,116 +2009,146 @@ def load_last_diag() -> Optional[Dict[str, Any]]:
 
 
 # =====================================================
-# ===== Institutional AI Extensions (v12 add-on) ======
+# JPX AI TRADER v13 - Institutional Engines
 # =====================================================
 
-import numpy as _np
-import pandas as _pd
+import numpy as np
+import pandas as pd
 
-# ---- Liquidity Flow AI ----
-def liquidity_flow_ai(df):
+# ------------------------------
+# AI Sector Rotation
+# ------------------------------
+def ai_sector_rotation(df):
     try:
-        if df is None or len(df) < 25:
-            return 0.0
-        close = df["Close"].astype(float)
-        volume = df["Volume"].astype(float)
-        ret = close.pct_change()
-        money_flow = (ret * volume).rolling(10).sum()
-        vol_surge = volume.iloc[-1] / (volume.rolling(20).mean().iloc[-1] + 1e-9)
-        trend = close.rolling(20).mean()
-        trend_align = 1 if close.iloc[-1] > trend.iloc[-1] else -1
-        volatility = ret.rolling(20).std()
-        flow_score = (
-            0.4 * vol_surge +
-            0.3 * float(money_flow.iloc[-1]) +
-            0.2 * trend_align -
-            0.1 * float(volatility.iloc[-1])
-        )
-        if _np.isfinite(flow_score):
-            return float(flow_score)
-        return 0.0
-    except Exception:
-        return 0.0
-
-# ---- Sector Flow AI ----
-def sector_flow_ai(df):
-    try:
-        if "sector33_name" not in df.columns:
+        if "sector33_name" not in df.columns or "RET_3M" not in df.columns:
             return None
-        sec = df.groupby("sector33_name")["RET_3M"].mean()
+        sec = df.groupby("sector33_name")["RET_3M"].median()
         return sec.sort_values(ascending=False)
     except Exception:
         return None
 
-# ---- Market Regime AI ----
-def market_regime_ai(index_df):
+# ------------------------------
+# Self Evolving Parameters
+# ------------------------------
+def evolve_parameters(history):
     try:
-        close = index_df["Close"].astype(float)
-        ma200 = close.rolling(200).mean()
-        vol = close.pct_change().rolling(20).std()
-        price = close.iloc[-1]
-        if price > ma200.iloc[-1] and vol.iloc[-1] < 0.25:
-            return "BULL"
-        if price < ma200.iloc[-1] and vol.iloc[-1] > 0.30:
-            return "BEAR"
-        return "RANGE"
+        best = history.sort_values("score", ascending=False).head(5)
+        return best.mean(numeric_only=True).to_dict()
     except Exception:
-        return "UNKNOWN"
+        return {}
 
-# ---- MonteCarlo Drawdown ----
-def montecarlo_dd_ext(returns, n=2000):
+# ------------------------------
+# Sharpe Optimization
+# ------------------------------
+def sharpe_optimize(returns):
     try:
-        dd=[]
-        returns=_np.array(returns)
+        mu = np.mean(returns)
+        sigma = np.std(returns) + 1e-9
+        return float(mu / sigma)
+    except Exception:
+        return 0.0
+
+# ------------------------------
+# Correlation Portfolio
+# ------------------------------
+def correlation_portfolio(returns_matrix):
+    try:
+        corr = np.corrcoef(returns_matrix.T)
+        weights = 1 - np.mean(corr, axis=1)
+        weights = weights / np.sum(np.abs(weights))
+        return weights
+    except Exception:
+        return None
+
+# ------------------------------
+# MonteCarlo Portfolio
+# ------------------------------
+def montecarlo_portfolio(returns, n=2000):
+    try:
+        results = []
         for _ in range(n):
-            sim=_np.random.choice(returns,len(returns))
-            eq=_np.cumprod(1+sim)
-            peak=_np.maximum.accumulate(eq)
-            dd.append(_np.min(eq/peak-1))
-        return float(_np.percentile(dd,5))
+            sim = np.random.choice(returns, size=len(returns))
+            eq = np.cumprod(1 + sim)
+            results.append(eq[-1])
+        return float(np.mean(results))
     except Exception:
         return 0.0
 
-# ---- Institutional Risk Engine ----
-def institutional_risk_engine(returns):
+# ------------------------------
+# Bankruptcy Probability
+# ------------------------------
+def bankruptcy_probability(returns):
     try:
-        vol=_np.std(returns)
-        dd=_np.min(_np.cumsum(returns))
-        sharpe=_np.mean(returns)/(_np.std(returns)+1e-9)
-        risk = vol + abs(dd) - sharpe
-        return float(risk)
+        ruin = np.sum(np.array(returns) < -0.5)
+        return float(ruin / max(len(returns),1))
     except Exception:
         return 0.0
 
-# ---- WalkForward Evaluation ----
-def walkforward_test_ext(returns):
+# ------------------------------
+# Black-Litterman
+# ------------------------------
+def black_litterman(cov, market_weights, views):
     try:
-        split=int(len(returns)*0.7)
-        train=returns[:split]
-        test=returns[split:]
-        sharpe_train=_np.mean(train)/(_np.std(train)+1e-9)
-        sharpe_test=_np.mean(test)/(_np.std(test)+1e-9)
-        return float(sharpe_train),float(sharpe_test)
+        tau = 0.05
+        pi = cov @ market_weights
+        return pi + tau * views
     except Exception:
-        return 0.0,0.0
+        return None
 
-# ---- Final Institutional AI Score ----
-def final_ai_score_ext(row):
+# ------------------------------
+# Transformer Price Prediction (lightweight)
+# ------------------------------
+def transformer_predict(series):
     try:
-        score=(
-            0.15*row.get("trend_score",0)+
-            0.15*row.get("liquidity_flow",0)+
-            0.12*row.get("sector_flow",0)+
+        # simple attention-like weighting
+        w = np.linspace(0.1,1,len(series))
+        w = w / np.sum(w)
+        return float(np.sum(series * w))
+    except Exception:
+        return 0.0
+
+# ------------------------------
+# Reinforcement Portfolio (simple policy)
+# ------------------------------
+def rl_portfolio(weights, returns, lr=0.01):
+    try:
+        grad = returns
+        weights = weights + lr * grad
+        weights = weights / (np.sum(np.abs(weights)) + 1e-9)
+        return weights
+    except Exception:
+        return weights
+
+# ------------------------------
+# Macro Factor AI
+# ------------------------------
+def macro_factor_ai(factors):
+    try:
+        return float(np.mean(factors))
+    except Exception:
+        return 0.0
+
+# ------------------------------
+# Final Institutional Score
+# ------------------------------
+def institutional_score(row):
+    try:
+        score = (
+            0.12*row.get("trend_score",0)+
+            0.12*row.get("liquidity_flow",0)+
+            0.10*row.get("sector_flow",0)+
             0.10*row.get("wf_oos_wr",0)+
-            0.10*row.get("wf_oos_rr",0)+
-            0.10*row.get("mc_dd5",0)+
+            0.08*row.get("wf_oos_rr",0)+
+            0.08*row.get("mc_dd5",0)+
             0.08*row.get("kelly_f",0)+
-            0.08*row.get("trend_score",0)+
-            0.07*row.get("buffett_score",0)+
-            0.05*(1-row.get("risk_score",0))
+            0.08*row.get("buffett_score",0)+
+            0.06*row.get("macro_factor",0)+
+            0.06*(1-row.get("risk_score",0))+
+            0.12*row.get("transformer_pred",0)
         )
-        if _np.isfinite(score):
+        if np.isfinite(score):
             return float(score)
         return 0.0
     except Exception:
         return 0.0
+
