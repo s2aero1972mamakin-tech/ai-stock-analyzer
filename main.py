@@ -276,6 +276,7 @@ if run_scan:
         st.success(f"スキャン完了（{elapsed:.1f}秒） / mode={diag.get('mode','?')}")
         with st.expander("📊 診断（JSON）", expanded=False):
             st.json(diag)
+        with st.expander("🏁 セクター強度（参考）", expanded=False):
         st.subheader("🏁 セクター強度ランキング（Stage0）")
         st.caption("（補足）セクターが「不明」ばかりの場合は、銘柄マスタの33業種がDBに入っていません。サイドバーの『33業種を再同期（JPX）』を実行してください。")
         st.caption("※ここは **33業種ごとの“強度（中央値）”** ランキングです。銘柄ランキングではありません。")
@@ -290,7 +291,8 @@ if run_scan:
         else:
             st.info("セクター情報が不足しているため、セクター強度は非表示です（銘柄マスタに33業種が入っているか確認してください）。")
 
-        st.subheader("🏆 AI最終選定銘柄（利確スコア統合）")
+        
+st.subheader("🏆 AI最終選定銘柄（利確スコア統合）")
         st.caption("どれを買うか？（利確評価＋資金効率でランキング）")
         st.caption("※ここは **Stage2（固定TP/SL/最大保有）で“利確が再現しやすい順”** に並べた最終ランキングです。")
         df = out.get("selected")
@@ -356,7 +358,7 @@ for v in ["銘柄","企業名","セクター","3ヶ月リターン","WF勝率（
             if mobile_cards:
                 render_cards_selected(df.head(show_top_n))
                 with st.expander("表で見る（PC向け）", expanded=False):
-                    st.dataframe(df, width="stretch")
+                    st.dataframe(df_main if "df_main" in locals() else df, width="stretch")
             else:
                 st.dataframe(df, width="stretch")
 
