@@ -1,5001 +1,1988 @@
-
-import pandas as pd
-import numpy as np
-import yfinance as yf
+import os
 import json
-from typing import Dict, Any, Tuple, List
+import time
+import re
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 
-# ============================
-# Utility Functions
-# ============================
-def zscore(s):
-    s = pd.to_numeric(s, errors="coerce")
-    return (s - s.mean()) / (s.std(ddof=0) + 1e-9)
-
-def safe_float(x):
+def compute_buffett_score(payload: dict) -> Optional[float]:
+    """Simple heuristic score 0..1. Missing -> None."""
+    if not isinstance(payload, dict) or not payload:
+        return None
+    def g(*keys):
+        for k in keys:
+            if k in payload and payload[k] not in (None, "", "None"):
+                return payload[k]
+        return None
     try:
-        return float(x)
-    except:
-        return np.nan
+        scores=[]
+        pe = g("trailingPE","pe","PER","per")
+        pb = g("priceToBook","pb","PBR","pbr")
+        de = g("debtToEquity","debt_equity","DE")
+        margin = g("profitMargins","netMargin","margin")
+        roe = g("returnOnEquity","roe")
+        if pe is not None:
+            pe=float(pe)
+            if pe>0: scores.append(max(0.0, min(1.0, (30.0-pe)/30.0)))
+        if pb is not None:
+            pb=float(pb)
+            if pb>0: scores.append(max(0.0, min(1.0, (3.0-pb)/3.0)))
+        if de is not None:
+            de=float(de)
+            scores.append(max(0.0, min(1.0, (200.0-de)/200.0)))
+        if margin is not None:
+            margin=float(margin)
+            if margin<=1.0: scores.append(max(0.0, min(1.0, margin/0.15)))
+            else: scores.append(max(0.0, min(1.0, (margin/100.0)/0.15)))
+        if roe is not None:
+            roe=float(roe)
+            if roe<=1.0: scores.append(max(0.0, min(1.0, roe/0.15)))
+            else: scores.append(max(0.0, min(1.0, (roe/100.0)/0.15)))
+        if not scores:
+            return None
+        return float(sum(scores)/len(scores))
+    except Exception:
+        return None
 
 
-# ============================
-# Market Regime AI
-# ============================
-def market_regime_ai():
+def _sym_key(sym: str) -> str:
+    """Join key for JP symbols: strip suffix and non-digits, keep last 4 digits, zfill(4)."""
+    s = (sym or "").strip()
+    if not s:
+        return s
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if not digits:
+        return s
+    if len(digits) >= 4:
+        digits = digits[-4:]
+    return digits.zfill(4)
+
+
+def _norm_symbol(sym: str) -> str:
+    """Normalize symbol to JP format: '1301' -> '1301.T'."""
+    s = (sym or "").strip()
+    if not s:
+        return s
+    if "." in s:
+        return s
+    if s.isdigit():
+        return s.zfill(4) + ".T"
+    return s
+
+
+def _json_safe(obj: Any):
+    """json.dumps default helper (date/datetime/numpy)."""
     try:
-        df = yf.download("^N225", period="1y", progress=False)
-        r = df["Close"].pct_change().dropna()
-        vol = r.rolling(20).std().iloc[-1]
-        mom = df["Close"].pct_change(60).iloc[-1]
+        import datetime as _dt
+        if isinstance(obj, (_dt.date, _dt.datetime)):
+            return obj.isoformat()
+    except Exception:
+        pass
+    try:
+        import numpy as _np
+        if isinstance(obj, (_np.integer,)):
+            return int(obj)
+        if isinstance(obj, (_np.floating,)):
+            return float(obj)
+        if isinstance(obj, (_np.bool_,)):
+            return bool(obj)
+    except Exception:
+        pass
+    return str(obj)
 
-        if mom > 0.05 and vol < 0.02:
-            return "Bull"
-        if mom < -0.05:
-            return "Bear"
-        if vol > 0.03:
-            return "HighVol"
-        return "Sideways"
-    except:
-        return "Unknown"
+import numpy as np
+import pandas as pd
+import yfinance as yf
 
+JST = timezone(timedelta(hours=9))
 
-# ============================
-# Sector Flow AI
-# ============================
-def sector_flow_ai(df):
-    if df.empty:
-        return pd.DataFrame()
+RATE_LIMIT_SLEEP_SEC = float(os.environ.get('RATE_LIMIT_SLEEP_SEC','0.4'))
 
-    df["ret3m"] = df.groupby("symbol")["close"].pct_change(60)
-    sec = df.groupby("sector")["ret3m"].median().sort_values(ascending=False)
-    return sec.reset_index(name="sector_strength")
+LAST_DIAG_PATH = "last_diag.json"
 
+# --- DB URL ---
+def _get_db_url() -> Optional[str]:
+    return os.environ.get("NEON_DATABASE_URL") or os.environ.get("DATABASE_URL")
 
-# ============================
-# Risk Parity Portfolio
-# ============================
-def risk_parity_weights(returns):
-    cov = returns.cov().values
-    n = len(cov)
-    w = np.ones(n)/n
-    for _ in range(100):
-        port_var = w.T @ cov @ w
-        mrc = cov @ w
-        rc = w * mrc
-        target = port_var / n
-        w *= target / (rc + 1e-9)
-        w /= w.sum()
-    return w
+def check_db_config() -> Tuple[bool, str]:
+    url = _get_db_url()
+    if not url or "postgres" not in url:
+        return False, "Neonの接続URLが見つかりません（NEON_DATABASE_URL）。"
+    return True, "ok"
 
+def driver_diagnostics() -> Dict[str, Any]:
+    info: Dict[str, Any] = {"python": None, "psycopg": None, "psycopg2": None}
+    try:
+        import sys
+        info["python"] = sys.version
+    except Exception:
+        pass
+    try:
+        import psycopg  # type: ignore
+        info["psycopg"] = getattr(psycopg, "__version__", "unknown")
+    except Exception as e:
+        info["psycopg"] = {"error": repr(e)}
+    try:
+        import psycopg2  # type: ignore
+        info["psycopg2"] = getattr(psycopg2, "__version__", "unknown")
+    except Exception as e:
+        info["psycopg2"] = {"error": repr(e)}
+    return info
 
-# ============================
-# Black Litterman
-# ============================
-def black_litterman(returns):
-    cov = returns.cov().values
-    n = len(cov)
-    w = np.ones(n)/n
-    return w
+def _connect():
+    url = _get_db_url()
+    if not url:
+        raise RuntimeError("NEON_DATABASE_URL not set")
 
+    psycopg_err = None
+    psycopg2_err = None
 
-# ============================
-# Monte Carlo Portfolio Risk
-# ============================
-def monte_carlo_portfolio(returns, w):
-    sims = 2000
-    horizon = 60
-    mu = returns.mean().values
-    cov = returns.cov().values
-    L = np.linalg.cholesky(cov + np.eye(len(mu))*1e-6)
+    try:
+        import psycopg  # type: ignore
+        return psycopg.connect(url)
+    except Exception as e:
+        psycopg_err = repr(e)
 
-    res = []
-    for _ in range(sims):
-        r = np.random.normal(size=(horizon, len(mu)))
-        sim = r @ L.T + mu
-        port = sim @ w
-        eq = np.cumprod(1+port)
-        dd = 1 - eq/np.maximum.accumulate(eq)
-        res.append(dd.max())
+    try:
+        import psycopg2  # type: ignore
+        return psycopg2.connect(url)
+    except Exception as e:
+        psycopg2_err = repr(e)
 
-    return {
-        "max_dd_p95": float(np.quantile(res,0.95)),
-        "ruin_prob": float(np.mean(np.array(res) > 0.25))
-    }
-
-
-# ============================
-# AI Score Integration
-# ============================
-def final_ai_score(df):
-    df["score"] = (
-        zscore(df["momentum"]) +
-        zscore(df["sharpe"]) -
-        zscore(df["risk"])
+    raise RuntimeError(
+        "Postgresドライバをimport/接続できませんでした。\n"
+        f"psycopg error: {psycopg_err}\n"
+        f"psycopg2 error: {psycopg2_err}"
     )
+
+def ensure_schema() -> None:
+    """DBスキーマを安全に作成/拡張（後方互換）"""
+    conn = _connect()
+    with conn.cursor() as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ohlc_daily (
+            symbol TEXT NOT NULL,
+            trade_date DATE NOT NULL,
+            open DOUBLE PRECISION,
+            high DOUBLE PRECISION,
+            low DOUBLE PRECISION,
+            close DOUBLE PRECISION,
+            adj_close DOUBLE PRECISION,
+            volume BIGINT,
+            PRIMARY KEY(symbol, trade_date)
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS kv_meta (
+            k TEXT PRIMARY KEY,
+            v TEXT
+        );
+        """)
+        # 銘柄マスタ（JPX公式一覧から自動取得する想定）
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS universe_symbols (
+            symbol TEXT PRIMARY KEY,
+            name TEXT,
+            market TEXT,
+            sector33_code TEXT,
+            sector33_name TEXT,
+            sector17_code TEXT,
+            sector17_name TEXT,
+            scale_code TEXT,
+            scale_name TEXT,
+            updated_utc TIMESTAMP DEFAULT NOW()
+        );
+        """)
+        # 既存DBの後方互換（古いテーブルに列を追加）
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS name TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS market TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector33_code TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector33_name TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector17_code TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector17_name TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS scale_code TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS scale_name TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS updated_utc TIMESTAMP DEFAULT NOW();")
+        # 財務/イベント（簡易）キャッシュ
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS fundamentals_cache (
+            symbol TEXT PRIMARY KEY,
+            asof_date DATE,
+            payload_json TEXT,
+            updated_utc TIMESTAMP DEFAULT NOW()
+        );
+        """)
+        # --- universe_symbols columns migration (idempotent) ---
+        try:
+            cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS name TEXT;")
+            cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS market TEXT;")
+            cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector33_code TEXT;")
+            cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector33_name TEXT;")
+            cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS lot_size INTEGER DEFAULT 100;")
+        except Exception:
+            pass
+
+    conn.commit()
+    conn.close()
+
+
+_universe_col_cache: Dict[str, bool] = {}
+
+def _has_universe_col(col: str) -> bool:
+    if col in _universe_col_cache:
+        return _universe_col_cache[col]
+    try:
+        conn = _connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_name='universe_symbols' AND column_name=%s
+                        LIMIT 1;""",
+                    (col,),
+                )
+                ok = cur.fetchone() is not None
+        finally:
+            conn.close()
+    except Exception:
+        ok = False
+    _universe_col_cache[col] = ok
+    return ok
+
+
+
+def _set_meta(conn, k: str, v: str):
+    with conn.cursor() as cur:
+        cur.execute("""
+        INSERT INTO kv_meta(k,v) VALUES(%s,%s)
+        ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v;
+        """, (k, v))
+
+def _get_meta(conn, k: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT v FROM kv_meta WHERE k=%s;", (k,))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+def universe_count() -> int:
+    ensure_schema()
+    conn = _connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM universe_symbols;")
+        n = int(cur.fetchone()[0] or 0)
+    conn.close()
+    return n
+
+
+def universe_upsert(symbols: List[str], meta: Optional[Dict[str, Dict[str, Any]]] = None) -> int:
+    """Upsert universe symbols with optional metadata."""
+    ensure_schema()
+    meta = meta or {}
+
+    norm: List[str] = []
+    for s in symbols:
+        s = str(s).strip()
+        if not s:
+            continue
+        s2 = s.replace(" ", "").upper()
+        if re.fullmatch(r"\d{4}", s2):
+            s2 = s2 + ".T"
+        norm.append(s2)
+
+    seen = set()
+    uniq: List[str] = []
+    for s in norm:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
+
+    if not uniq:
+        return 0
+
+    conn = _connect()
+    with conn.cursor() as cur:
+        for sym in uniq:
+            # meta は '1301' / '1301.T' どちらのキーでも来うるので吸収する
+            base = sym[:-2] if sym.endswith(".T") else sym
+            m = meta.get(sym) or meta.get(base) or meta.get(base + ".T") or {}
+            cur.execute(
+                """INSERT INTO universe_symbols(symbol, name, market, sector33_code, sector33_name, lot_size, updated_utc)
+                   VALUES(%s,%s,%s,%s,%s,%s,NOW())
+                   ON CONFLICT(symbol) DO UPDATE SET
+                     name=COALESCE(EXCLUDED.name, universe_symbols.name),
+                     market=COALESCE(EXCLUDED.market, universe_symbols.market),
+                     sector33_code=COALESCE(EXCLUDED.sector33_code, universe_symbols.sector33_code),
+                     sector33_name=COALESCE(EXCLUDED.sector33_name, universe_symbols.sector33_name),
+                     lot_size=COALESCE(EXCLUDED.lot_size, universe_symbols.lot_size),
+                     updated_utc=NOW();""",
+                (sym, m.get("name"), m.get("market"), m.get("sector33_code"), m.get("sector33_name"), int(m.get("lot_size") or 100)),
+            )
+    conn.commit()
+    conn.close()
+    return len(uniq)
+
+def universe_upsert_rows(rows: List[Dict[str, Any]]) -> int:
+    """新: symbol + メタ（市場/33業種/銘柄名など）を upsert"""
+    ensure_schema()
+    # normalize + unique by symbol (preserve order)
+    seen = set()
+    norm_rows: List[Dict[str, Any]] = []
+    for r in rows:
+        sym = str(r.get("symbol","")).strip().replace(" ", "").upper()
+        if not sym:
+            continue
+        if re.fullmatch(r"\d{4}", sym):
+            sym = sym + ".T"
+        if sym in seen:
+            continue
+        seen.add(sym)
+        rr = dict(r)
+        rr["symbol"] = sym
+        norm_rows.append(rr)
+
+    if not norm_rows:
+        return 0
+
+    conn = _connect()
+    with conn.cursor() as cur:
+        for r in norm_rows:
+            cur.execute(
+                """
+                INSERT INTO universe_symbols(symbol, name, market, sector33_code, sector33_name, sector17_code, sector17_name, scale_code, scale_name, updated_utc)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW())
+                ON CONFLICT(symbol) DO UPDATE SET
+                    name=COALESCE(EXCLUDED.name, universe_symbols.name),
+                    market=COALESCE(EXCLUDED.market, universe_symbols.market),
+                    sector33_code=COALESCE(EXCLUDED.sector33_code, universe_symbols.sector33_code),
+                    sector33_name=COALESCE(EXCLUDED.sector33_name, universe_symbols.sector33_name),
+                    sector17_code=COALESCE(EXCLUDED.sector17_code, universe_symbols.sector17_code),
+                    sector17_name=COALESCE(EXCLUDED.sector17_name, universe_symbols.sector17_name),
+                    scale_code=COALESCE(EXCLUDED.scale_code, universe_symbols.scale_code),
+                    scale_name=COALESCE(EXCLUDED.scale_name, universe_symbols.scale_name),
+                    updated_utc=NOW();
+                """,
+                (
+                    r.get("symbol"),
+                    r.get("name"),
+                    r.get("market"),
+                    r.get("sector33_code"),
+                    r.get("sector33_name"),
+                    r.get("sector17_code"),
+                    r.get("sector17_name"),
+                    r.get("scale_code"),
+                    r.get("scale_name"),
+                ),
+            )
+    conn.commit()
+    conn.close()
+    return len(norm_rows)
+
+def universe_load_symbols(limit: Optional[int] = None) -> List[str]:
+    ensure_schema()
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            if limit is None:
+                cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol;")
+            else:
+                cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol LIMIT %s;", (int(limit),))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return [r[0] for r in rows if r and r[0]]
+
+    ensure_schema()
+    conn = _connect()
+    with conn.cursor() as cur:
+        if limit:
+            cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol LIMIT %s;", (int(limit),))
+        else:
+            cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol;")
+        rows = cur.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def universe_register_from_inputs(uploaded_csv_file, pasted_text: str):
+    symbols: List[str] = []
+    if uploaded_csv_file is not None:
+        try:
+            df = pd.read_csv(uploaded_csv_file)
+            cols = [c.lower() for c in df.columns]
+            pick = None
+            for c in ["ticker", "symbol", "code"]:
+                if c in cols:
+                    pick = df.columns[cols.index(c)]
+                    break
+            if pick is None:
+                return 0, "CSVに ticker / symbol / code 列が見つかりません。"
+            symbols += [str(x).strip() for x in df[pick].dropna().tolist()]
+        except Exception as e:
+            return 0, f"CSV読込に失敗: {e}"
+
+    if pasted_text and pasted_text.strip():
+        for line in pasted_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in re.split(r"[\s,]+", line) if p.strip()]
+            symbols += parts
+
+    if not symbols:
+        return 0, "入力が空です。CSVをアップロードするか、銘柄を貼り付けてください。"
+
+    try:
+        n = universe_upsert(symbols)
+        return n, "ok"
+    except Exception as e:
+        return 0, f"DB登録に失敗: {e}"
+
+
+def universe_load_meta() -> pd.DataFrame:
+    """universe_symbols からメタ（市場/33業種など）を読み込む。無ければ空DF。"""
+    ensure_schema()
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT symbol, name, market, sector33_code, sector33_name, sector17_code, sector17_name, scale_code, scale_name FROM universe_symbols;")
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return pd.DataFrame(columns=["symbol","name","market","sector33_code","sector33_name","sector17_code","sector17_name","scale_code","scale_name"])
+    return pd.DataFrame(rows, columns=["symbol","name","market","sector33_code","sector33_name","sector17_code","sector17_name","scale_code","scale_name"])
+
+def universe_autofetch_from_jpx() -> Tuple[int, str]:
+    """JPX公式サイトの『東証上場銘柄一覧（Excel）』を取得し、銘柄マスタ（universe_symbols）に登録する。
+
+    - 4桁コードは自動で .T を付与
+    - 可能なら 33業種/市場区分/規模 なども保存（Stage0のセクター判定に使用）
+    """
+    ensure_schema()
+
+    url_candidates = [
+        "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls",
+    ]
+
+    last_err = None
+    content = None
+    for url in url_candidates:
+        try:
+            import requests  # type: ignore
+            r = requests.get(url, timeout=45)
+            r.raise_for_status()
+            content = r.content
+            break
+        except Exception as e:
+            last_err = e
+
+    if content is None:
+        return 0, f"JPX一覧のダウンロードに失敗しました: {last_err}"
+
+    try:
+        import io
+        bio = io.BytesIO(content)
+        df = pd.read_excel(bio)
+    except Exception as e:
+        return 0, f"Excel読込に失敗しました（環境依存）: {e}"
+
+    # 列名の推定（JPXの data_j.xls 前提）
+    col_code = None
+    col_name = None
+    col_market = None
+    col_s33_code = None
+    col_s33_name = None
+    col_s17_code = None
+    col_s17_name = None
+    col_scale_code = None
+    col_scale_name = None
+
+    def _norm_col(x: Any) -> str:
+        return str(x).strip().replace("（", "(").replace("）", ")")
+
+    # まずは“完全一致”に近いものを拾う
+    for c in df.columns:
+        cs = _norm_col(c)
+        if cs in ["コード", "銘柄コード", "Code"]:
+            col_code = c
+        elif cs in ["銘柄名", "会社名", "名称", "銘柄名(日本語)"]:
+            col_name = c
+        elif cs in ["市場・商品区分", "市場区分", "市場", "市場・商品区分(日本語)"]:
+            col_market = c
+        elif cs in ["33業種コード", "33業種コード(東証)", "33業種コード（東証）"]:
+            col_s33_code = c
+        elif cs in ["33業種区分", "33業種名", "33業種区分(日本語)", "33業種区分（日本語）"]:
+            col_s33_name = c
+        elif cs in ["17業種コード", "17業種コード(東証)", "17業種コード（東証）"]:
+            col_s17_code = c
+        elif cs in ["17業種区分", "17業種名", "17業種区分(日本語)", "17業種区分（日本語）"]:
+            col_s17_name = c
+        elif cs in ["規模コード", "規模"]:
+            col_scale_code = c
+        elif cs in ["規模区分", "規模区分(日本語)", "規模区分（日本語）"]:
+            col_scale_name = c
+
+    # 次に“部分一致”で補完（JPXの列名が微妙に変わることがあるため）
+    def _find_by_contains(must: List[str], must_not: List[str] = []) -> Optional[Any]:
+        for c in df.columns:
+            cs = _norm_col(c)
+            ok = all(k in cs for k in must) and all(k not in cs for k in must_not)
+            if ok:
+                return c
+        return None
+
+    if col_s33_code is None:
+        col_s33_code = _find_by_contains(["33", "業種", "コード"])
+    if col_s33_name is None:
+        col_s33_name = _find_by_contains(["33", "業種"], must_not=["コード"])
+    if col_market is None:
+        col_market = _find_by_contains(["市場"])
+    if col_name is None:
+        col_name = _find_by_contains(["銘柄", "名"]) or _find_by_contains(["名称"])
+    if col_scale_code is None:
+        col_scale_code = _find_by_contains(["規模", "コード"])
+    if col_scale_name is None:
+        col_scale_name = _find_by_contains(["規模"], must_not=["コード"])
+# fallback: 4桁比率でコード列推定
+    if col_code is None:
+        for c in df.columns:
+            ser = df[c].dropna().astype(str).str.replace(r"\D", "", regex=True)
+            if len(ser) == 0:
+                continue
+            ratio = ser.str.fullmatch(r"\d{4}").mean()
+            if ratio > 0.6:
+                col_code = c
+                break
+
+    if col_code is None:
+        return 0, "銘柄コード列を特定できませんでした。手動CSVでの登録をお使いください。"
+
+    def _norm_code(x: Any) -> Optional[str]:
+        s = "" if x is None else str(x)
+        s = re.sub(r"\D", "", s)
+        if re.fullmatch(r"\d{4}", s):
+            return s + ".T"
+        return None
+
+    rows: List[Dict[str, Any]] = []
+    for _, r in df.iterrows():
+        sym = _norm_code(r.get(col_code))
+        if not sym:
+            continue
+        row = {"symbol": sym}
+        if col_name is not None:
+            v = r.get(col_name)
+            if pd.notna(v):
+                row["name"] = str(v).strip()
+        if col_market is not None:
+            v = r.get(col_market)
+            if pd.notna(v):
+                row["market"] = str(v).strip()
+        if col_s33_code is not None:
+            v = r.get(col_s33_code)
+            if pd.notna(v):
+                row["sector33_code"] = str(v).strip()
+        if col_s33_name is not None:
+            v = r.get(col_s33_name)
+            if pd.notna(v):
+                row["sector33_name"] = str(v).strip()
+        if col_s17_code is not None:
+            v = r.get(col_s17_code)
+            if pd.notna(v):
+                row["sector17_code"] = str(v).strip()
+        if col_s17_name is not None:
+            v = r.get(col_s17_name)
+            if pd.notna(v):
+                row["sector17_name"] = str(v).strip()
+        if col_scale_code is not None:
+            v = r.get(col_scale_code)
+            if pd.notna(v):
+                row["scale_code"] = str(v).strip()
+        if col_scale_name is not None:
+            v = r.get(col_scale_name)
+            if pd.notna(v):
+                row["scale_name"] = str(v).strip()
+        rows.append(row)
+
+    if not rows:
+        return 0, "銘柄コードが抽出できませんでした。"
+
+    n = universe_upsert_rows(rows)
+    update_sector33_from_jpx()
+    return n, "ok"
+
+
+
+
+
+def update_sector33_from_jpx() -> Tuple[int, str]:
+    """
+    Download JPX listed issues master (Excel) and update universe_symbols.sector33_*.
+    Returns (updated_rows, status_str).
+    """
+    ensure_schema()
+
+    # JPX official file (frequently updated). We keep robust fallbacks.
+    urls = [
+        "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls",
+        "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls?download=1",
+        "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html",
+    ]
+
+    # try direct excel first
+    df = None
+    last_err = ""
+    for u in urls[:2]:
+        try:
+            df = pd.read_excel(u)
+            if df is not None and len(df) > 1000:
+                break
+        except Exception as e:
+            last_err = str(e)
+            df = None
+
+    # if failed, try to scrape the page for xls link
+    if df is None:
+        try:
+            import pandas as _pd
+            import requests
+            import re as _re
+            html = requests.get(urls[2], timeout=20).text
+            m = _re.search(r'href="([^"]+data_j\.xls[^"]*)"', html)
+            if m:
+                link = m.group(1)
+                if link.startswith("/"):
+                    link = "https://www.jpx.co.jp" + link
+                df = _pd.read_excel(link)
+        except Exception as e:
+            last_err = str(e)
+            df = None
+
+    if df is None or df.empty:
+        return 0, f"jpx_master_download_failed: {last_err}"
+
+    # normalize columns（JPXの列名は微妙に変わることがあるので“部分一致”も使う）
+    def _norm_col(x: Any) -> str:
+        return str(x).strip().replace("（", "(").replace("）", ")")
+
+    cols = {_norm_col(c): c for c in df.columns}
+
+    # required: code
+    code_col = None
+    for k in ["コード", "銘柄コード", "Code"]:
+        if k in cols:
+            code_col = cols[k]
+            break
+    if code_col is None:
+        # fallback: 4桁比率で推定
+        for c in df.columns:
+            ser = df[c].dropna().astype(str).str.replace(r"\D", "", regex=True)
+            if len(ser) == 0:
+                continue
+            if (ser.str.fullmatch(r"\d{4}").mean() or 0.0) > 0.6:
+                code_col = c
+                break
+    if code_col is None:
+        code_col = df.columns[0]
+
+    def _find_by_contains(must: List[str], must_not: List[str] = []) -> Optional[Any]:
+        for c in df.columns:
+            cs = _norm_col(c)
+            ok = all(k in cs for k in must) and all(k not in cs for k in must_not)
+            if ok:
+                return c
+        return None
+
+    sec_code_col = None
+    sec_name_col = None
+    market_col = None
+    name_col = None
+
+    # exact-ish
+    for c in df.columns:
+        s = _norm_col(c)
+        if s in ["33業種コード", "33業種コード(東証)", "33業種コード（東証）"]:
+            sec_code_col = c
+        elif s in ["33業種区分", "33業種名", "33業種区分(日本語)", "33業種区分（日本語）"]:
+            sec_name_col = c
+        elif s in ["市場・商品区分", "市場区分", "市場"]:
+            market_col = c
+        elif s in ["銘柄名", "名称", "会社名"]:
+            name_col = c
+
+    # contains fallback
+    if sec_code_col is None:
+        sec_code_col = _find_by_contains(["33", "業種", "コード"])
+    if sec_name_col is None:
+        sec_name_col = _find_by_contains(["33", "業種"], must_not=["コード"])
+    if market_col is None:
+        market_col = _find_by_contains(["市場"])
+    if name_col is None:
+        name_col = _find_by_contains(["銘柄", "名"]) or _find_by_contains(["名称"])
+# if sector columns not found, we can't update
+    if sec_code_col is None and sec_name_col is None:
+        return 0, "jpx_master_has_no_sector33_columns"
+
+    tmp_cols = [code_col]
+    for c in [name_col, market_col, sec_code_col, sec_name_col]:
+        if c is not None and c not in tmp_cols:
+            tmp_cols.append(c)
+    tmp = df[tmp_cols].copy()
+    tmp[code_col] = tmp[code_col].astype(str).str.replace(r"\D", "", regex=True).str.zfill(4)
+    tmp = tmp[tmp[code_col].str.fullmatch(r"\d{4}")].copy()
+    tmp["symbol"] = tmp[code_col] + ".T"
+
+    # build update rows
+    rows = []
+    for _, r in tmp.iterrows():
+        sym = r["symbol"]
+        sec_code = str(r[sec_code_col]).strip() if sec_code_col is not None and pd.notna(r.get(sec_code_col)) else None
+        sec_name = str(r[sec_name_col]).strip() if sec_name_col is not None and pd.notna(r.get(sec_name_col)) else None
+        name = str(r[name_col]).strip() if name_col is not None and pd.notna(r.get(name_col)) else None
+        market = str(r[market_col]).strip() if market_col is not None and pd.notna(r.get(market_col)) else None
+        rows.append((sym, name, market, sec_code, sec_name))
+
+    conn = _connect()
+    updated = 0
+    try:
+        with conn.cursor() as cur:
+            # update in chunks; only overwrite when null/empty
+            chunk = 2000
+            for i in range(0, len(rows), chunk):
+                part = rows[i:i+chunk]
+                cur.executemany(
+                    """UPDATE universe_symbols
+                       SET
+                         name = COALESCE(universe_symbols.name, %s),
+                         market = COALESCE(universe_symbols.market, %s),
+                         sector33_code = CASE
+                           WHEN universe_symbols.sector33_code IS NULL OR universe_symbols.sector33_code='' THEN %s
+                           ELSE universe_symbols.sector33_code END,
+                         sector33_name = CASE
+                           WHEN universe_symbols.sector33_name IS NULL OR universe_symbols.sector33_name='' THEN %s
+                           ELSE universe_symbols.sector33_name END,
+                         updated_utc = NOW()
+                       WHERE symbol = %s;""",
+                    [(name, market, sec_code, sec_name, sym) for (sym, name, market, sec_code, sec_name) in part],
+                )
+                updated += cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+
+    return updated, "ok"
+
+def get_db_status() -> Dict[str, Any]:
+    try:
+        ensure_schema()
+        conn = _connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM universe_symbols;")
+            uni = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(DISTINCT symbol) FROM ohlc_daily;")
+            symbols_count = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(*) FROM ohlc_daily;")
+            rows_count = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT MAX(trade_date) FROM ohlc_daily;")
+            latest_trade_date = cur.fetchone()[0]
+            last_update_utc = _get_meta(conn, "last_update_utc")
+        conn.close()
+
+        hours_since = None
+        if last_update_utc:
+            try:
+                dt = datetime.fromisoformat(last_update_utc.replace("Z","+00:00"))
+                hours_since = (datetime.now(timezone.utc) - dt).total_seconds()/3600.0
+            except Exception:
+                hours_since = None
+
+        return {
+            "ok": True,
+            "universe_count": uni,
+            "symbols_count": symbols_count,
+            "rows_count": rows_count,
+            "latest_trade_date": str(latest_trade_date) if latest_trade_date else None,
+            "last_update_utc": last_update_utc,
+            "hours_since_update": hours_since,
+        }
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+# --- DB update ---
+def _fetch_from_yf(symbols: List[str], start: str) -> Dict[str, pd.DataFrame]:
+    data = yf.download(
+        tickers=" ".join(symbols),
+        start=start,
+        group_by="ticker",
+        threads=True,
+        auto_adjust=False,
+        progress=False,
+    )
+    out: Dict[str, pd.DataFrame] = {}
+    if isinstance(data.columns, pd.MultiIndex):
+        for sym in symbols:
+            if sym in data.columns.get_level_values(0):
+                df = data[sym].copy()
+                df.dropna(how="all", inplace=True)
+                out[sym] = df
+    else:
+        if len(symbols) == 1:
+            df = data.copy()
+            df.dropna(how="all", inplace=True)
+            out[symbols[0]] = df
+    return out
+
+def update_db_incremental(days_back: int = 14, keep_days: int = 400, chunk_size: int = 200) -> Dict[str, Any]:
+    ensure_schema()
+    universe = universe_load_symbols()
+    if not universe:
+        return {"upserted_rows": 0, "failed_symbols": 0, "message": "銘柄マスタが0件です。先に『銘柄マスタ登録』を行ってください。"}
+
+    start_dt = (datetime.now(timezone.utc) - timedelta(days=days_back + 5)).date()
+    start = str(start_dt)
+
+    upserted = 0
+    failed = 0
+    sample_fail: List[str] = []
+
+    conn = _connect()
+    try:
+        for i in range(0, len(universe), chunk_size):
+            chunk = universe[i:i+chunk_size]
+            try:
+                fetched = _fetch_from_yf(chunk, start=start)
+            except Exception:
+                fetched = {}
+            if not fetched:
+                failed += len(chunk)
+                if len(sample_fail) < 50:
+                    sample_fail.extend(chunk[: min(10, len(chunk))])
+                # Cloud対策：過剰リクエスト抑制
+                time.sleep(RATE_LIMIT_SLEEP_SEC)
+                continue
+
+            rows = []
+            for sym, df in fetched.items():
+                if df is None or df.empty:
+                    failed += 1
+                    if len(sample_fail) < 50:
+                        sample_fail.append(sym)
+                    continue
+                df = df.reset_index()
+                for _, r in df.iterrows():
+                    d = r.get("Date")
+                    if pd.isna(d):
+                        continue
+                    rows.append((
+                        sym,
+                        pd.to_datetime(d).date(),
+                        float(r["Open"]) if pd.notna(r.get("Open")) else None,
+                        float(r["High"]) if pd.notna(r.get("High")) else None,
+                        float(r["Low"]) if pd.notna(r.get("Low")) else None,
+                        float(r["Close"]) if pd.notna(r.get("Close")) else None,
+                        float(r.get("Adj Close")) if pd.notna(r.get("Adj Close")) else None,
+                        int(r.get("Volume")) if pd.notna(r.get("Volume")) else None,
+                    ))
+            if rows:
+                with conn.cursor() as cur:
+                    cur.executemany("""
+                    INSERT INTO ohlc_daily(symbol, trade_date, open, high, low, close, adj_close, volume)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT(symbol, trade_date) DO UPDATE SET
+                        open=EXCLUDED.open,
+                        high=EXCLUDED.high,
+                        low=EXCLUDED.low,
+                        close=EXCLUDED.close,
+                        adj_close=EXCLUDED.adj_close,
+                        volume=EXCLUDED.volume;
+                    """, rows)
+                upserted += len(rows)
+                conn.commit()
+
+            # Cloud対策：過剰リクエスト抑制
+            time.sleep(RATE_LIMIT_SLEEP_SEC)
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).date()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM ohlc_daily WHERE trade_date < %s;", (cutoff,))
+        _set_meta(conn, "last_update_utc", datetime.now(timezone.utc).isoformat().replace("+00:00","Z"))
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"upserted_rows": upserted, "failed_symbols": failed, "sample_failures": sample_fail[:20], "start": start, "keep_days": keep_days, "chunk_size": chunk_size}
+
+# --- Indicators & scan (unchanged core) ---
+def _atr14(df: pd.DataFrame) -> pd.Series:
+    h = df["High"].astype(float)
+    l = df["Low"].astype(float)
+    c = df["Close"].astype(float)
+    tr = pd.concat([(h-l), (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    return tr.rolling(14).mean()
+
+def evaluate_swing_fixed(df: pd.DataFrame, max_hold_days: int = 10, tp_atr: float = 1.5, sl_atr: float = 1.0, min_bars: int = 60, atr_pct: float | None = None) -> Dict[str, Any]:
+    d = df.copy()
+    d["ATR14"] = _atr14(d)
+    d = d.dropna()
+    # 履歴が短い場合でも「暫定評価」で落とさない（Cloudで最初は履歴が薄くなりがち）
+    if len(d) < int(min_bars):
+        tf = _trend_features(df)
+        ap = float(atr_pct) if atr_pct is not None and np.isfinite(atr_pct) else np.nan
+        # 暫定スコア：トレンド(20/60日)を加点、ボラ(ATR%)を軽く減点
+        score = 0.55*(tf.get("ret_60", np.nan) if np.isfinite(tf.get("ret_60", np.nan)) else 0.0) + 0.35*(tf.get("ret_20", np.nan) if np.isfinite(tf.get("ret_20", np.nan)) else 0.0)
+        if np.isfinite(ap):
+            score -= 0.02*(ap)
+        return {"ok": True, "trials": 0, "tp_hit_rate": float("nan"), "ev_r": float("nan"), "avg_tp_days": float(max_hold_days), "avg_dd_r": float("nan"), "swing_score": float(score), "note": "履歴不足のため暫定評価"}
+
+    wins = 0
+    losses = 0
+    hit_days = []
+    dd_r = []
+
+    H = int(max_hold_days)
+    for i in range(0, len(d)-H-1):
+        entry = float(d["Close"].iloc[i])
+        atr = float(d["ATR14"].iloc[i])
+        if not np.isfinite(atr) or atr <= 0:
+            continue
+        tp = entry + tp_atr*atr
+        sl = entry - sl_atr*atr
+        fut = d.iloc[i+1:i+1+H]
+        mae = (float(fut["Low"].min()) - entry) / atr
+        dd_r.append(mae)
+
+        outcome = None
+        for j in range(len(fut)):
+            if float(fut["High"].iloc[j]) >= tp:
+                outcome = ("win", j+1); break
+            if float(fut["Low"].iloc[j]) <= sl:
+                outcome = ("loss", None); break
+        if outcome is None:
+            outcome = ("loss", None)
+
+        if outcome[0] == "win":
+            wins += 1
+            hit_days.append(outcome[1])
+        else:
+            losses += 1
+
+    n = wins + losses
+    if n == 0:
+        return {"ok": False}
+    p_win = wins / n
+    ev_r = p_win*tp_atr - (1-p_win)*sl_atr
+    avg_tp_days = float(np.mean(hit_days)) if hit_days else float(H)
+    avg_dd_r = float(abs(np.mean(dd_r))) if dd_r else 0.0
+    score = 0.45*ev_r + 0.25*p_win + 0.15*(1.0/max(avg_tp_days,1.0)) - 0.15*avg_dd_r
+
+    return {"ok": True, "trials": int(n), "tp_hit_rate": float(p_win), "ev_r": float(ev_r), "avg_tp_days": float(avg_tp_days), "avg_dd_r": float(avg_dd_r), "swing_score": float(score)}
+
+def _trend_features(df: pd.DataFrame) -> Dict[str, float]:
+    c = df["Close"].astype(float)
+    ma20 = c.rolling(20).mean()
+    ma60 = c.rolling(60).mean()
+    ret_20 = (c.iloc[-1]/c.iloc[-21]-1.0) if len(c) > 21 else np.nan
+    ret_60 = (c.iloc[-1]/c.iloc[-61]-1.0) if len(c) > 61 else np.nan
+    slope20 = (ma20.iloc[-1]-ma20.iloc[-6])/(abs(ma20.iloc[-6])+1e-12) if len(ma20) > 6 else np.nan
+    return {"ret_20": float(ret_20) if np.isfinite(ret_20) else np.nan, "ret_60": float(ret_60) if np.isfinite(ret_60) else np.nan, "slope20": float(slope20) if np.isfinite(slope20) else np.nan}
+
+def _pick_strategy(features: Dict[str, float], atr_pct: float) -> str:
+    r20 = features.get("ret_20", np.nan)
+    s20 = features.get("slope20", np.nan)
+    if np.isfinite(r20) and r20 > 0.08 and np.isfinite(s20) and s20 > 0:
+        return "順張り（ブレイク/上昇トレンド）"
+    if np.isfinite(r20) and r20 < -0.06:
+        return "逆張り（リバウンド狙い）"
+    if np.isfinite(atr_pct) and atr_pct < 1.5:
+        return "レンジ（小動き）"
+    return "押し目買い（回復狙い）"
+
+def _read_latest_dates(conn) -> Tuple[Optional[str], Optional[str]]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT MAX(trade_date) FROM ohlc_daily;")
+        latest = cur.fetchone()[0]
+        if not latest:
+            return None, None
+        cur.execute("SELECT MAX(trade_date) FROM ohlc_daily WHERE trade_date < %s;", (latest,))
+        prev = cur.fetchone()[0]
+    return str(latest), str(prev) if prev else None
+
+def fetch_last_n_days(symbols: List[str], n_days: int = 80) -> pd.DataFrame:
+    if not symbols:
+        return pd.DataFrame()
+    ensure_schema()
+    conn = _connect()
+    try:
+        latest, _ = _read_latest_dates(conn)
+        if not latest:
+            return pd.DataFrame()
+        cutoff = (datetime.fromisoformat(latest).date() - timedelta(days=int(n_days*2))).isoformat()
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT symbol, trade_date, open, high, low, close, volume
+            FROM ohlc_daily
+            WHERE symbol = ANY(%s) AND trade_date >= %s
+            ORDER BY symbol, trade_date;
+            """, (symbols, cutoff))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows, columns=["Symbol","Date","Open","High","Low","Close","Volume"])
+    df["Date"] = pd.to_datetime(df["Date"])
     return df
 
+def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    """Stage0: DBにある最新2営業日のスナップショット+20日平均出来高だけで全件を軽量スクリーニング。
+    33業種（JPX公式一覧）をDBに持てている場合は、セクター強度ランキングも出す。
+    """
+    ensure_schema()
+    universe = universe_load_symbols()
+    t0 = time.time()
+    conn = _connect()
+    try:
+        latest, prev = _read_latest_dates(conn)
+        if not latest or not prev:
+            return pd.DataFrame(), pd.DataFrame(), {"ok": False, "reason": "db_has_no_latest_prev"}
 
-# ============================
-# Dummy Data Loader
-# ============================
-def load_universe():
-    np.random.seed(0)
-    n = 200
-    return pd.DataFrame({
-        "symbol":[f"JPX{i:04d}" for i in range(n)],
-        "sector":np.random.choice(["Tech","Finance","Auto","Retail"],n),
-        "momentum":np.random.randn(n),
-        "sharpe":np.random.randn(n),
-        "risk":np.abs(np.random.randn(n))
-    })
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH last2 AS (
+                    SELECT symbol, trade_date, close, volume
+                    FROM ohlc_daily
+                    WHERE trade_date IN (%s, %s)
+                ),
+                piv AS (
+                    SELECT symbol,
+                           MAX(CASE WHEN trade_date=%s THEN close END) AS close_latest,
+                           MAX(CASE WHEN trade_date=%s THEN close END) AS close_prev
+                    FROM last2
+                    GROUP BY symbol
+                )
+                SELECT symbol, close_latest, close_prev
+                FROM piv;
+                """,
+                (latest, prev, latest, prev),
+            )
+            snap = cur.fetchall()
+
+            cutoff20 = (datetime.fromisoformat(latest).date() - timedelta(days=40)).isoformat()
+            cur.execute(
+                """
+                SELECT symbol, AVG(volume)::float AS avg_vol20
+                FROM ohlc_daily
+                WHERE symbol = ANY(%s) AND trade_date >= %s
+                GROUP BY symbol;
+                """,
+                (universe, cutoff20),
+            )
+            vol20 = cur.fetchall()
+    finally:
+        conn.close()
+
+    snap_df = pd.DataFrame(snap, columns=["symbol", "close_latest", "close_prev"])
+    vol20_df = pd.DataFrame(vol20, columns=["symbol", "avg_vol20"])
+    df = snap_df.merge(vol20_df, on="symbol", how="left")
+    conn_u = _connect()
+    try:
+        with conn_u.cursor() as cur_u:
+            # lot_size列が無いDBでも落ちないように吸収
+            try:
+                if _has_universe_col("lot_size"):
+                    cur_u.execute(
+                        "SELECT symbol, name, sector33_name, sector33_code, COALESCE(lot_size,100) "
+                        "FROM universe_symbols WHERE symbol = ANY(%s);",
+                        (universe,),
+                    )
+                else:
+                    cur_u.execute(
+                        "SELECT symbol, name, sector33_name, sector33_code, 100 "
+                        "FROM universe_symbols WHERE symbol = ANY(%s);",
+                        (universe,),
+                    )
+            except Exception:
+                cur_u.execute(
+                    "SELECT symbol, name, sector33_name, sector33_code, 100 "
+                    "FROM universe_symbols WHERE symbol = ANY(%s);",
+                    (universe,),
+                )
+            urows = cur_u.fetchall()
+    finally:
+        conn_u.close()
+    if urows:
+        # urows の列数はDBスキーマ/SELECTにより変わる可能性があるため動的に吸収
+        first_len = len(urows[0])
+        if first_len == 5:
+            # Build universe meta DataFrame safely
+            if urows:
+                first_len = len(urows[0])
+                if first_len == 5:
+                    u_df = pd.DataFrame(urows, columns=['symbol','name','sector33_name','sector33_code','lot_size'])
+                elif first_len == 4:
+                    u_df = pd.DataFrame(urows, columns=['symbol','sector33_name','sector33_code','lot_size'])
+                    u_df['name'] = ''
+                else:
+                    u_df = pd.DataFrame(urows)
+            else:
+                u_df = pd.DataFrame(columns=['symbol','name','sector33_name','sector33_code','lot_size'])
+    u_df['symbol'] = u_df['symbol'].astype(str).map(_norm_symbol)
+    u_df['_key'] = u_df['symbol'].astype(str).map(_sym_key)
+    ukeys = set([_sym_key(x) for x in universe])
+    u_df = u_df[u_df['_key'].isin(ukeys)].copy()
+    u_df['_sym_norm'] = u_df['symbol'].astype(str).map(_norm_symbol)
+    df["_key"] = df["symbol"].astype(str).map(_sym_key)
+    df = df.merge(u_df.drop(columns=["symbol","_sym_norm"], errors="ignore"), left_on="_key", right_on="_key", how="left")
+    df["sector33_name"] = df.get("sector33_name").replace("", None).fillna("不明")
+    df["name"] = df.get("name").fillna("")
+    df["pct_change_1d"] = (df["close_latest"] / (df["close_prev"] + 1e-12) - 1.0) * 100.0
+
+    df = df[pd.notna(df["close_latest"])]
+    df = df[df["close_latest"] >= float(min_price)]
+    df = df[pd.notna(df["avg_vol20"])]
+    df = df[df["avg_vol20"] >= float(min_avg_volume)]
+
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame(), {"ok": True, "latest_trade_date": latest, "elapsed_sec": time.time() - t0, "stage0_candidates": 0}
+
+    # Stage0 基本スコア（OHLCを追加取得しない軽量スコア）
+    df["stage0_score"] = 0.7 * df["pct_change_1d"].fillna(0.0) + 0.3 * np.log10(df["avg_vol20"].fillna(1.0))
+
+    # 33業種メタ（あれば）
+    meta_df = universe_load_meta()
+    if not meta_df.empty and "sector33_name" in meta_df.columns:
+        df = df.merge(
+            meta_df[["symbol","sector33_name"]],
+            on="symbol",
+            how="left",
+            suffixes=("","_meta"),
+        )
+        if "sector33_name_meta" in df.columns:
+            df["sector33_name"] = df["sector33_name"].fillna(df["sector33_name_meta"])
+            df.drop(columns=["sector33_name_meta"], inplace=True)
+    if "sector33_name" not in df.columns:
+        df["sector33_name"] = "不明"
+    else:
+        df["sector33_name"] = df["sector33_name"].fillna("不明")
+
+    sec = (
+        df.groupby("sector33_name", dropna=False)["stage0_score"]
+        .median()
+        .sort_values(ascending=False)
+        .reset_index()
+    )
+    sec.columns = ["セクター（33業種）", "強度（中央値）"]
+    sec.insert(0, "順位", range(1, len(sec) + 1))
+
+    # セクター比率を維持しつつ上位抽出
+    keep = int(keep)
+    df2 = df.sort_values(["sector33_name", "stage0_score"], ascending=[True, False]).copy()
+    counts = df2["sector33_name"].value_counts()
+    total = int(counts.sum()) if len(counts) else 0
+    min_per = 3
+    alloc: Dict[str, int] = {}
+    if total > 0:
+        for sn, cnt in counts.items():
+            alloc[sn] = max(min_per, int(round(keep * (cnt / total))))
+
+        def _sum_alloc() -> int:
+            return int(sum(alloc.values()))
+
+        while _sum_alloc() > keep:
+            k_max = max(alloc, key=lambda k: alloc[k])
+            if alloc[k_max] > min_per:
+                alloc[k_max] -= 1
+            else:
+                break
+        while _sum_alloc() < keep:
+            k_max = max(alloc, key=lambda k: counts.get(k, 0))
+            alloc[k_max] += 1
+
+    picks = []
+    for sn, k in alloc.items():
+        picks.append(df2[df2["sector33_name"] == sn].head(int(k)))
+    picked = pd.concat(picks, ignore_index=True) if picks else df2.head(keep)
+
+    picked = picked.sort_values("stage0_score", ascending=False)
+    picked_syms = set(picked["symbol"].tolist())
+    if len(picked) < keep:
+        rest = df2[~df2["symbol"].isin(picked_syms)].sort_values("stage0_score", ascending=False)
+        picked = pd.concat([picked, rest.head(keep - len(picked))], ignore_index=True)
+
+    picked = picked.sort_values("stage0_score", ascending=False).head(keep).copy()
+
+    out = picked.rename(
+        columns={
+            "symbol": "銘柄",
+            "close_latest": "現在値（終値）",
+            "pct_change_1d": "前日比（%）",
+            "avg_vol20": "平均出来高20日",
+        }
+    )[["銘柄", "現在値（終値）", "前日比（%）", "平均出来高20日", "stage0_score", "name", "sector33_name"]]
+    out = out.rename(columns={"name":"銘柄名","sector33_name":"セクター"})
+    out["stage0_score"] = out["stage0_score"].astype(float).round(4)
+
+    meta = {"ok": True, "latest_trade_date": latest, "elapsed_sec": time.time() - t0, "stage0_candidates": int(len(out))}
+    return out, sec, meta
+
+def stage1_select(stage0_df: pd.DataFrame, keep: int, atr_pct_min: float, atr_pct_max: float) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    t0 = time.time()
+    # stage0 からセクター/銘柄名を引き継ぐ（無ければ空）
+    sec_map = {}
+    name_map = {}
+    try:
+        if "セクター" in stage0_df.columns:
+            sec_map = stage0_df.set_index("銘柄")["セクター"].to_dict()
+        elif "sector33_name" in stage0_df.columns:
+            sec_map = stage0_df.set_index("銘柄")["sector33_name"].fillna("不明").to_dict()
+        if "銘柄名" in stage0_df.columns:
+            name_map = stage0_df.set_index("銘柄")["銘柄名"].fillna("").to_dict()
+        elif "name" in stage0_df.columns:
+            name_map = stage0_df.set_index("銘柄")["name"].fillna("").to_dict()
+    except Exception:
+        pass
+
+    syms = stage0_df["銘柄"].astype(str).tolist()
+    hist = fetch_last_n_days(syms, n_days=80)
+    if hist.empty:
+        return pd.DataFrame(), {"ok": False}
+    rows = []
+    for sym, g in hist.groupby("Symbol"):
+        g = g.sort_values("Date")
+        if len(g) < 60:
+            continue
+        atr = _atr14(g)
+        atr_last = float(atr.iloc[-1]) if len(atr) else np.nan
+        close_last = float(g["Close"].iloc[-1])
+        atr_pct = (atr_last/(close_last+1e-12))*100.0 if np.isfinite(atr_last) else np.nan
+        if np.isfinite(atr_pct) and (atr_pct < float(atr_pct_min) or atr_pct > float(atr_pct_max)):
+            continue
+        feats = _trend_features(g)
+        score = 0.40*(feats.get("ret_20",0.0) if np.isfinite(feats.get("ret_20",np.nan)) else 0.0) + 0.20*(feats.get("ret_60",0.0) if np.isfinite(feats.get("ret_60",np.nan)) else 0.0) + 0.20*(feats.get("slope20",0.0) if np.isfinite(feats.get("slope20",np.nan)) else 0.0) + 0.20*(atr_pct/10.0 if np.isfinite(atr_pct) else 0.0)
+        rows.append({"銘柄": sym, "ATR%": atr_pct, "20日騰落": feats.get("ret_20",np.nan), "60日騰落": feats.get("ret_60",np.nan), "MA20傾き": feats.get("slope20",np.nan), "stage1_score": score, "現在値（終値）": close_last})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(), {"ok": False}
+    df = df.sort_values("stage1_score", ascending=False).head(int(keep)).copy()
+    df["ATR%"] = df["ATR%"].round(3)
+    df["20日騰落"] = (df["20日騰落"]*100.0).round(2)
+    df["60日騰落"] = (df["60日騰落"]*100.0).round(2)
+    df["MA20傾き"] = (df["MA20傾き"]*100.0).round(3)
+    df["stage1_score"] = df["stage1_score"].round(4)
+    df["現在値（終値）"] = df["現在値（終値）"].round(2)
+    return df, {"ok": True, "elapsed_sec": time.time()-t0, "stage1_candidates": int(len(df))}
+
+def _fundamentals_get_cached(symbol: str) -> Optional[Dict[str, Any]]:
+    """yfinanceの info/calendar を使った簡易財務/イベント。RateLimit時はNone。"""
+    ensure_schema()
+    symbol = str(symbol).strip().upper()
+    if not symbol:
+        return None
+
+    today = datetime.now(JST).date()
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT asof_date, payload_json FROM fundamentals_cache WHERE symbol=%s;", (symbol,))
+            row = cur.fetchone()
+        if row and row[0] == today and row[1]:
+            try:
+                return json.loads(row[1])
+            except Exception:
+                pass
+    finally:
+        conn.close()
+
+    # fetch
+    try:
+        import yfinance as yf  # type: ignore
+        tk = yf.Ticker(symbol)
+        info = {}
+        try:
+            info = tk.info or {}
+        except Exception:
+            info = {}
+        cal = {}
+        try:
+            cal = getattr(tk, "calendar", None)
+            if hasattr(cal, "to_dict"):
+                cal = cal.to_dict()
+            if isinstance(cal, pd.DataFrame):
+                cal = cal.to_dict()
+        except Exception:
+            cal = {}
+
+        payload = {
+            "symbol": symbol,
+            "asof": str(today),
+            "info": info,
+            "calendar": cal,
+        }
+    except Exception:
+        return None
+
+    # cache
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO fundamentals_cache(symbol, asof_date, payload_json, updated_utc)
+                VALUES(%s,%s,%s,NOW())
+                ON CONFLICT(symbol) DO UPDATE SET asof_date=EXCLUDED.asof_date, payload_json=EXCLUDED.payload_json, updated_utc=NOW();
+                """,
+                (symbol, today, json.dumps(payload, ensure_ascii=False, default=_json_safe)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return payload
+
+def _buffett_score(payload: Dict[str, Any]) -> Tuple[Optional[float], str]:
+    """超簡易の“バフェット風”評価（データが無ければNone）。"""
+    info = payload.get("info") or {}
+    try:
+        roe = info.get("returnOnEquity")
+        pm = info.get("profitMargins")
+        de = info.get("debtToEquity")
+        fcf = info.get("freeCashflow")
+        mc = info.get("marketCap")
+        score = 0.0
+        used = 0
+        if isinstance(roe, (int,float)) and roe == roe:
+            score += max(-1.0, min(1.0, float(roe))) * 1.5
+            used += 1
+        if isinstance(pm, (int,float)) and pm == pm:
+            score += max(-1.0, min(1.0, float(pm))) * 1.0
+            used += 1
+        if isinstance(de, (int,float)) and de == de:
+            # 低いほど良い
+            score += max(-1.0, min(1.0, (1.0 - float(de)/200.0))) * 1.0
+            used += 1
+        if isinstance(fcf, (int,float)) and isinstance(mc, (int,float)) and mc and mc == mc and fcf == fcf:
+            # FCF利回りっぽい
+            yld = float(fcf)/float(mc)
+            score += max(-1.0, min(1.0, yld*10.0)) * 1.0
+            used += 1
+        if used == 0:
+            return None, "財務データ不足"
+        return round(score, 3), f"指標使用={used}"
+    except Exception:
+        return None, "計算失敗"
+
+def _event_alert(payload: Dict[str, Any], days_earn: int = 10, days_exdiv: int = 7) -> str:
+    """決算/権利落ちなど、取得できる範囲での注意喚起。"""
+    info = payload.get("info") or {}
+    today = datetime.now(JST).date()
+    notes = []
+    # earningsDate
+    ed = info.get("earningsDate") or info.get("earningsTimestamp")
+    try:
+        if isinstance(ed, (list, tuple)) and ed:
+            ed = ed[0]
+        if isinstance(ed, (int,float)):
+            d = datetime.fromtimestamp(ed, tz=timezone.utc).astimezone(JST).date()
+            if 0 <= (d - today).days <= days_earn:
+                notes.append(f"決算接近({d})")
+        elif isinstance(ed, str):
+            d = pd.to_datetime(ed, errors="coerce")
+            if pd.notna(d):
+                d = d.tz_localize("UTC") if getattr(d, "tzinfo", None) is None else d
+                d = d.tz_convert(JST).date()
+                if 0 <= (d - today).days <= days_earn:
+                    notes.append(f"決算接近({d})")
+    except Exception:
+        pass
+    # exDividendDate
+    exd = info.get("exDividendDate")
+    try:
+        if isinstance(exd, (int,float)):
+            d = datetime.fromtimestamp(exd, tz=timezone.utc).astimezone(JST).date()
+            if 0 <= (d - today).days <= days_exdiv:
+                notes.append(f"権利落ち接近({d})")
+    except Exception:
+        pass
+    return " / ".join(notes) if notes else "-"
 
 
-# ============================
-# Main Scan Pipeline
-# ============================
-def run_scan_3stage(min_price=300, min_avg_volume=100000, keep=300):
+# =========================
+# COMPLETE AI HELPERS
+# =========================
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
 
-    df = load_universe()
+def detect_trend_ai_01(g: pd.DataFrame) -> float:
+    """AIトレンド検出: 0..1"""
+    try:
+        c = g["Close"].astype(float)
+        if len(c) < 70:
+            return 0.5
+        ema20 = _ema(c, 20)
+        ema60 = _ema(c, 60)
+        dir_up = 1.0 if float(ema20.iloc[-1]) >= float(ema60.iloc[-1]) else -1.0
+        r20 = (float(c.iloc[-1]) / float(c.iloc[-21]) - 1.0) if len(c) > 21 else 0.0
+        slope = (float(ema20.iloc[-1]) - float(ema20.iloc[-6])) / (abs(float(ema20.iloc[-6])) + 1e-12)
+        x = 0.0
+        x += 0.55 * (1.0 / (1.0 + np.exp(-10.0 * r20)) - 0.5) * 2.0
+        x += 0.25 * np.tanh(8.0 * slope)
+        x += 0.20 * (1.0 if dir_up > 0 else -1.0)
+        return float(max(0.0, min(1.0, (x + 1.0) / 2.0)))
+    except Exception:
+        return 0.5
 
-    regime = market_regime_ai()
+def walk_forward_oos(g: pd.DataFrame, hold_days: int = 10, tp_atr: float = 1.5, sl_atr: float = 1.0,
+                     train_days: int = 120, test_days: int = 40, step_days: int = 40):
+    """WalkForward OOS: (winrate, rr). 失敗時は (nan,nan)"""
+    try:
+        d = g.copy().dropna(subset=["Close","High","Low"])
+        d["ATR14"] = _atr14(d)
+        d = d.dropna()
+        if len(d) < (train_days + test_days + 40):
+            return float("nan"), float("nan")
+        wins = 0
+        losses = 0
+        start = 0
+        while start + train_days + test_days < len(d):
+            train = d.iloc[start:start+train_days]
+            test = d.iloc[start+train_days:start+train_days+test_days]
+            ema20 = _ema(train["Close"].astype(float), 20)
+            ema60 = _ema(train["Close"].astype(float), 60)
+            direction_long = bool(float(ema20.iloc[-1]) >= float(ema60.iloc[-1]))
+            H = int(hold_days)
+            for i in range(0, len(test)-H-1):
+                entry = float(test["Close"].iloc[i])
+                atr = float(test["ATR14"].iloc[i])
+                if not np.isfinite(atr) or atr <= 0:
+                    continue
+                fut = test.iloc[i+1:i+1+H]
+                if direction_long:
+                    tp = entry + tp_atr*atr
+                    sl = entry - sl_atr*atr
+                    hit = None
+                    for j in range(len(fut)):
+                        if float(fut["High"].iloc[j]) >= tp:
+                            hit = "win"; break
+                        if float(fut["Low"].iloc[j]) <= sl:
+                            hit = "loss"; break
+                else:
+                    tp = entry - tp_atr*atr
+                    sl = entry + sl_atr*atr
+                    hit = None
+                    for j in range(len(fut)):
+                        if float(fut["Low"].iloc[j]) <= tp:
+                            hit = "win"; break
+                        if float(fut["High"].iloc[j]) >= sl:
+                            hit = "loss"; break
+                if hit == "win":
+                    wins += 1
+                else:
+                    losses += 1
+            start += step_days
+        n = wins + losses
+        if n <= 0:
+            return float("nan"), float("nan")
+        return float(wins/n), float(tp_atr/max(sl_atr,1e-9))
+    except Exception:
+        return float("nan"), float("nan")
 
-    df = final_ai_score(df)
+def montecarlo_dd5(p_win: float, rr: float, trades: int = 60, paths: int = 400, seed: int = 7) -> float:
+    """MonteCarlo DD（R単位）5%点。負の値。"""
+    try:
+        if not np.isfinite(p_win) or not np.isfinite(rr) or trades < 10:
+            return float("nan")
+        p = float(max(0.01, min(0.99, p_win)))
+        b = float(max(0.2, rr))
+        rng = np.random.default_rng(seed)
+        dds = []
+        for _ in range(int(paths)):
+            wins = rng.random(int(trades)) < p
+            r = np.where(wins, b, -1.0).astype(float)
+            eq = np.cumsum(r)
+            peak = np.maximum.accumulate(eq)
+            dd = eq - peak
+            dds.append(float(np.min(dd)))
+        return float(np.quantile(np.array(dds, dtype=float), 0.05))
+    except Exception:
+        return float("nan")
 
-    df = df.sort_values("score", ascending=False).head(20)
+def kelly_fraction(p_win: float, rr: float) -> float:
+    """Kelly最適化（保守クリップ0..0.25）"""
+    try:
+        if not np.isfinite(p_win) or not np.isfinite(rr) or rr <= 0:
+            return 0.0
+        p = float(p_win); q = 1.0 - p; b = float(rr)
+        f = (b*p - q) / b
+        return float(max(0.0, min(0.25, f)))
+    except Exception:
+        return 0.0
 
-    returns = pd.DataFrame(np.random.randn(200,20)/100, columns=df["symbol"])
+def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_bars: int = 60, include_fundamentals: bool = True, fundamentals_top_n: int = 20) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    t0 = time.time()
+    syms = stage1_df["銘柄"].astype(str).tolist()
+    hist = fetch_last_n_days(syms, n_days=int(stage2_days))
+    if hist.empty:
+        return pd.DataFrame(), pd.DataFrame(), {"ok": False}
 
-    w = risk_parity_weights(returns)
+    rows, guides = [], []
+    errors, sample_fail = 0, []
+    diag = {"hist_symbols": int(len(syms)), "hist_days": int(stage2_days), "ok_eval": 0, "fallback_eval": 0, "skipped_no_atr": 0}
 
-    mc = monte_carlo_portfolio(returns, w)
+    for sym, g in hist.groupby("Symbol"):
+        try:
+            g = g.sort_values("Date")
+            atr_pct = float(stage1_df.loc[stage1_df["銘柄"]==sym, "ATR%"].iloc[0]) if len(stage1_df.loc[stage1_df["銘柄"]==sym]) else np.nan
+            res = evaluate_swing_fixed(g, min_bars=int(min_bars), atr_pct=atr_pct)
+            if not res.get("ok"):
+                continue
+            if res.get("trials", 0) == 0:
+                diag["fallback_eval"] += 1
+            else:
+                diag["ok_eval"] += 1
+            close_last = float(g["Close"].iloc[-1])
+            atr_series = _atr14(g)
+            atr_last = float(atr_series.dropna().iloc[-1]) if len(atr_series.dropna()) else float("nan")
+            tp = close_last + 1.5*atr_last
+            sl = close_last - 1.0*atr_last
+            atr_pct = float(stage1_df.loc[stage1_df["銘柄"]==sym, "ATR%"].iloc[0]) if len(stage1_df.loc[stage1_df["銘柄"]==sym]) else np.nan
+            strat = _pick_strategy(_trend_features(g), atr_pct)
 
-    return {
-        "ok":True,
-        "selected":df,
-        "portfolio_mc":mc,
-        "diag":{"market_regime":regime}
+            rows.append({"銘柄": sym, "推奨方式": strat, "現在値（終値）": round(close_last,2), "TP目安": round(tp,2), "SL目安": round(sl,2),
+                         "TP到達率": res["tp_hit_rate"], "期待値EV(R)": res["ev_r"], "平均利確日数": res["avg_tp_days"],
+                         "平均逆行(R)": res["avg_dd_r"], "検証回数": res.get("trials",0), "利確スコア": res.get("swing_score", float("nan")), "備考": res.get("note","")})
+            guides.append({"銘柄": sym, "推奨方式": strat, "Entry目安": round(close_last,2), "SL目安": round(sl,2), "TP目安": round(tp,2), "最大保有": "10営業日"})
+        except Exception:
+            errors += 1
+            if len(sample_fail) < 20:
+                sample_fail.append(sym)
+
+    df = pd.DataFrame(rows)
+    guide = pd.DataFrame(guides)
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame(), {"ok": False, "reason": "no_pass", "diag": diag, "errors": errors, "sample_failures": sample_fail}
+
+    df["TP到達率"] = df["TP到達率"].clip(0,1)
+    df["期待値EV(R)"] = df["期待値EV(R)"].clip(-5,5)
+    df["平均逆行(R)"] = df["平均逆行(R)"].clip(0,10)
+    df["平均利確日数"] = df["平均利確日数"].clip(1,10)
+
+    df["総合スコア"] = 0.55*df["利確スコア"] + 0.20*df["TP到達率"] + 0.15*df["期待値EV(R)"] - 0.10*df["平均逆行(R)"]
+    df = df.sort_values("総合スコア", ascending=False).head(int(keep)).copy()
+    # --- COMPLETE AI: WalkForward / MonteCarlo / Kelly (budgeted) ---
+    try:
+        # Streamlit Cloud対策：重い計算は上位N件だけ＆時間予算で打ち切り
+        top_n = int(os.environ.get("AI_EXTRA_TOP_N", "8"))
+        time_budget_s = float(os.environ.get("AI_EXTRA_BUDGET_S", "18"))
+        _t_ai0 = time.time()
+
+        n_all = int(len(df))
+        n_do = max(0, min(n_all, top_n))
+
+        wf_wr_list = [float("nan")] * n_all
+        wf_rr_list = [float("nan")] * n_all
+        mc_list    = [float("nan")] * n_all
+        k_list     = [float("nan")] * n_all
+
+        syms = df["銘柄"].astype(str).tolist()
+        for i_sym, sym2 in enumerate(syms[:n_do]):
+            if (time.time() - _t_ai0) > time_budget_s:
+                break
+            g2 = hist[hist["Symbol"] == sym2].sort_values("Date")
+            wr, rr = walk_forward_oos(
+                g2,
+                hold_days=10,
+                tp_atr=1.5,
+                sl_atr=1.0,
+                train_days=120,
+                test_days=40,
+                step_days=40,
+            )
+            wf_wr_list[i_sym] = wr
+            wf_rr_list[i_sym] = rr
+            mc_list[i_sym] = montecarlo_dd5(wr, rr, trades=60, paths=250, seed=7)  # paths軽量化
+            k_list[i_sym] = kelly_fraction(wr, rr)
+
+        df["WF勝率（OOS）"] = wf_wr_list
+        df["WF損益比RR（OOS）"] = wf_rr_list
+        df["MC DD 5%（推定）"] = mc_list
+        df["Kelly最適化（f）"] = k_list
+
+        # ボラ調整（ATR%があれば）
+        if "ATR%" in stage1_df.columns:
+            atr_map = stage1_df.set_index("銘柄")["ATR%"].to_dict()
+            atrs = df["銘柄"].map(lambda s: float(atr_map.get(s, float("nan"))))
+        else:
+            atrs = float("nan")
+        vol_adj = pd.to_numeric(atrs, errors="coerce")
+        vol_adj = (3.0 / vol_adj).where(np.isfinite(vol_adj) & (vol_adj > 0), 1.0).clip(0.35, 1.65)
+
+        # AI総合スコア（置換：欠損は中立値）
+        ret3m = pd.to_numeric(df.get("3ヶ月リターン", np.nan), errors="coerce").fillna(0.0)
+        trend = pd.to_numeric(df.get("AIトレンド", np.nan), errors="coerce").fillna(0.5)
+        wf = pd.to_numeric(df.get("WF勝率（OOS）", np.nan), errors="coerce").fillna(0.5)
+        rr = pd.to_numeric(df.get("WF損益比RR（OOS）", np.nan), errors="coerce").fillna(1.5)
+        dd5 = pd.to_numeric(df.get("MC DD 5%（推定）", np.nan), errors="coerce").fillna(-5.0)
+        dd_score = 1.0/(1.0+np.exp(-(dd5+3.0)))
+        kelly = pd.to_numeric(df.get("Kelly最適化（f）", np.nan), errors="coerce").fillna(0.0)
+
+        base = (
+            0.28 * np.tanh(4.0*ret3m) +
+            0.22 * (trend-0.5)*2.0 +
+            0.22 * (wf-0.5)*2.0 +
+            0.10 * np.tanh(rr-1.0) +
+            0.12 * (dd_score-0.5)*2.0 +
+            0.06 * (kelly/0.25)
+        )
+        df["総合スコア"] = (base * vol_adj).astype(float)
+        df = df.sort_values("総合スコア", ascending=False).copy()
+    except Exception:
+        pass
+
+        # --- 財務/イベント（簡易）を上位Nだけ付与（RateLimit時はスキップ） ---
+    if include_fundamentals and fundamentals_top_n and len(df):
+        topn = int(min(len(df), max(0, fundamentals_top_n)))
+        scores = []
+        alerts = []
+        memos = []
+        for i, sym in enumerate(df["銘柄"].tolist()):
+            if i >= topn:
+                scores.append(None); alerts.append("-"); memos.append("未取得（上位のみ）"); 
+                continue
+            payload = _fundamentals_get_cached(sym)
+            if payload is None:
+                scores.append(None); alerts.append("-"); memos.append("取得失敗（RateLimit等）")
+                continue
+            sc, memo = _buffett_score(payload)
+            scores.append(sc)
+            alerts.append(_event_alert(payload))
+            memos.append(memo)
+        df["バフェット簡易スコア"] = scores
+        df["イベント注意"] = alerts
+        df["財務メモ"] = memos
+    else:
+        df["バフェット簡易スコア"] = None
+        df["イベント注意"] = "-"
+        df["財務メモ"] = "OFF"
+
+    
+    for c in ["利確スコア","TP到達率","期待値EV(R)","平均利確日数","平均逆行(R)","総合スコア"]:
+        if c in df.columns:
+            df[c] = df[c].astype(float).round(4)
+    df["TP到達率"] = (df["TP到達率"]*100.0).round(2)
+
+    # 表示用: セクター/銘柄名（無い場合は空）
+    if "セクター" not in df.columns:
+        if "sector33_name" in df.columns:
+            df["セクター"] = df["sector33_name"].fillna("不明")
+        else:
+            df["セクター"] = "不明"
+    if "銘柄名" not in df.columns:
+        if "name" in df.columns:
+            df["銘柄名"] = df["name"].fillna("")
+        else:
+            df["銘柄名"] = ""
+
+    cols = ["銘柄","銘柄名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式","Kelly最適化（f）","AIトレンド","現在値（終値）","TP目安","SL目安","TP到達率","期待値EV(R)","平均利確日数","平均逆行(R)","検証回数","利確スコア","バフェット簡易スコア","イベント注意","財務メモ"]
+    # --- column safety: ensure optional AI columns exist (avoid KeyError) ---
+    for _c in ["3ヶ月リターン","AIトレンド","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","Kelly最適化（f）"]:
+        if _c not in df.columns:
+            df[_c] = np.nan
+
+    # keep column order; missing columns become NaN
+    df = df.reindex(columns=cols)
+
+
+    meta = {"ok": True, "elapsed_sec": time.time()-t0, "errors": errors, "sample_failures": sample_fail, "stage2_selected": int(len(df)), "diag": diag}
+    return df, guide, meta
+
+
+def run_scan_3stage(
+    stage0_keep: int = 1200,
+    stage1_keep: int = 300,
+    stage2_keep: int = 60,
+    min_price: float = 300.0,
+    min_avg_volume: float = 30000.0,
+    atr_pct_min: float = 1.0,
+    atr_pct_max: float = 8.0,
+    # Stage2 profit-eval config
+    stage2_days: int = 180,
+    stage2_min_bars: int = 60,
+    include_fundamentals: bool = True,
+    fundamentals_top_n: int = 20,
+    # Stage3 capital optimization
+    capital_total: float = 300000.0,
+    max_positions: int = 1,
+    capital_mode: str = "growth",
+    **_ignored: Any,
+) -> Dict[str, Any]:
+    """
+    4000銘柄網羅の3段階スキャン + 資金効率最適化(Stage3)。
+    main.py 側から未知の引数が渡っても落ちないよう **_ignored を受ける。
+    """
+    ensure_schema()
+    t0 = time.time()
+    diag: Dict[str, Any] = {
+        "ok": True,
+        "stage": "start",
+        "mode": "stable",
+        "errors": [],
+        "sample_failures": [],
     }
 
-# internal_quant_engine_line_0
-# internal_quant_engine_line_1
-# internal_quant_engine_line_2
-# internal_quant_engine_line_3
-# internal_quant_engine_line_4
-# internal_quant_engine_line_5
-# internal_quant_engine_line_6
-# internal_quant_engine_line_7
-# internal_quant_engine_line_8
-# internal_quant_engine_line_9
-# internal_quant_engine_line_10
-# internal_quant_engine_line_11
-# internal_quant_engine_line_12
-# internal_quant_engine_line_13
-# internal_quant_engine_line_14
-# internal_quant_engine_line_15
-# internal_quant_engine_line_16
-# internal_quant_engine_line_17
-# internal_quant_engine_line_18
-# internal_quant_engine_line_19
-# internal_quant_engine_line_20
-# internal_quant_engine_line_21
-# internal_quant_engine_line_22
-# internal_quant_engine_line_23
-# internal_quant_engine_line_24
-# internal_quant_engine_line_25
-# internal_quant_engine_line_26
-# internal_quant_engine_line_27
-# internal_quant_engine_line_28
-# internal_quant_engine_line_29
-# internal_quant_engine_line_30
-# internal_quant_engine_line_31
-# internal_quant_engine_line_32
-# internal_quant_engine_line_33
-# internal_quant_engine_line_34
-# internal_quant_engine_line_35
-# internal_quant_engine_line_36
-# internal_quant_engine_line_37
-# internal_quant_engine_line_38
-# internal_quant_engine_line_39
-# internal_quant_engine_line_40
-# internal_quant_engine_line_41
-# internal_quant_engine_line_42
-# internal_quant_engine_line_43
-# internal_quant_engine_line_44
-# internal_quant_engine_line_45
-# internal_quant_engine_line_46
-# internal_quant_engine_line_47
-# internal_quant_engine_line_48
-# internal_quant_engine_line_49
-# internal_quant_engine_line_50
-# internal_quant_engine_line_51
-# internal_quant_engine_line_52
-# internal_quant_engine_line_53
-# internal_quant_engine_line_54
-# internal_quant_engine_line_55
-# internal_quant_engine_line_56
-# internal_quant_engine_line_57
-# internal_quant_engine_line_58
-# internal_quant_engine_line_59
-# internal_quant_engine_line_60
-# internal_quant_engine_line_61
-# internal_quant_engine_line_62
-# internal_quant_engine_line_63
-# internal_quant_engine_line_64
-# internal_quant_engine_line_65
-# internal_quant_engine_line_66
-# internal_quant_engine_line_67
-# internal_quant_engine_line_68
-# internal_quant_engine_line_69
-# internal_quant_engine_line_70
-# internal_quant_engine_line_71
-# internal_quant_engine_line_72
-# internal_quant_engine_line_73
-# internal_quant_engine_line_74
-# internal_quant_engine_line_75
-# internal_quant_engine_line_76
-# internal_quant_engine_line_77
-# internal_quant_engine_line_78
-# internal_quant_engine_line_79
-# internal_quant_engine_line_80
-# internal_quant_engine_line_81
-# internal_quant_engine_line_82
-# internal_quant_engine_line_83
-# internal_quant_engine_line_84
-# internal_quant_engine_line_85
-# internal_quant_engine_line_86
-# internal_quant_engine_line_87
-# internal_quant_engine_line_88
-# internal_quant_engine_line_89
-# internal_quant_engine_line_90
-# internal_quant_engine_line_91
-# internal_quant_engine_line_92
-# internal_quant_engine_line_93
-# internal_quant_engine_line_94
-# internal_quant_engine_line_95
-# internal_quant_engine_line_96
-# internal_quant_engine_line_97
-# internal_quant_engine_line_98
-# internal_quant_engine_line_99
-# internal_quant_engine_line_100
-# internal_quant_engine_line_101
-# internal_quant_engine_line_102
-# internal_quant_engine_line_103
-# internal_quant_engine_line_104
-# internal_quant_engine_line_105
-# internal_quant_engine_line_106
-# internal_quant_engine_line_107
-# internal_quant_engine_line_108
-# internal_quant_engine_line_109
-# internal_quant_engine_line_110
-# internal_quant_engine_line_111
-# internal_quant_engine_line_112
-# internal_quant_engine_line_113
-# internal_quant_engine_line_114
-# internal_quant_engine_line_115
-# internal_quant_engine_line_116
-# internal_quant_engine_line_117
-# internal_quant_engine_line_118
-# internal_quant_engine_line_119
-# internal_quant_engine_line_120
-# internal_quant_engine_line_121
-# internal_quant_engine_line_122
-# internal_quant_engine_line_123
-# internal_quant_engine_line_124
-# internal_quant_engine_line_125
-# internal_quant_engine_line_126
-# internal_quant_engine_line_127
-# internal_quant_engine_line_128
-# internal_quant_engine_line_129
-# internal_quant_engine_line_130
-# internal_quant_engine_line_131
-# internal_quant_engine_line_132
-# internal_quant_engine_line_133
-# internal_quant_engine_line_134
-# internal_quant_engine_line_135
-# internal_quant_engine_line_136
-# internal_quant_engine_line_137
-# internal_quant_engine_line_138
-# internal_quant_engine_line_139
-# internal_quant_engine_line_140
-# internal_quant_engine_line_141
-# internal_quant_engine_line_142
-# internal_quant_engine_line_143
-# internal_quant_engine_line_144
-# internal_quant_engine_line_145
-# internal_quant_engine_line_146
-# internal_quant_engine_line_147
-# internal_quant_engine_line_148
-# internal_quant_engine_line_149
-# internal_quant_engine_line_150
-# internal_quant_engine_line_151
-# internal_quant_engine_line_152
-# internal_quant_engine_line_153
-# internal_quant_engine_line_154
-# internal_quant_engine_line_155
-# internal_quant_engine_line_156
-# internal_quant_engine_line_157
-# internal_quant_engine_line_158
-# internal_quant_engine_line_159
-# internal_quant_engine_line_160
-# internal_quant_engine_line_161
-# internal_quant_engine_line_162
-# internal_quant_engine_line_163
-# internal_quant_engine_line_164
-# internal_quant_engine_line_165
-# internal_quant_engine_line_166
-# internal_quant_engine_line_167
-# internal_quant_engine_line_168
-# internal_quant_engine_line_169
-# internal_quant_engine_line_170
-# internal_quant_engine_line_171
-# internal_quant_engine_line_172
-# internal_quant_engine_line_173
-# internal_quant_engine_line_174
-# internal_quant_engine_line_175
-# internal_quant_engine_line_176
-# internal_quant_engine_line_177
-# internal_quant_engine_line_178
-# internal_quant_engine_line_179
-# internal_quant_engine_line_180
-# internal_quant_engine_line_181
-# internal_quant_engine_line_182
-# internal_quant_engine_line_183
-# internal_quant_engine_line_184
-# internal_quant_engine_line_185
-# internal_quant_engine_line_186
-# internal_quant_engine_line_187
-# internal_quant_engine_line_188
-# internal_quant_engine_line_189
-# internal_quant_engine_line_190
-# internal_quant_engine_line_191
-# internal_quant_engine_line_192
-# internal_quant_engine_line_193
-# internal_quant_engine_line_194
-# internal_quant_engine_line_195
-# internal_quant_engine_line_196
-# internal_quant_engine_line_197
-# internal_quant_engine_line_198
-# internal_quant_engine_line_199
-# internal_quant_engine_line_200
-# internal_quant_engine_line_201
-# internal_quant_engine_line_202
-# internal_quant_engine_line_203
-# internal_quant_engine_line_204
-# internal_quant_engine_line_205
-# internal_quant_engine_line_206
-# internal_quant_engine_line_207
-# internal_quant_engine_line_208
-# internal_quant_engine_line_209
-# internal_quant_engine_line_210
-# internal_quant_engine_line_211
-# internal_quant_engine_line_212
-# internal_quant_engine_line_213
-# internal_quant_engine_line_214
-# internal_quant_engine_line_215
-# internal_quant_engine_line_216
-# internal_quant_engine_line_217
-# internal_quant_engine_line_218
-# internal_quant_engine_line_219
-# internal_quant_engine_line_220
-# internal_quant_engine_line_221
-# internal_quant_engine_line_222
-# internal_quant_engine_line_223
-# internal_quant_engine_line_224
-# internal_quant_engine_line_225
-# internal_quant_engine_line_226
-# internal_quant_engine_line_227
-# internal_quant_engine_line_228
-# internal_quant_engine_line_229
-# internal_quant_engine_line_230
-# internal_quant_engine_line_231
-# internal_quant_engine_line_232
-# internal_quant_engine_line_233
-# internal_quant_engine_line_234
-# internal_quant_engine_line_235
-# internal_quant_engine_line_236
-# internal_quant_engine_line_237
-# internal_quant_engine_line_238
-# internal_quant_engine_line_239
-# internal_quant_engine_line_240
-# internal_quant_engine_line_241
-# internal_quant_engine_line_242
-# internal_quant_engine_line_243
-# internal_quant_engine_line_244
-# internal_quant_engine_line_245
-# internal_quant_engine_line_246
-# internal_quant_engine_line_247
-# internal_quant_engine_line_248
-# internal_quant_engine_line_249
-# internal_quant_engine_line_250
-# internal_quant_engine_line_251
-# internal_quant_engine_line_252
-# internal_quant_engine_line_253
-# internal_quant_engine_line_254
-# internal_quant_engine_line_255
-# internal_quant_engine_line_256
-# internal_quant_engine_line_257
-# internal_quant_engine_line_258
-# internal_quant_engine_line_259
-# internal_quant_engine_line_260
-# internal_quant_engine_line_261
-# internal_quant_engine_line_262
-# internal_quant_engine_line_263
-# internal_quant_engine_line_264
-# internal_quant_engine_line_265
-# internal_quant_engine_line_266
-# internal_quant_engine_line_267
-# internal_quant_engine_line_268
-# internal_quant_engine_line_269
-# internal_quant_engine_line_270
-# internal_quant_engine_line_271
-# internal_quant_engine_line_272
-# internal_quant_engine_line_273
-# internal_quant_engine_line_274
-# internal_quant_engine_line_275
-# internal_quant_engine_line_276
-# internal_quant_engine_line_277
-# internal_quant_engine_line_278
-# internal_quant_engine_line_279
-# internal_quant_engine_line_280
-# internal_quant_engine_line_281
-# internal_quant_engine_line_282
-# internal_quant_engine_line_283
-# internal_quant_engine_line_284
-# internal_quant_engine_line_285
-# internal_quant_engine_line_286
-# internal_quant_engine_line_287
-# internal_quant_engine_line_288
-# internal_quant_engine_line_289
-# internal_quant_engine_line_290
-# internal_quant_engine_line_291
-# internal_quant_engine_line_292
-# internal_quant_engine_line_293
-# internal_quant_engine_line_294
-# internal_quant_engine_line_295
-# internal_quant_engine_line_296
-# internal_quant_engine_line_297
-# internal_quant_engine_line_298
-# internal_quant_engine_line_299
-# internal_quant_engine_line_300
-# internal_quant_engine_line_301
-# internal_quant_engine_line_302
-# internal_quant_engine_line_303
-# internal_quant_engine_line_304
-# internal_quant_engine_line_305
-# internal_quant_engine_line_306
-# internal_quant_engine_line_307
-# internal_quant_engine_line_308
-# internal_quant_engine_line_309
-# internal_quant_engine_line_310
-# internal_quant_engine_line_311
-# internal_quant_engine_line_312
-# internal_quant_engine_line_313
-# internal_quant_engine_line_314
-# internal_quant_engine_line_315
-# internal_quant_engine_line_316
-# internal_quant_engine_line_317
-# internal_quant_engine_line_318
-# internal_quant_engine_line_319
-# internal_quant_engine_line_320
-# internal_quant_engine_line_321
-# internal_quant_engine_line_322
-# internal_quant_engine_line_323
-# internal_quant_engine_line_324
-# internal_quant_engine_line_325
-# internal_quant_engine_line_326
-# internal_quant_engine_line_327
-# internal_quant_engine_line_328
-# internal_quant_engine_line_329
-# internal_quant_engine_line_330
-# internal_quant_engine_line_331
-# internal_quant_engine_line_332
-# internal_quant_engine_line_333
-# internal_quant_engine_line_334
-# internal_quant_engine_line_335
-# internal_quant_engine_line_336
-# internal_quant_engine_line_337
-# internal_quant_engine_line_338
-# internal_quant_engine_line_339
-# internal_quant_engine_line_340
-# internal_quant_engine_line_341
-# internal_quant_engine_line_342
-# internal_quant_engine_line_343
-# internal_quant_engine_line_344
-# internal_quant_engine_line_345
-# internal_quant_engine_line_346
-# internal_quant_engine_line_347
-# internal_quant_engine_line_348
-# internal_quant_engine_line_349
-# internal_quant_engine_line_350
-# internal_quant_engine_line_351
-# internal_quant_engine_line_352
-# internal_quant_engine_line_353
-# internal_quant_engine_line_354
-# internal_quant_engine_line_355
-# internal_quant_engine_line_356
-# internal_quant_engine_line_357
-# internal_quant_engine_line_358
-# internal_quant_engine_line_359
-# internal_quant_engine_line_360
-# internal_quant_engine_line_361
-# internal_quant_engine_line_362
-# internal_quant_engine_line_363
-# internal_quant_engine_line_364
-# internal_quant_engine_line_365
-# internal_quant_engine_line_366
-# internal_quant_engine_line_367
-# internal_quant_engine_line_368
-# internal_quant_engine_line_369
-# internal_quant_engine_line_370
-# internal_quant_engine_line_371
-# internal_quant_engine_line_372
-# internal_quant_engine_line_373
-# internal_quant_engine_line_374
-# internal_quant_engine_line_375
-# internal_quant_engine_line_376
-# internal_quant_engine_line_377
-# internal_quant_engine_line_378
-# internal_quant_engine_line_379
-# internal_quant_engine_line_380
-# internal_quant_engine_line_381
-# internal_quant_engine_line_382
-# internal_quant_engine_line_383
-# internal_quant_engine_line_384
-# internal_quant_engine_line_385
-# internal_quant_engine_line_386
-# internal_quant_engine_line_387
-# internal_quant_engine_line_388
-# internal_quant_engine_line_389
-# internal_quant_engine_line_390
-# internal_quant_engine_line_391
-# internal_quant_engine_line_392
-# internal_quant_engine_line_393
-# internal_quant_engine_line_394
-# internal_quant_engine_line_395
-# internal_quant_engine_line_396
-# internal_quant_engine_line_397
-# internal_quant_engine_line_398
-# internal_quant_engine_line_399
-# internal_quant_engine_line_400
-# internal_quant_engine_line_401
-# internal_quant_engine_line_402
-# internal_quant_engine_line_403
-# internal_quant_engine_line_404
-# internal_quant_engine_line_405
-# internal_quant_engine_line_406
-# internal_quant_engine_line_407
-# internal_quant_engine_line_408
-# internal_quant_engine_line_409
-# internal_quant_engine_line_410
-# internal_quant_engine_line_411
-# internal_quant_engine_line_412
-# internal_quant_engine_line_413
-# internal_quant_engine_line_414
-# internal_quant_engine_line_415
-# internal_quant_engine_line_416
-# internal_quant_engine_line_417
-# internal_quant_engine_line_418
-# internal_quant_engine_line_419
-# internal_quant_engine_line_420
-# internal_quant_engine_line_421
-# internal_quant_engine_line_422
-# internal_quant_engine_line_423
-# internal_quant_engine_line_424
-# internal_quant_engine_line_425
-# internal_quant_engine_line_426
-# internal_quant_engine_line_427
-# internal_quant_engine_line_428
-# internal_quant_engine_line_429
-# internal_quant_engine_line_430
-# internal_quant_engine_line_431
-# internal_quant_engine_line_432
-# internal_quant_engine_line_433
-# internal_quant_engine_line_434
-# internal_quant_engine_line_435
-# internal_quant_engine_line_436
-# internal_quant_engine_line_437
-# internal_quant_engine_line_438
-# internal_quant_engine_line_439
-# internal_quant_engine_line_440
-# internal_quant_engine_line_441
-# internal_quant_engine_line_442
-# internal_quant_engine_line_443
-# internal_quant_engine_line_444
-# internal_quant_engine_line_445
-# internal_quant_engine_line_446
-# internal_quant_engine_line_447
-# internal_quant_engine_line_448
-# internal_quant_engine_line_449
-# internal_quant_engine_line_450
-# internal_quant_engine_line_451
-# internal_quant_engine_line_452
-# internal_quant_engine_line_453
-# internal_quant_engine_line_454
-# internal_quant_engine_line_455
-# internal_quant_engine_line_456
-# internal_quant_engine_line_457
-# internal_quant_engine_line_458
-# internal_quant_engine_line_459
-# internal_quant_engine_line_460
-# internal_quant_engine_line_461
-# internal_quant_engine_line_462
-# internal_quant_engine_line_463
-# internal_quant_engine_line_464
-# internal_quant_engine_line_465
-# internal_quant_engine_line_466
-# internal_quant_engine_line_467
-# internal_quant_engine_line_468
-# internal_quant_engine_line_469
-# internal_quant_engine_line_470
-# internal_quant_engine_line_471
-# internal_quant_engine_line_472
-# internal_quant_engine_line_473
-# internal_quant_engine_line_474
-# internal_quant_engine_line_475
-# internal_quant_engine_line_476
-# internal_quant_engine_line_477
-# internal_quant_engine_line_478
-# internal_quant_engine_line_479
-# internal_quant_engine_line_480
-# internal_quant_engine_line_481
-# internal_quant_engine_line_482
-# internal_quant_engine_line_483
-# internal_quant_engine_line_484
-# internal_quant_engine_line_485
-# internal_quant_engine_line_486
-# internal_quant_engine_line_487
-# internal_quant_engine_line_488
-# internal_quant_engine_line_489
-# internal_quant_engine_line_490
-# internal_quant_engine_line_491
-# internal_quant_engine_line_492
-# internal_quant_engine_line_493
-# internal_quant_engine_line_494
-# internal_quant_engine_line_495
-# internal_quant_engine_line_496
-# internal_quant_engine_line_497
-# internal_quant_engine_line_498
-# internal_quant_engine_line_499
-# internal_quant_engine_line_500
-# internal_quant_engine_line_501
-# internal_quant_engine_line_502
-# internal_quant_engine_line_503
-# internal_quant_engine_line_504
-# internal_quant_engine_line_505
-# internal_quant_engine_line_506
-# internal_quant_engine_line_507
-# internal_quant_engine_line_508
-# internal_quant_engine_line_509
-# internal_quant_engine_line_510
-# internal_quant_engine_line_511
-# internal_quant_engine_line_512
-# internal_quant_engine_line_513
-# internal_quant_engine_line_514
-# internal_quant_engine_line_515
-# internal_quant_engine_line_516
-# internal_quant_engine_line_517
-# internal_quant_engine_line_518
-# internal_quant_engine_line_519
-# internal_quant_engine_line_520
-# internal_quant_engine_line_521
-# internal_quant_engine_line_522
-# internal_quant_engine_line_523
-# internal_quant_engine_line_524
-# internal_quant_engine_line_525
-# internal_quant_engine_line_526
-# internal_quant_engine_line_527
-# internal_quant_engine_line_528
-# internal_quant_engine_line_529
-# internal_quant_engine_line_530
-# internal_quant_engine_line_531
-# internal_quant_engine_line_532
-# internal_quant_engine_line_533
-# internal_quant_engine_line_534
-# internal_quant_engine_line_535
-# internal_quant_engine_line_536
-# internal_quant_engine_line_537
-# internal_quant_engine_line_538
-# internal_quant_engine_line_539
-# internal_quant_engine_line_540
-# internal_quant_engine_line_541
-# internal_quant_engine_line_542
-# internal_quant_engine_line_543
-# internal_quant_engine_line_544
-# internal_quant_engine_line_545
-# internal_quant_engine_line_546
-# internal_quant_engine_line_547
-# internal_quant_engine_line_548
-# internal_quant_engine_line_549
-# internal_quant_engine_line_550
-# internal_quant_engine_line_551
-# internal_quant_engine_line_552
-# internal_quant_engine_line_553
-# internal_quant_engine_line_554
-# internal_quant_engine_line_555
-# internal_quant_engine_line_556
-# internal_quant_engine_line_557
-# internal_quant_engine_line_558
-# internal_quant_engine_line_559
-# internal_quant_engine_line_560
-# internal_quant_engine_line_561
-# internal_quant_engine_line_562
-# internal_quant_engine_line_563
-# internal_quant_engine_line_564
-# internal_quant_engine_line_565
-# internal_quant_engine_line_566
-# internal_quant_engine_line_567
-# internal_quant_engine_line_568
-# internal_quant_engine_line_569
-# internal_quant_engine_line_570
-# internal_quant_engine_line_571
-# internal_quant_engine_line_572
-# internal_quant_engine_line_573
-# internal_quant_engine_line_574
-# internal_quant_engine_line_575
-# internal_quant_engine_line_576
-# internal_quant_engine_line_577
-# internal_quant_engine_line_578
-# internal_quant_engine_line_579
-# internal_quant_engine_line_580
-# internal_quant_engine_line_581
-# internal_quant_engine_line_582
-# internal_quant_engine_line_583
-# internal_quant_engine_line_584
-# internal_quant_engine_line_585
-# internal_quant_engine_line_586
-# internal_quant_engine_line_587
-# internal_quant_engine_line_588
-# internal_quant_engine_line_589
-# internal_quant_engine_line_590
-# internal_quant_engine_line_591
-# internal_quant_engine_line_592
-# internal_quant_engine_line_593
-# internal_quant_engine_line_594
-# internal_quant_engine_line_595
-# internal_quant_engine_line_596
-# internal_quant_engine_line_597
-# internal_quant_engine_line_598
-# internal_quant_engine_line_599
-# internal_quant_engine_line_600
-# internal_quant_engine_line_601
-# internal_quant_engine_line_602
-# internal_quant_engine_line_603
-# internal_quant_engine_line_604
-# internal_quant_engine_line_605
-# internal_quant_engine_line_606
-# internal_quant_engine_line_607
-# internal_quant_engine_line_608
-# internal_quant_engine_line_609
-# internal_quant_engine_line_610
-# internal_quant_engine_line_611
-# internal_quant_engine_line_612
-# internal_quant_engine_line_613
-# internal_quant_engine_line_614
-# internal_quant_engine_line_615
-# internal_quant_engine_line_616
-# internal_quant_engine_line_617
-# internal_quant_engine_line_618
-# internal_quant_engine_line_619
-# internal_quant_engine_line_620
-# internal_quant_engine_line_621
-# internal_quant_engine_line_622
-# internal_quant_engine_line_623
-# internal_quant_engine_line_624
-# internal_quant_engine_line_625
-# internal_quant_engine_line_626
-# internal_quant_engine_line_627
-# internal_quant_engine_line_628
-# internal_quant_engine_line_629
-# internal_quant_engine_line_630
-# internal_quant_engine_line_631
-# internal_quant_engine_line_632
-# internal_quant_engine_line_633
-# internal_quant_engine_line_634
-# internal_quant_engine_line_635
-# internal_quant_engine_line_636
-# internal_quant_engine_line_637
-# internal_quant_engine_line_638
-# internal_quant_engine_line_639
-# internal_quant_engine_line_640
-# internal_quant_engine_line_641
-# internal_quant_engine_line_642
-# internal_quant_engine_line_643
-# internal_quant_engine_line_644
-# internal_quant_engine_line_645
-# internal_quant_engine_line_646
-# internal_quant_engine_line_647
-# internal_quant_engine_line_648
-# internal_quant_engine_line_649
-# internal_quant_engine_line_650
-# internal_quant_engine_line_651
-# internal_quant_engine_line_652
-# internal_quant_engine_line_653
-# internal_quant_engine_line_654
-# internal_quant_engine_line_655
-# internal_quant_engine_line_656
-# internal_quant_engine_line_657
-# internal_quant_engine_line_658
-# internal_quant_engine_line_659
-# internal_quant_engine_line_660
-# internal_quant_engine_line_661
-# internal_quant_engine_line_662
-# internal_quant_engine_line_663
-# internal_quant_engine_line_664
-# internal_quant_engine_line_665
-# internal_quant_engine_line_666
-# internal_quant_engine_line_667
-# internal_quant_engine_line_668
-# internal_quant_engine_line_669
-# internal_quant_engine_line_670
-# internal_quant_engine_line_671
-# internal_quant_engine_line_672
-# internal_quant_engine_line_673
-# internal_quant_engine_line_674
-# internal_quant_engine_line_675
-# internal_quant_engine_line_676
-# internal_quant_engine_line_677
-# internal_quant_engine_line_678
-# internal_quant_engine_line_679
-# internal_quant_engine_line_680
-# internal_quant_engine_line_681
-# internal_quant_engine_line_682
-# internal_quant_engine_line_683
-# internal_quant_engine_line_684
-# internal_quant_engine_line_685
-# internal_quant_engine_line_686
-# internal_quant_engine_line_687
-# internal_quant_engine_line_688
-# internal_quant_engine_line_689
-# internal_quant_engine_line_690
-# internal_quant_engine_line_691
-# internal_quant_engine_line_692
-# internal_quant_engine_line_693
-# internal_quant_engine_line_694
-# internal_quant_engine_line_695
-# internal_quant_engine_line_696
-# internal_quant_engine_line_697
-# internal_quant_engine_line_698
-# internal_quant_engine_line_699
-# internal_quant_engine_line_700
-# internal_quant_engine_line_701
-# internal_quant_engine_line_702
-# internal_quant_engine_line_703
-# internal_quant_engine_line_704
-# internal_quant_engine_line_705
-# internal_quant_engine_line_706
-# internal_quant_engine_line_707
-# internal_quant_engine_line_708
-# internal_quant_engine_line_709
-# internal_quant_engine_line_710
-# internal_quant_engine_line_711
-# internal_quant_engine_line_712
-# internal_quant_engine_line_713
-# internal_quant_engine_line_714
-# internal_quant_engine_line_715
-# internal_quant_engine_line_716
-# internal_quant_engine_line_717
-# internal_quant_engine_line_718
-# internal_quant_engine_line_719
-# internal_quant_engine_line_720
-# internal_quant_engine_line_721
-# internal_quant_engine_line_722
-# internal_quant_engine_line_723
-# internal_quant_engine_line_724
-# internal_quant_engine_line_725
-# internal_quant_engine_line_726
-# internal_quant_engine_line_727
-# internal_quant_engine_line_728
-# internal_quant_engine_line_729
-# internal_quant_engine_line_730
-# internal_quant_engine_line_731
-# internal_quant_engine_line_732
-# internal_quant_engine_line_733
-# internal_quant_engine_line_734
-# internal_quant_engine_line_735
-# internal_quant_engine_line_736
-# internal_quant_engine_line_737
-# internal_quant_engine_line_738
-# internal_quant_engine_line_739
-# internal_quant_engine_line_740
-# internal_quant_engine_line_741
-# internal_quant_engine_line_742
-# internal_quant_engine_line_743
-# internal_quant_engine_line_744
-# internal_quant_engine_line_745
-# internal_quant_engine_line_746
-# internal_quant_engine_line_747
-# internal_quant_engine_line_748
-# internal_quant_engine_line_749
-# internal_quant_engine_line_750
-# internal_quant_engine_line_751
-# internal_quant_engine_line_752
-# internal_quant_engine_line_753
-# internal_quant_engine_line_754
-# internal_quant_engine_line_755
-# internal_quant_engine_line_756
-# internal_quant_engine_line_757
-# internal_quant_engine_line_758
-# internal_quant_engine_line_759
-# internal_quant_engine_line_760
-# internal_quant_engine_line_761
-# internal_quant_engine_line_762
-# internal_quant_engine_line_763
-# internal_quant_engine_line_764
-# internal_quant_engine_line_765
-# internal_quant_engine_line_766
-# internal_quant_engine_line_767
-# internal_quant_engine_line_768
-# internal_quant_engine_line_769
-# internal_quant_engine_line_770
-# internal_quant_engine_line_771
-# internal_quant_engine_line_772
-# internal_quant_engine_line_773
-# internal_quant_engine_line_774
-# internal_quant_engine_line_775
-# internal_quant_engine_line_776
-# internal_quant_engine_line_777
-# internal_quant_engine_line_778
-# internal_quant_engine_line_779
-# internal_quant_engine_line_780
-# internal_quant_engine_line_781
-# internal_quant_engine_line_782
-# internal_quant_engine_line_783
-# internal_quant_engine_line_784
-# internal_quant_engine_line_785
-# internal_quant_engine_line_786
-# internal_quant_engine_line_787
-# internal_quant_engine_line_788
-# internal_quant_engine_line_789
-# internal_quant_engine_line_790
-# internal_quant_engine_line_791
-# internal_quant_engine_line_792
-# internal_quant_engine_line_793
-# internal_quant_engine_line_794
-# internal_quant_engine_line_795
-# internal_quant_engine_line_796
-# internal_quant_engine_line_797
-# internal_quant_engine_line_798
-# internal_quant_engine_line_799
-# internal_quant_engine_line_800
-# internal_quant_engine_line_801
-# internal_quant_engine_line_802
-# internal_quant_engine_line_803
-# internal_quant_engine_line_804
-# internal_quant_engine_line_805
-# internal_quant_engine_line_806
-# internal_quant_engine_line_807
-# internal_quant_engine_line_808
-# internal_quant_engine_line_809
-# internal_quant_engine_line_810
-# internal_quant_engine_line_811
-# internal_quant_engine_line_812
-# internal_quant_engine_line_813
-# internal_quant_engine_line_814
-# internal_quant_engine_line_815
-# internal_quant_engine_line_816
-# internal_quant_engine_line_817
-# internal_quant_engine_line_818
-# internal_quant_engine_line_819
-# internal_quant_engine_line_820
-# internal_quant_engine_line_821
-# internal_quant_engine_line_822
-# internal_quant_engine_line_823
-# internal_quant_engine_line_824
-# internal_quant_engine_line_825
-# internal_quant_engine_line_826
-# internal_quant_engine_line_827
-# internal_quant_engine_line_828
-# internal_quant_engine_line_829
-# internal_quant_engine_line_830
-# internal_quant_engine_line_831
-# internal_quant_engine_line_832
-# internal_quant_engine_line_833
-# internal_quant_engine_line_834
-# internal_quant_engine_line_835
-# internal_quant_engine_line_836
-# internal_quant_engine_line_837
-# internal_quant_engine_line_838
-# internal_quant_engine_line_839
-# internal_quant_engine_line_840
-# internal_quant_engine_line_841
-# internal_quant_engine_line_842
-# internal_quant_engine_line_843
-# internal_quant_engine_line_844
-# internal_quant_engine_line_845
-# internal_quant_engine_line_846
-# internal_quant_engine_line_847
-# internal_quant_engine_line_848
-# internal_quant_engine_line_849
-# internal_quant_engine_line_850
-# internal_quant_engine_line_851
-# internal_quant_engine_line_852
-# internal_quant_engine_line_853
-# internal_quant_engine_line_854
-# internal_quant_engine_line_855
-# internal_quant_engine_line_856
-# internal_quant_engine_line_857
-# internal_quant_engine_line_858
-# internal_quant_engine_line_859
-# internal_quant_engine_line_860
-# internal_quant_engine_line_861
-# internal_quant_engine_line_862
-# internal_quant_engine_line_863
-# internal_quant_engine_line_864
-# internal_quant_engine_line_865
-# internal_quant_engine_line_866
-# internal_quant_engine_line_867
-# internal_quant_engine_line_868
-# internal_quant_engine_line_869
-# internal_quant_engine_line_870
-# internal_quant_engine_line_871
-# internal_quant_engine_line_872
-# internal_quant_engine_line_873
-# internal_quant_engine_line_874
-# internal_quant_engine_line_875
-# internal_quant_engine_line_876
-# internal_quant_engine_line_877
-# internal_quant_engine_line_878
-# internal_quant_engine_line_879
-# internal_quant_engine_line_880
-# internal_quant_engine_line_881
-# internal_quant_engine_line_882
-# internal_quant_engine_line_883
-# internal_quant_engine_line_884
-# internal_quant_engine_line_885
-# internal_quant_engine_line_886
-# internal_quant_engine_line_887
-# internal_quant_engine_line_888
-# internal_quant_engine_line_889
-# internal_quant_engine_line_890
-# internal_quant_engine_line_891
-# internal_quant_engine_line_892
-# internal_quant_engine_line_893
-# internal_quant_engine_line_894
-# internal_quant_engine_line_895
-# internal_quant_engine_line_896
-# internal_quant_engine_line_897
-# internal_quant_engine_line_898
-# internal_quant_engine_line_899
-# internal_quant_engine_line_900
-# internal_quant_engine_line_901
-# internal_quant_engine_line_902
-# internal_quant_engine_line_903
-# internal_quant_engine_line_904
-# internal_quant_engine_line_905
-# internal_quant_engine_line_906
-# internal_quant_engine_line_907
-# internal_quant_engine_line_908
-# internal_quant_engine_line_909
-# internal_quant_engine_line_910
-# internal_quant_engine_line_911
-# internal_quant_engine_line_912
-# internal_quant_engine_line_913
-# internal_quant_engine_line_914
-# internal_quant_engine_line_915
-# internal_quant_engine_line_916
-# internal_quant_engine_line_917
-# internal_quant_engine_line_918
-# internal_quant_engine_line_919
-# internal_quant_engine_line_920
-# internal_quant_engine_line_921
-# internal_quant_engine_line_922
-# internal_quant_engine_line_923
-# internal_quant_engine_line_924
-# internal_quant_engine_line_925
-# internal_quant_engine_line_926
-# internal_quant_engine_line_927
-# internal_quant_engine_line_928
-# internal_quant_engine_line_929
-# internal_quant_engine_line_930
-# internal_quant_engine_line_931
-# internal_quant_engine_line_932
-# internal_quant_engine_line_933
-# internal_quant_engine_line_934
-# internal_quant_engine_line_935
-# internal_quant_engine_line_936
-# internal_quant_engine_line_937
-# internal_quant_engine_line_938
-# internal_quant_engine_line_939
-# internal_quant_engine_line_940
-# internal_quant_engine_line_941
-# internal_quant_engine_line_942
-# internal_quant_engine_line_943
-# internal_quant_engine_line_944
-# internal_quant_engine_line_945
-# internal_quant_engine_line_946
-# internal_quant_engine_line_947
-# internal_quant_engine_line_948
-# internal_quant_engine_line_949
-# internal_quant_engine_line_950
-# internal_quant_engine_line_951
-# internal_quant_engine_line_952
-# internal_quant_engine_line_953
-# internal_quant_engine_line_954
-# internal_quant_engine_line_955
-# internal_quant_engine_line_956
-# internal_quant_engine_line_957
-# internal_quant_engine_line_958
-# internal_quant_engine_line_959
-# internal_quant_engine_line_960
-# internal_quant_engine_line_961
-# internal_quant_engine_line_962
-# internal_quant_engine_line_963
-# internal_quant_engine_line_964
-# internal_quant_engine_line_965
-# internal_quant_engine_line_966
-# internal_quant_engine_line_967
-# internal_quant_engine_line_968
-# internal_quant_engine_line_969
-# internal_quant_engine_line_970
-# internal_quant_engine_line_971
-# internal_quant_engine_line_972
-# internal_quant_engine_line_973
-# internal_quant_engine_line_974
-# internal_quant_engine_line_975
-# internal_quant_engine_line_976
-# internal_quant_engine_line_977
-# internal_quant_engine_line_978
-# internal_quant_engine_line_979
-# internal_quant_engine_line_980
-# internal_quant_engine_line_981
-# internal_quant_engine_line_982
-# internal_quant_engine_line_983
-# internal_quant_engine_line_984
-# internal_quant_engine_line_985
-# internal_quant_engine_line_986
-# internal_quant_engine_line_987
-# internal_quant_engine_line_988
-# internal_quant_engine_line_989
-# internal_quant_engine_line_990
-# internal_quant_engine_line_991
-# internal_quant_engine_line_992
-# internal_quant_engine_line_993
-# internal_quant_engine_line_994
-# internal_quant_engine_line_995
-# internal_quant_engine_line_996
-# internal_quant_engine_line_997
-# internal_quant_engine_line_998
-# internal_quant_engine_line_999
-# internal_quant_engine_line_1000
-# internal_quant_engine_line_1001
-# internal_quant_engine_line_1002
-# internal_quant_engine_line_1003
-# internal_quant_engine_line_1004
-# internal_quant_engine_line_1005
-# internal_quant_engine_line_1006
-# internal_quant_engine_line_1007
-# internal_quant_engine_line_1008
-# internal_quant_engine_line_1009
-# internal_quant_engine_line_1010
-# internal_quant_engine_line_1011
-# internal_quant_engine_line_1012
-# internal_quant_engine_line_1013
-# internal_quant_engine_line_1014
-# internal_quant_engine_line_1015
-# internal_quant_engine_line_1016
-# internal_quant_engine_line_1017
-# internal_quant_engine_line_1018
-# internal_quant_engine_line_1019
-# internal_quant_engine_line_1020
-# internal_quant_engine_line_1021
-# internal_quant_engine_line_1022
-# internal_quant_engine_line_1023
-# internal_quant_engine_line_1024
-# internal_quant_engine_line_1025
-# internal_quant_engine_line_1026
-# internal_quant_engine_line_1027
-# internal_quant_engine_line_1028
-# internal_quant_engine_line_1029
-# internal_quant_engine_line_1030
-# internal_quant_engine_line_1031
-# internal_quant_engine_line_1032
-# internal_quant_engine_line_1033
-# internal_quant_engine_line_1034
-# internal_quant_engine_line_1035
-# internal_quant_engine_line_1036
-# internal_quant_engine_line_1037
-# internal_quant_engine_line_1038
-# internal_quant_engine_line_1039
-# internal_quant_engine_line_1040
-# internal_quant_engine_line_1041
-# internal_quant_engine_line_1042
-# internal_quant_engine_line_1043
-# internal_quant_engine_line_1044
-# internal_quant_engine_line_1045
-# internal_quant_engine_line_1046
-# internal_quant_engine_line_1047
-# internal_quant_engine_line_1048
-# internal_quant_engine_line_1049
-# internal_quant_engine_line_1050
-# internal_quant_engine_line_1051
-# internal_quant_engine_line_1052
-# internal_quant_engine_line_1053
-# internal_quant_engine_line_1054
-# internal_quant_engine_line_1055
-# internal_quant_engine_line_1056
-# internal_quant_engine_line_1057
-# internal_quant_engine_line_1058
-# internal_quant_engine_line_1059
-# internal_quant_engine_line_1060
-# internal_quant_engine_line_1061
-# internal_quant_engine_line_1062
-# internal_quant_engine_line_1063
-# internal_quant_engine_line_1064
-# internal_quant_engine_line_1065
-# internal_quant_engine_line_1066
-# internal_quant_engine_line_1067
-# internal_quant_engine_line_1068
-# internal_quant_engine_line_1069
-# internal_quant_engine_line_1070
-# internal_quant_engine_line_1071
-# internal_quant_engine_line_1072
-# internal_quant_engine_line_1073
-# internal_quant_engine_line_1074
-# internal_quant_engine_line_1075
-# internal_quant_engine_line_1076
-# internal_quant_engine_line_1077
-# internal_quant_engine_line_1078
-# internal_quant_engine_line_1079
-# internal_quant_engine_line_1080
-# internal_quant_engine_line_1081
-# internal_quant_engine_line_1082
-# internal_quant_engine_line_1083
-# internal_quant_engine_line_1084
-# internal_quant_engine_line_1085
-# internal_quant_engine_line_1086
-# internal_quant_engine_line_1087
-# internal_quant_engine_line_1088
-# internal_quant_engine_line_1089
-# internal_quant_engine_line_1090
-# internal_quant_engine_line_1091
-# internal_quant_engine_line_1092
-# internal_quant_engine_line_1093
-# internal_quant_engine_line_1094
-# internal_quant_engine_line_1095
-# internal_quant_engine_line_1096
-# internal_quant_engine_line_1097
-# internal_quant_engine_line_1098
-# internal_quant_engine_line_1099
-# internal_quant_engine_line_1100
-# internal_quant_engine_line_1101
-# internal_quant_engine_line_1102
-# internal_quant_engine_line_1103
-# internal_quant_engine_line_1104
-# internal_quant_engine_line_1105
-# internal_quant_engine_line_1106
-# internal_quant_engine_line_1107
-# internal_quant_engine_line_1108
-# internal_quant_engine_line_1109
-# internal_quant_engine_line_1110
-# internal_quant_engine_line_1111
-# internal_quant_engine_line_1112
-# internal_quant_engine_line_1113
-# internal_quant_engine_line_1114
-# internal_quant_engine_line_1115
-# internal_quant_engine_line_1116
-# internal_quant_engine_line_1117
-# internal_quant_engine_line_1118
-# internal_quant_engine_line_1119
-# internal_quant_engine_line_1120
-# internal_quant_engine_line_1121
-# internal_quant_engine_line_1122
-# internal_quant_engine_line_1123
-# internal_quant_engine_line_1124
-# internal_quant_engine_line_1125
-# internal_quant_engine_line_1126
-# internal_quant_engine_line_1127
-# internal_quant_engine_line_1128
-# internal_quant_engine_line_1129
-# internal_quant_engine_line_1130
-# internal_quant_engine_line_1131
-# internal_quant_engine_line_1132
-# internal_quant_engine_line_1133
-# internal_quant_engine_line_1134
-# internal_quant_engine_line_1135
-# internal_quant_engine_line_1136
-# internal_quant_engine_line_1137
-# internal_quant_engine_line_1138
-# internal_quant_engine_line_1139
-# internal_quant_engine_line_1140
-# internal_quant_engine_line_1141
-# internal_quant_engine_line_1142
-# internal_quant_engine_line_1143
-# internal_quant_engine_line_1144
-# internal_quant_engine_line_1145
-# internal_quant_engine_line_1146
-# internal_quant_engine_line_1147
-# internal_quant_engine_line_1148
-# internal_quant_engine_line_1149
-# internal_quant_engine_line_1150
-# internal_quant_engine_line_1151
-# internal_quant_engine_line_1152
-# internal_quant_engine_line_1153
-# internal_quant_engine_line_1154
-# internal_quant_engine_line_1155
-# internal_quant_engine_line_1156
-# internal_quant_engine_line_1157
-# internal_quant_engine_line_1158
-# internal_quant_engine_line_1159
-# internal_quant_engine_line_1160
-# internal_quant_engine_line_1161
-# internal_quant_engine_line_1162
-# internal_quant_engine_line_1163
-# internal_quant_engine_line_1164
-# internal_quant_engine_line_1165
-# internal_quant_engine_line_1166
-# internal_quant_engine_line_1167
-# internal_quant_engine_line_1168
-# internal_quant_engine_line_1169
-# internal_quant_engine_line_1170
-# internal_quant_engine_line_1171
-# internal_quant_engine_line_1172
-# internal_quant_engine_line_1173
-# internal_quant_engine_line_1174
-# internal_quant_engine_line_1175
-# internal_quant_engine_line_1176
-# internal_quant_engine_line_1177
-# internal_quant_engine_line_1178
-# internal_quant_engine_line_1179
-# internal_quant_engine_line_1180
-# internal_quant_engine_line_1181
-# internal_quant_engine_line_1182
-# internal_quant_engine_line_1183
-# internal_quant_engine_line_1184
-# internal_quant_engine_line_1185
-# internal_quant_engine_line_1186
-# internal_quant_engine_line_1187
-# internal_quant_engine_line_1188
-# internal_quant_engine_line_1189
-# internal_quant_engine_line_1190
-# internal_quant_engine_line_1191
-# internal_quant_engine_line_1192
-# internal_quant_engine_line_1193
-# internal_quant_engine_line_1194
-# internal_quant_engine_line_1195
-# internal_quant_engine_line_1196
-# internal_quant_engine_line_1197
-# internal_quant_engine_line_1198
-# internal_quant_engine_line_1199
-# internal_quant_engine_line_1200
-# internal_quant_engine_line_1201
-# internal_quant_engine_line_1202
-# internal_quant_engine_line_1203
-# internal_quant_engine_line_1204
-# internal_quant_engine_line_1205
-# internal_quant_engine_line_1206
-# internal_quant_engine_line_1207
-# internal_quant_engine_line_1208
-# internal_quant_engine_line_1209
-# internal_quant_engine_line_1210
-# internal_quant_engine_line_1211
-# internal_quant_engine_line_1212
-# internal_quant_engine_line_1213
-# internal_quant_engine_line_1214
-# internal_quant_engine_line_1215
-# internal_quant_engine_line_1216
-# internal_quant_engine_line_1217
-# internal_quant_engine_line_1218
-# internal_quant_engine_line_1219
-# internal_quant_engine_line_1220
-# internal_quant_engine_line_1221
-# internal_quant_engine_line_1222
-# internal_quant_engine_line_1223
-# internal_quant_engine_line_1224
-# internal_quant_engine_line_1225
-# internal_quant_engine_line_1226
-# internal_quant_engine_line_1227
-# internal_quant_engine_line_1228
-# internal_quant_engine_line_1229
-# internal_quant_engine_line_1230
-# internal_quant_engine_line_1231
-# internal_quant_engine_line_1232
-# internal_quant_engine_line_1233
-# internal_quant_engine_line_1234
-# internal_quant_engine_line_1235
-# internal_quant_engine_line_1236
-# internal_quant_engine_line_1237
-# internal_quant_engine_line_1238
-# internal_quant_engine_line_1239
-# internal_quant_engine_line_1240
-# internal_quant_engine_line_1241
-# internal_quant_engine_line_1242
-# internal_quant_engine_line_1243
-# internal_quant_engine_line_1244
-# internal_quant_engine_line_1245
-# internal_quant_engine_line_1246
-# internal_quant_engine_line_1247
-# internal_quant_engine_line_1248
-# internal_quant_engine_line_1249
-# internal_quant_engine_line_1250
-# internal_quant_engine_line_1251
-# internal_quant_engine_line_1252
-# internal_quant_engine_line_1253
-# internal_quant_engine_line_1254
-# internal_quant_engine_line_1255
-# internal_quant_engine_line_1256
-# internal_quant_engine_line_1257
-# internal_quant_engine_line_1258
-# internal_quant_engine_line_1259
-# internal_quant_engine_line_1260
-# internal_quant_engine_line_1261
-# internal_quant_engine_line_1262
-# internal_quant_engine_line_1263
-# internal_quant_engine_line_1264
-# internal_quant_engine_line_1265
-# internal_quant_engine_line_1266
-# internal_quant_engine_line_1267
-# internal_quant_engine_line_1268
-# internal_quant_engine_line_1269
-# internal_quant_engine_line_1270
-# internal_quant_engine_line_1271
-# internal_quant_engine_line_1272
-# internal_quant_engine_line_1273
-# internal_quant_engine_line_1274
-# internal_quant_engine_line_1275
-# internal_quant_engine_line_1276
-# internal_quant_engine_line_1277
-# internal_quant_engine_line_1278
-# internal_quant_engine_line_1279
-# internal_quant_engine_line_1280
-# internal_quant_engine_line_1281
-# internal_quant_engine_line_1282
-# internal_quant_engine_line_1283
-# internal_quant_engine_line_1284
-# internal_quant_engine_line_1285
-# internal_quant_engine_line_1286
-# internal_quant_engine_line_1287
-# internal_quant_engine_line_1288
-# internal_quant_engine_line_1289
-# internal_quant_engine_line_1290
-# internal_quant_engine_line_1291
-# internal_quant_engine_line_1292
-# internal_quant_engine_line_1293
-# internal_quant_engine_line_1294
-# internal_quant_engine_line_1295
-# internal_quant_engine_line_1296
-# internal_quant_engine_line_1297
-# internal_quant_engine_line_1298
-# internal_quant_engine_line_1299
-# internal_quant_engine_line_1300
-# internal_quant_engine_line_1301
-# internal_quant_engine_line_1302
-# internal_quant_engine_line_1303
-# internal_quant_engine_line_1304
-# internal_quant_engine_line_1305
-# internal_quant_engine_line_1306
-# internal_quant_engine_line_1307
-# internal_quant_engine_line_1308
-# internal_quant_engine_line_1309
-# internal_quant_engine_line_1310
-# internal_quant_engine_line_1311
-# internal_quant_engine_line_1312
-# internal_quant_engine_line_1313
-# internal_quant_engine_line_1314
-# internal_quant_engine_line_1315
-# internal_quant_engine_line_1316
-# internal_quant_engine_line_1317
-# internal_quant_engine_line_1318
-# internal_quant_engine_line_1319
-# internal_quant_engine_line_1320
-# internal_quant_engine_line_1321
-# internal_quant_engine_line_1322
-# internal_quant_engine_line_1323
-# internal_quant_engine_line_1324
-# internal_quant_engine_line_1325
-# internal_quant_engine_line_1326
-# internal_quant_engine_line_1327
-# internal_quant_engine_line_1328
-# internal_quant_engine_line_1329
-# internal_quant_engine_line_1330
-# internal_quant_engine_line_1331
-# internal_quant_engine_line_1332
-# internal_quant_engine_line_1333
-# internal_quant_engine_line_1334
-# internal_quant_engine_line_1335
-# internal_quant_engine_line_1336
-# internal_quant_engine_line_1337
-# internal_quant_engine_line_1338
-# internal_quant_engine_line_1339
-# internal_quant_engine_line_1340
-# internal_quant_engine_line_1341
-# internal_quant_engine_line_1342
-# internal_quant_engine_line_1343
-# internal_quant_engine_line_1344
-# internal_quant_engine_line_1345
-# internal_quant_engine_line_1346
-# internal_quant_engine_line_1347
-# internal_quant_engine_line_1348
-# internal_quant_engine_line_1349
-# internal_quant_engine_line_1350
-# internal_quant_engine_line_1351
-# internal_quant_engine_line_1352
-# internal_quant_engine_line_1353
-# internal_quant_engine_line_1354
-# internal_quant_engine_line_1355
-# internal_quant_engine_line_1356
-# internal_quant_engine_line_1357
-# internal_quant_engine_line_1358
-# internal_quant_engine_line_1359
-# internal_quant_engine_line_1360
-# internal_quant_engine_line_1361
-# internal_quant_engine_line_1362
-# internal_quant_engine_line_1363
-# internal_quant_engine_line_1364
-# internal_quant_engine_line_1365
-# internal_quant_engine_line_1366
-# internal_quant_engine_line_1367
-# internal_quant_engine_line_1368
-# internal_quant_engine_line_1369
-# internal_quant_engine_line_1370
-# internal_quant_engine_line_1371
-# internal_quant_engine_line_1372
-# internal_quant_engine_line_1373
-# internal_quant_engine_line_1374
-# internal_quant_engine_line_1375
-# internal_quant_engine_line_1376
-# internal_quant_engine_line_1377
-# internal_quant_engine_line_1378
-# internal_quant_engine_line_1379
-# internal_quant_engine_line_1380
-# internal_quant_engine_line_1381
-# internal_quant_engine_line_1382
-# internal_quant_engine_line_1383
-# internal_quant_engine_line_1384
-# internal_quant_engine_line_1385
-# internal_quant_engine_line_1386
-# internal_quant_engine_line_1387
-# internal_quant_engine_line_1388
-# internal_quant_engine_line_1389
-# internal_quant_engine_line_1390
-# internal_quant_engine_line_1391
-# internal_quant_engine_line_1392
-# internal_quant_engine_line_1393
-# internal_quant_engine_line_1394
-# internal_quant_engine_line_1395
-# internal_quant_engine_line_1396
-# internal_quant_engine_line_1397
-# internal_quant_engine_line_1398
-# internal_quant_engine_line_1399
-# internal_quant_engine_line_1400
-# internal_quant_engine_line_1401
-# internal_quant_engine_line_1402
-# internal_quant_engine_line_1403
-# internal_quant_engine_line_1404
-# internal_quant_engine_line_1405
-# internal_quant_engine_line_1406
-# internal_quant_engine_line_1407
-# internal_quant_engine_line_1408
-# internal_quant_engine_line_1409
-# internal_quant_engine_line_1410
-# internal_quant_engine_line_1411
-# internal_quant_engine_line_1412
-# internal_quant_engine_line_1413
-# internal_quant_engine_line_1414
-# internal_quant_engine_line_1415
-# internal_quant_engine_line_1416
-# internal_quant_engine_line_1417
-# internal_quant_engine_line_1418
-# internal_quant_engine_line_1419
-# internal_quant_engine_line_1420
-# internal_quant_engine_line_1421
-# internal_quant_engine_line_1422
-# internal_quant_engine_line_1423
-# internal_quant_engine_line_1424
-# internal_quant_engine_line_1425
-# internal_quant_engine_line_1426
-# internal_quant_engine_line_1427
-# internal_quant_engine_line_1428
-# internal_quant_engine_line_1429
-# internal_quant_engine_line_1430
-# internal_quant_engine_line_1431
-# internal_quant_engine_line_1432
-# internal_quant_engine_line_1433
-# internal_quant_engine_line_1434
-# internal_quant_engine_line_1435
-# internal_quant_engine_line_1436
-# internal_quant_engine_line_1437
-# internal_quant_engine_line_1438
-# internal_quant_engine_line_1439
-# internal_quant_engine_line_1440
-# internal_quant_engine_line_1441
-# internal_quant_engine_line_1442
-# internal_quant_engine_line_1443
-# internal_quant_engine_line_1444
-# internal_quant_engine_line_1445
-# internal_quant_engine_line_1446
-# internal_quant_engine_line_1447
-# internal_quant_engine_line_1448
-# internal_quant_engine_line_1449
-# internal_quant_engine_line_1450
-# internal_quant_engine_line_1451
-# internal_quant_engine_line_1452
-# internal_quant_engine_line_1453
-# internal_quant_engine_line_1454
-# internal_quant_engine_line_1455
-# internal_quant_engine_line_1456
-# internal_quant_engine_line_1457
-# internal_quant_engine_line_1458
-# internal_quant_engine_line_1459
-# internal_quant_engine_line_1460
-# internal_quant_engine_line_1461
-# internal_quant_engine_line_1462
-# internal_quant_engine_line_1463
-# internal_quant_engine_line_1464
-# internal_quant_engine_line_1465
-# internal_quant_engine_line_1466
-# internal_quant_engine_line_1467
-# internal_quant_engine_line_1468
-# internal_quant_engine_line_1469
-# internal_quant_engine_line_1470
-# internal_quant_engine_line_1471
-# internal_quant_engine_line_1472
-# internal_quant_engine_line_1473
-# internal_quant_engine_line_1474
-# internal_quant_engine_line_1475
-# internal_quant_engine_line_1476
-# internal_quant_engine_line_1477
-# internal_quant_engine_line_1478
-# internal_quant_engine_line_1479
-# internal_quant_engine_line_1480
-# internal_quant_engine_line_1481
-# internal_quant_engine_line_1482
-# internal_quant_engine_line_1483
-# internal_quant_engine_line_1484
-# internal_quant_engine_line_1485
-# internal_quant_engine_line_1486
-# internal_quant_engine_line_1487
-# internal_quant_engine_line_1488
-# internal_quant_engine_line_1489
-# internal_quant_engine_line_1490
-# internal_quant_engine_line_1491
-# internal_quant_engine_line_1492
-# internal_quant_engine_line_1493
-# internal_quant_engine_line_1494
-# internal_quant_engine_line_1495
-# internal_quant_engine_line_1496
-# internal_quant_engine_line_1497
-# internal_quant_engine_line_1498
-# internal_quant_engine_line_1499
-# internal_quant_engine_line_1500
-# internal_quant_engine_line_1501
-# internal_quant_engine_line_1502
-# internal_quant_engine_line_1503
-# internal_quant_engine_line_1504
-# internal_quant_engine_line_1505
-# internal_quant_engine_line_1506
-# internal_quant_engine_line_1507
-# internal_quant_engine_line_1508
-# internal_quant_engine_line_1509
-# internal_quant_engine_line_1510
-# internal_quant_engine_line_1511
-# internal_quant_engine_line_1512
-# internal_quant_engine_line_1513
-# internal_quant_engine_line_1514
-# internal_quant_engine_line_1515
-# internal_quant_engine_line_1516
-# internal_quant_engine_line_1517
-# internal_quant_engine_line_1518
-# internal_quant_engine_line_1519
-# internal_quant_engine_line_1520
-# internal_quant_engine_line_1521
-# internal_quant_engine_line_1522
-# internal_quant_engine_line_1523
-# internal_quant_engine_line_1524
-# internal_quant_engine_line_1525
-# internal_quant_engine_line_1526
-# internal_quant_engine_line_1527
-# internal_quant_engine_line_1528
-# internal_quant_engine_line_1529
-# internal_quant_engine_line_1530
-# internal_quant_engine_line_1531
-# internal_quant_engine_line_1532
-# internal_quant_engine_line_1533
-# internal_quant_engine_line_1534
-# internal_quant_engine_line_1535
-# internal_quant_engine_line_1536
-# internal_quant_engine_line_1537
-# internal_quant_engine_line_1538
-# internal_quant_engine_line_1539
-# internal_quant_engine_line_1540
-# internal_quant_engine_line_1541
-# internal_quant_engine_line_1542
-# internal_quant_engine_line_1543
-# internal_quant_engine_line_1544
-# internal_quant_engine_line_1545
-# internal_quant_engine_line_1546
-# internal_quant_engine_line_1547
-# internal_quant_engine_line_1548
-# internal_quant_engine_line_1549
-# internal_quant_engine_line_1550
-# internal_quant_engine_line_1551
-# internal_quant_engine_line_1552
-# internal_quant_engine_line_1553
-# internal_quant_engine_line_1554
-# internal_quant_engine_line_1555
-# internal_quant_engine_line_1556
-# internal_quant_engine_line_1557
-# internal_quant_engine_line_1558
-# internal_quant_engine_line_1559
-# internal_quant_engine_line_1560
-# internal_quant_engine_line_1561
-# internal_quant_engine_line_1562
-# internal_quant_engine_line_1563
-# internal_quant_engine_line_1564
-# internal_quant_engine_line_1565
-# internal_quant_engine_line_1566
-# internal_quant_engine_line_1567
-# internal_quant_engine_line_1568
-# internal_quant_engine_line_1569
-# internal_quant_engine_line_1570
-# internal_quant_engine_line_1571
-# internal_quant_engine_line_1572
-# internal_quant_engine_line_1573
-# internal_quant_engine_line_1574
-# internal_quant_engine_line_1575
-# internal_quant_engine_line_1576
-# internal_quant_engine_line_1577
-# internal_quant_engine_line_1578
-# internal_quant_engine_line_1579
-# internal_quant_engine_line_1580
-# internal_quant_engine_line_1581
-# internal_quant_engine_line_1582
-# internal_quant_engine_line_1583
-# internal_quant_engine_line_1584
-# internal_quant_engine_line_1585
-# internal_quant_engine_line_1586
-# internal_quant_engine_line_1587
-# internal_quant_engine_line_1588
-# internal_quant_engine_line_1589
-# internal_quant_engine_line_1590
-# internal_quant_engine_line_1591
-# internal_quant_engine_line_1592
-# internal_quant_engine_line_1593
-# internal_quant_engine_line_1594
-# internal_quant_engine_line_1595
-# internal_quant_engine_line_1596
-# internal_quant_engine_line_1597
-# internal_quant_engine_line_1598
-# internal_quant_engine_line_1599
-# internal_quant_engine_line_1600
-# internal_quant_engine_line_1601
-# internal_quant_engine_line_1602
-# internal_quant_engine_line_1603
-# internal_quant_engine_line_1604
-# internal_quant_engine_line_1605
-# internal_quant_engine_line_1606
-# internal_quant_engine_line_1607
-# internal_quant_engine_line_1608
-# internal_quant_engine_line_1609
-# internal_quant_engine_line_1610
-# internal_quant_engine_line_1611
-# internal_quant_engine_line_1612
-# internal_quant_engine_line_1613
-# internal_quant_engine_line_1614
-# internal_quant_engine_line_1615
-# internal_quant_engine_line_1616
-# internal_quant_engine_line_1617
-# internal_quant_engine_line_1618
-# internal_quant_engine_line_1619
-# internal_quant_engine_line_1620
-# internal_quant_engine_line_1621
-# internal_quant_engine_line_1622
-# internal_quant_engine_line_1623
-# internal_quant_engine_line_1624
-# internal_quant_engine_line_1625
-# internal_quant_engine_line_1626
-# internal_quant_engine_line_1627
-# internal_quant_engine_line_1628
-# internal_quant_engine_line_1629
-# internal_quant_engine_line_1630
-# internal_quant_engine_line_1631
-# internal_quant_engine_line_1632
-# internal_quant_engine_line_1633
-# internal_quant_engine_line_1634
-# internal_quant_engine_line_1635
-# internal_quant_engine_line_1636
-# internal_quant_engine_line_1637
-# internal_quant_engine_line_1638
-# internal_quant_engine_line_1639
-# internal_quant_engine_line_1640
-# internal_quant_engine_line_1641
-# internal_quant_engine_line_1642
-# internal_quant_engine_line_1643
-# internal_quant_engine_line_1644
-# internal_quant_engine_line_1645
-# internal_quant_engine_line_1646
-# internal_quant_engine_line_1647
-# internal_quant_engine_line_1648
-# internal_quant_engine_line_1649
-# internal_quant_engine_line_1650
-# internal_quant_engine_line_1651
-# internal_quant_engine_line_1652
-# internal_quant_engine_line_1653
-# internal_quant_engine_line_1654
-# internal_quant_engine_line_1655
-# internal_quant_engine_line_1656
-# internal_quant_engine_line_1657
-# internal_quant_engine_line_1658
-# internal_quant_engine_line_1659
-# internal_quant_engine_line_1660
-# internal_quant_engine_line_1661
-# internal_quant_engine_line_1662
-# internal_quant_engine_line_1663
-# internal_quant_engine_line_1664
-# internal_quant_engine_line_1665
-# internal_quant_engine_line_1666
-# internal_quant_engine_line_1667
-# internal_quant_engine_line_1668
-# internal_quant_engine_line_1669
-# internal_quant_engine_line_1670
-# internal_quant_engine_line_1671
-# internal_quant_engine_line_1672
-# internal_quant_engine_line_1673
-# internal_quant_engine_line_1674
-# internal_quant_engine_line_1675
-# internal_quant_engine_line_1676
-# internal_quant_engine_line_1677
-# internal_quant_engine_line_1678
-# internal_quant_engine_line_1679
-# internal_quant_engine_line_1680
-# internal_quant_engine_line_1681
-# internal_quant_engine_line_1682
-# internal_quant_engine_line_1683
-# internal_quant_engine_line_1684
-# internal_quant_engine_line_1685
-# internal_quant_engine_line_1686
-# internal_quant_engine_line_1687
-# internal_quant_engine_line_1688
-# internal_quant_engine_line_1689
-# internal_quant_engine_line_1690
-# internal_quant_engine_line_1691
-# internal_quant_engine_line_1692
-# internal_quant_engine_line_1693
-# internal_quant_engine_line_1694
-# internal_quant_engine_line_1695
-# internal_quant_engine_line_1696
-# internal_quant_engine_line_1697
-# internal_quant_engine_line_1698
-# internal_quant_engine_line_1699
-# internal_quant_engine_line_1700
-# internal_quant_engine_line_1701
-# internal_quant_engine_line_1702
-# internal_quant_engine_line_1703
-# internal_quant_engine_line_1704
-# internal_quant_engine_line_1705
-# internal_quant_engine_line_1706
-# internal_quant_engine_line_1707
-# internal_quant_engine_line_1708
-# internal_quant_engine_line_1709
-# internal_quant_engine_line_1710
-# internal_quant_engine_line_1711
-# internal_quant_engine_line_1712
-# internal_quant_engine_line_1713
-# internal_quant_engine_line_1714
-# internal_quant_engine_line_1715
-# internal_quant_engine_line_1716
-# internal_quant_engine_line_1717
-# internal_quant_engine_line_1718
-# internal_quant_engine_line_1719
-# internal_quant_engine_line_1720
-# internal_quant_engine_line_1721
-# internal_quant_engine_line_1722
-# internal_quant_engine_line_1723
-# internal_quant_engine_line_1724
-# internal_quant_engine_line_1725
-# internal_quant_engine_line_1726
-# internal_quant_engine_line_1727
-# internal_quant_engine_line_1728
-# internal_quant_engine_line_1729
-# internal_quant_engine_line_1730
-# internal_quant_engine_line_1731
-# internal_quant_engine_line_1732
-# internal_quant_engine_line_1733
-# internal_quant_engine_line_1734
-# internal_quant_engine_line_1735
-# internal_quant_engine_line_1736
-# internal_quant_engine_line_1737
-# internal_quant_engine_line_1738
-# internal_quant_engine_line_1739
-# internal_quant_engine_line_1740
-# internal_quant_engine_line_1741
-# internal_quant_engine_line_1742
-# internal_quant_engine_line_1743
-# internal_quant_engine_line_1744
-# internal_quant_engine_line_1745
-# internal_quant_engine_line_1746
-# internal_quant_engine_line_1747
-# internal_quant_engine_line_1748
-# internal_quant_engine_line_1749
-# internal_quant_engine_line_1750
-# internal_quant_engine_line_1751
-# internal_quant_engine_line_1752
-# internal_quant_engine_line_1753
-# internal_quant_engine_line_1754
-# internal_quant_engine_line_1755
-# internal_quant_engine_line_1756
-# internal_quant_engine_line_1757
-# internal_quant_engine_line_1758
-# internal_quant_engine_line_1759
-# internal_quant_engine_line_1760
-# internal_quant_engine_line_1761
-# internal_quant_engine_line_1762
-# internal_quant_engine_line_1763
-# internal_quant_engine_line_1764
-# internal_quant_engine_line_1765
-# internal_quant_engine_line_1766
-# internal_quant_engine_line_1767
-# internal_quant_engine_line_1768
-# internal_quant_engine_line_1769
-# internal_quant_engine_line_1770
-# internal_quant_engine_line_1771
-# internal_quant_engine_line_1772
-# internal_quant_engine_line_1773
-# internal_quant_engine_line_1774
-# internal_quant_engine_line_1775
-# internal_quant_engine_line_1776
-# internal_quant_engine_line_1777
-# internal_quant_engine_line_1778
-# internal_quant_engine_line_1779
-# internal_quant_engine_line_1780
-# internal_quant_engine_line_1781
-# internal_quant_engine_line_1782
-# internal_quant_engine_line_1783
-# internal_quant_engine_line_1784
-# internal_quant_engine_line_1785
-# internal_quant_engine_line_1786
-# internal_quant_engine_line_1787
-# internal_quant_engine_line_1788
-# internal_quant_engine_line_1789
-# internal_quant_engine_line_1790
-# internal_quant_engine_line_1791
-# internal_quant_engine_line_1792
-# internal_quant_engine_line_1793
-# internal_quant_engine_line_1794
-# internal_quant_engine_line_1795
-# internal_quant_engine_line_1796
-# internal_quant_engine_line_1797
-# internal_quant_engine_line_1798
-# internal_quant_engine_line_1799
-# internal_quant_engine_line_1800
-# internal_quant_engine_line_1801
-# internal_quant_engine_line_1802
-# internal_quant_engine_line_1803
-# internal_quant_engine_line_1804
-# internal_quant_engine_line_1805
-# internal_quant_engine_line_1806
-# internal_quant_engine_line_1807
-# internal_quant_engine_line_1808
-# internal_quant_engine_line_1809
-# internal_quant_engine_line_1810
-# internal_quant_engine_line_1811
-# internal_quant_engine_line_1812
-# internal_quant_engine_line_1813
-# internal_quant_engine_line_1814
-# internal_quant_engine_line_1815
-# internal_quant_engine_line_1816
-# internal_quant_engine_line_1817
-# internal_quant_engine_line_1818
-# internal_quant_engine_line_1819
-# internal_quant_engine_line_1820
-# internal_quant_engine_line_1821
-# internal_quant_engine_line_1822
-# internal_quant_engine_line_1823
-# internal_quant_engine_line_1824
-# internal_quant_engine_line_1825
-# internal_quant_engine_line_1826
-# internal_quant_engine_line_1827
-# internal_quant_engine_line_1828
-# internal_quant_engine_line_1829
-# internal_quant_engine_line_1830
-# internal_quant_engine_line_1831
-# internal_quant_engine_line_1832
-# internal_quant_engine_line_1833
-# internal_quant_engine_line_1834
-# internal_quant_engine_line_1835
-# internal_quant_engine_line_1836
-# internal_quant_engine_line_1837
-# internal_quant_engine_line_1838
-# internal_quant_engine_line_1839
-# internal_quant_engine_line_1840
-# internal_quant_engine_line_1841
-# internal_quant_engine_line_1842
-# internal_quant_engine_line_1843
-# internal_quant_engine_line_1844
-# internal_quant_engine_line_1845
-# internal_quant_engine_line_1846
-# internal_quant_engine_line_1847
-# internal_quant_engine_line_1848
-# internal_quant_engine_line_1849
-# internal_quant_engine_line_1850
-# internal_quant_engine_line_1851
-# internal_quant_engine_line_1852
-# internal_quant_engine_line_1853
-# internal_quant_engine_line_1854
-# internal_quant_engine_line_1855
-# internal_quant_engine_line_1856
-# internal_quant_engine_line_1857
-# internal_quant_engine_line_1858
-# internal_quant_engine_line_1859
-# internal_quant_engine_line_1860
-# internal_quant_engine_line_1861
-# internal_quant_engine_line_1862
-# internal_quant_engine_line_1863
-# internal_quant_engine_line_1864
-# internal_quant_engine_line_1865
-# internal_quant_engine_line_1866
-# internal_quant_engine_line_1867
-# internal_quant_engine_line_1868
-# internal_quant_engine_line_1869
-# internal_quant_engine_line_1870
-# internal_quant_engine_line_1871
-# internal_quant_engine_line_1872
-# internal_quant_engine_line_1873
-# internal_quant_engine_line_1874
-# internal_quant_engine_line_1875
-# internal_quant_engine_line_1876
-# internal_quant_engine_line_1877
-# internal_quant_engine_line_1878
-# internal_quant_engine_line_1879
-# internal_quant_engine_line_1880
-# internal_quant_engine_line_1881
-# internal_quant_engine_line_1882
-# internal_quant_engine_line_1883
-# internal_quant_engine_line_1884
-# internal_quant_engine_line_1885
-# internal_quant_engine_line_1886
-# internal_quant_engine_line_1887
-# internal_quant_engine_line_1888
-# internal_quant_engine_line_1889
-# internal_quant_engine_line_1890
-# internal_quant_engine_line_1891
-# internal_quant_engine_line_1892
-# internal_quant_engine_line_1893
-# internal_quant_engine_line_1894
-# internal_quant_engine_line_1895
-# internal_quant_engine_line_1896
-# internal_quant_engine_line_1897
-# internal_quant_engine_line_1898
-# internal_quant_engine_line_1899
-# internal_quant_engine_line_1900
-# internal_quant_engine_line_1901
-# internal_quant_engine_line_1902
-# internal_quant_engine_line_1903
-# internal_quant_engine_line_1904
-# internal_quant_engine_line_1905
-# internal_quant_engine_line_1906
-# internal_quant_engine_line_1907
-# internal_quant_engine_line_1908
-# internal_quant_engine_line_1909
-# internal_quant_engine_line_1910
-# internal_quant_engine_line_1911
-# internal_quant_engine_line_1912
-# internal_quant_engine_line_1913
-# internal_quant_engine_line_1914
-# internal_quant_engine_line_1915
-# internal_quant_engine_line_1916
-# internal_quant_engine_line_1917
-# internal_quant_engine_line_1918
-# internal_quant_engine_line_1919
-# internal_quant_engine_line_1920
-# internal_quant_engine_line_1921
-# internal_quant_engine_line_1922
-# internal_quant_engine_line_1923
-# internal_quant_engine_line_1924
-# internal_quant_engine_line_1925
-# internal_quant_engine_line_1926
-# internal_quant_engine_line_1927
-# internal_quant_engine_line_1928
-# internal_quant_engine_line_1929
-# internal_quant_engine_line_1930
-# internal_quant_engine_line_1931
-# internal_quant_engine_line_1932
-# internal_quant_engine_line_1933
-# internal_quant_engine_line_1934
-# internal_quant_engine_line_1935
-# internal_quant_engine_line_1936
-# internal_quant_engine_line_1937
-# internal_quant_engine_line_1938
-# internal_quant_engine_line_1939
-# internal_quant_engine_line_1940
-# internal_quant_engine_line_1941
-# internal_quant_engine_line_1942
-# internal_quant_engine_line_1943
-# internal_quant_engine_line_1944
-# internal_quant_engine_line_1945
-# internal_quant_engine_line_1946
-# internal_quant_engine_line_1947
-# internal_quant_engine_line_1948
-# internal_quant_engine_line_1949
-# internal_quant_engine_line_1950
-# internal_quant_engine_line_1951
-# internal_quant_engine_line_1952
-# internal_quant_engine_line_1953
-# internal_quant_engine_line_1954
-# internal_quant_engine_line_1955
-# internal_quant_engine_line_1956
-# internal_quant_engine_line_1957
-# internal_quant_engine_line_1958
-# internal_quant_engine_line_1959
-# internal_quant_engine_line_1960
-# internal_quant_engine_line_1961
-# internal_quant_engine_line_1962
-# internal_quant_engine_line_1963
-# internal_quant_engine_line_1964
-# internal_quant_engine_line_1965
-# internal_quant_engine_line_1966
-# internal_quant_engine_line_1967
-# internal_quant_engine_line_1968
-# internal_quant_engine_line_1969
-# internal_quant_engine_line_1970
-# internal_quant_engine_line_1971
-# internal_quant_engine_line_1972
-# internal_quant_engine_line_1973
-# internal_quant_engine_line_1974
-# internal_quant_engine_line_1975
-# internal_quant_engine_line_1976
-# internal_quant_engine_line_1977
-# internal_quant_engine_line_1978
-# internal_quant_engine_line_1979
-# internal_quant_engine_line_1980
-# internal_quant_engine_line_1981
-# internal_quant_engine_line_1982
-# internal_quant_engine_line_1983
-# internal_quant_engine_line_1984
-# internal_quant_engine_line_1985
-# internal_quant_engine_line_1986
-# internal_quant_engine_line_1987
-# internal_quant_engine_line_1988
-# internal_quant_engine_line_1989
-# internal_quant_engine_line_1990
-# internal_quant_engine_line_1991
-# internal_quant_engine_line_1992
-# internal_quant_engine_line_1993
-# internal_quant_engine_line_1994
-# internal_quant_engine_line_1995
-# internal_quant_engine_line_1996
-# internal_quant_engine_line_1997
-# internal_quant_engine_line_1998
-# internal_quant_engine_line_1999
-# internal_quant_engine_line_2000
-# internal_quant_engine_line_2001
-# internal_quant_engine_line_2002
-# internal_quant_engine_line_2003
-# internal_quant_engine_line_2004
-# internal_quant_engine_line_2005
-# internal_quant_engine_line_2006
-# internal_quant_engine_line_2007
-# internal_quant_engine_line_2008
-# internal_quant_engine_line_2009
-# internal_quant_engine_line_2010
-# internal_quant_engine_line_2011
-# internal_quant_engine_line_2012
-# internal_quant_engine_line_2013
-# internal_quant_engine_line_2014
-# internal_quant_engine_line_2015
-# internal_quant_engine_line_2016
-# internal_quant_engine_line_2017
-# internal_quant_engine_line_2018
-# internal_quant_engine_line_2019
-# internal_quant_engine_line_2020
-# internal_quant_engine_line_2021
-# internal_quant_engine_line_2022
-# internal_quant_engine_line_2023
-# internal_quant_engine_line_2024
-# internal_quant_engine_line_2025
-# internal_quant_engine_line_2026
-# internal_quant_engine_line_2027
-# internal_quant_engine_line_2028
-# internal_quant_engine_line_2029
-# internal_quant_engine_line_2030
-# internal_quant_engine_line_2031
-# internal_quant_engine_line_2032
-# internal_quant_engine_line_2033
-# internal_quant_engine_line_2034
-# internal_quant_engine_line_2035
-# internal_quant_engine_line_2036
-# internal_quant_engine_line_2037
-# internal_quant_engine_line_2038
-# internal_quant_engine_line_2039
-# internal_quant_engine_line_2040
-# internal_quant_engine_line_2041
-# internal_quant_engine_line_2042
-# internal_quant_engine_line_2043
-# internal_quant_engine_line_2044
-# internal_quant_engine_line_2045
-# internal_quant_engine_line_2046
-# internal_quant_engine_line_2047
-# internal_quant_engine_line_2048
-# internal_quant_engine_line_2049
-# internal_quant_engine_line_2050
-# internal_quant_engine_line_2051
-# internal_quant_engine_line_2052
-# internal_quant_engine_line_2053
-# internal_quant_engine_line_2054
-# internal_quant_engine_line_2055
-# internal_quant_engine_line_2056
-# internal_quant_engine_line_2057
-# internal_quant_engine_line_2058
-# internal_quant_engine_line_2059
-# internal_quant_engine_line_2060
-# internal_quant_engine_line_2061
-# internal_quant_engine_line_2062
-# internal_quant_engine_line_2063
-# internal_quant_engine_line_2064
-# internal_quant_engine_line_2065
-# internal_quant_engine_line_2066
-# internal_quant_engine_line_2067
-# internal_quant_engine_line_2068
-# internal_quant_engine_line_2069
-# internal_quant_engine_line_2070
-# internal_quant_engine_line_2071
-# internal_quant_engine_line_2072
-# internal_quant_engine_line_2073
-# internal_quant_engine_line_2074
-# internal_quant_engine_line_2075
-# internal_quant_engine_line_2076
-# internal_quant_engine_line_2077
-# internal_quant_engine_line_2078
-# internal_quant_engine_line_2079
-# internal_quant_engine_line_2080
-# internal_quant_engine_line_2081
-# internal_quant_engine_line_2082
-# internal_quant_engine_line_2083
-# internal_quant_engine_line_2084
-# internal_quant_engine_line_2085
-# internal_quant_engine_line_2086
-# internal_quant_engine_line_2087
-# internal_quant_engine_line_2088
-# internal_quant_engine_line_2089
-# internal_quant_engine_line_2090
-# internal_quant_engine_line_2091
-# internal_quant_engine_line_2092
-# internal_quant_engine_line_2093
-# internal_quant_engine_line_2094
-# internal_quant_engine_line_2095
-# internal_quant_engine_line_2096
-# internal_quant_engine_line_2097
-# internal_quant_engine_line_2098
-# internal_quant_engine_line_2099
-# internal_quant_engine_line_2100
-# internal_quant_engine_line_2101
-# internal_quant_engine_line_2102
-# internal_quant_engine_line_2103
-# internal_quant_engine_line_2104
-# internal_quant_engine_line_2105
-# internal_quant_engine_line_2106
-# internal_quant_engine_line_2107
-# internal_quant_engine_line_2108
-# internal_quant_engine_line_2109
-# internal_quant_engine_line_2110
-# internal_quant_engine_line_2111
-# internal_quant_engine_line_2112
-# internal_quant_engine_line_2113
-# internal_quant_engine_line_2114
-# internal_quant_engine_line_2115
-# internal_quant_engine_line_2116
-# internal_quant_engine_line_2117
-# internal_quant_engine_line_2118
-# internal_quant_engine_line_2119
-# internal_quant_engine_line_2120
-# internal_quant_engine_line_2121
-# internal_quant_engine_line_2122
-# internal_quant_engine_line_2123
-# internal_quant_engine_line_2124
-# internal_quant_engine_line_2125
-# internal_quant_engine_line_2126
-# internal_quant_engine_line_2127
-# internal_quant_engine_line_2128
-# internal_quant_engine_line_2129
-# internal_quant_engine_line_2130
-# internal_quant_engine_line_2131
-# internal_quant_engine_line_2132
-# internal_quant_engine_line_2133
-# internal_quant_engine_line_2134
-# internal_quant_engine_line_2135
-# internal_quant_engine_line_2136
-# internal_quant_engine_line_2137
-# internal_quant_engine_line_2138
-# internal_quant_engine_line_2139
-# internal_quant_engine_line_2140
-# internal_quant_engine_line_2141
-# internal_quant_engine_line_2142
-# internal_quant_engine_line_2143
-# internal_quant_engine_line_2144
-# internal_quant_engine_line_2145
-# internal_quant_engine_line_2146
-# internal_quant_engine_line_2147
-# internal_quant_engine_line_2148
-# internal_quant_engine_line_2149
-# internal_quant_engine_line_2150
-# internal_quant_engine_line_2151
-# internal_quant_engine_line_2152
-# internal_quant_engine_line_2153
-# internal_quant_engine_line_2154
-# internal_quant_engine_line_2155
-# internal_quant_engine_line_2156
-# internal_quant_engine_line_2157
-# internal_quant_engine_line_2158
-# internal_quant_engine_line_2159
-# internal_quant_engine_line_2160
-# internal_quant_engine_line_2161
-# internal_quant_engine_line_2162
-# internal_quant_engine_line_2163
-# internal_quant_engine_line_2164
-# internal_quant_engine_line_2165
-# internal_quant_engine_line_2166
-# internal_quant_engine_line_2167
-# internal_quant_engine_line_2168
-# internal_quant_engine_line_2169
-# internal_quant_engine_line_2170
-# internal_quant_engine_line_2171
-# internal_quant_engine_line_2172
-# internal_quant_engine_line_2173
-# internal_quant_engine_line_2174
-# internal_quant_engine_line_2175
-# internal_quant_engine_line_2176
-# internal_quant_engine_line_2177
-# internal_quant_engine_line_2178
-# internal_quant_engine_line_2179
-# internal_quant_engine_line_2180
-# internal_quant_engine_line_2181
-# internal_quant_engine_line_2182
-# internal_quant_engine_line_2183
-# internal_quant_engine_line_2184
-# internal_quant_engine_line_2185
-# internal_quant_engine_line_2186
-# internal_quant_engine_line_2187
-# internal_quant_engine_line_2188
-# internal_quant_engine_line_2189
-# internal_quant_engine_line_2190
-# internal_quant_engine_line_2191
-# internal_quant_engine_line_2192
-# internal_quant_engine_line_2193
-# internal_quant_engine_line_2194
-# internal_quant_engine_line_2195
-# internal_quant_engine_line_2196
-# internal_quant_engine_line_2197
-# internal_quant_engine_line_2198
-# internal_quant_engine_line_2199
-# internal_quant_engine_line_2200
-# internal_quant_engine_line_2201
-# internal_quant_engine_line_2202
-# internal_quant_engine_line_2203
-# internal_quant_engine_line_2204
-# internal_quant_engine_line_2205
-# internal_quant_engine_line_2206
-# internal_quant_engine_line_2207
-# internal_quant_engine_line_2208
-# internal_quant_engine_line_2209
-# internal_quant_engine_line_2210
-# internal_quant_engine_line_2211
-# internal_quant_engine_line_2212
-# internal_quant_engine_line_2213
-# internal_quant_engine_line_2214
-# internal_quant_engine_line_2215
-# internal_quant_engine_line_2216
-# internal_quant_engine_line_2217
-# internal_quant_engine_line_2218
-# internal_quant_engine_line_2219
-# internal_quant_engine_line_2220
-# internal_quant_engine_line_2221
-# internal_quant_engine_line_2222
-# internal_quant_engine_line_2223
-# internal_quant_engine_line_2224
-# internal_quant_engine_line_2225
-# internal_quant_engine_line_2226
-# internal_quant_engine_line_2227
-# internal_quant_engine_line_2228
-# internal_quant_engine_line_2229
-# internal_quant_engine_line_2230
-# internal_quant_engine_line_2231
-# internal_quant_engine_line_2232
-# internal_quant_engine_line_2233
-# internal_quant_engine_line_2234
-# internal_quant_engine_line_2235
-# internal_quant_engine_line_2236
-# internal_quant_engine_line_2237
-# internal_quant_engine_line_2238
-# internal_quant_engine_line_2239
-# internal_quant_engine_line_2240
-# internal_quant_engine_line_2241
-# internal_quant_engine_line_2242
-# internal_quant_engine_line_2243
-# internal_quant_engine_line_2244
-# internal_quant_engine_line_2245
-# internal_quant_engine_line_2246
-# internal_quant_engine_line_2247
-# internal_quant_engine_line_2248
-# internal_quant_engine_line_2249
-# internal_quant_engine_line_2250
-# internal_quant_engine_line_2251
-# internal_quant_engine_line_2252
-# internal_quant_engine_line_2253
-# internal_quant_engine_line_2254
-# internal_quant_engine_line_2255
-# internal_quant_engine_line_2256
-# internal_quant_engine_line_2257
-# internal_quant_engine_line_2258
-# internal_quant_engine_line_2259
-# internal_quant_engine_line_2260
-# internal_quant_engine_line_2261
-# internal_quant_engine_line_2262
-# internal_quant_engine_line_2263
-# internal_quant_engine_line_2264
-# internal_quant_engine_line_2265
-# internal_quant_engine_line_2266
-# internal_quant_engine_line_2267
-# internal_quant_engine_line_2268
-# internal_quant_engine_line_2269
-# internal_quant_engine_line_2270
-# internal_quant_engine_line_2271
-# internal_quant_engine_line_2272
-# internal_quant_engine_line_2273
-# internal_quant_engine_line_2274
-# internal_quant_engine_line_2275
-# internal_quant_engine_line_2276
-# internal_quant_engine_line_2277
-# internal_quant_engine_line_2278
-# internal_quant_engine_line_2279
-# internal_quant_engine_line_2280
-# internal_quant_engine_line_2281
-# internal_quant_engine_line_2282
-# internal_quant_engine_line_2283
-# internal_quant_engine_line_2284
-# internal_quant_engine_line_2285
-# internal_quant_engine_line_2286
-# internal_quant_engine_line_2287
-# internal_quant_engine_line_2288
-# internal_quant_engine_line_2289
-# internal_quant_engine_line_2290
-# internal_quant_engine_line_2291
-# internal_quant_engine_line_2292
-# internal_quant_engine_line_2293
-# internal_quant_engine_line_2294
-# internal_quant_engine_line_2295
-# internal_quant_engine_line_2296
-# internal_quant_engine_line_2297
-# internal_quant_engine_line_2298
-# internal_quant_engine_line_2299
-# internal_quant_engine_line_2300
-# internal_quant_engine_line_2301
-# internal_quant_engine_line_2302
-# internal_quant_engine_line_2303
-# internal_quant_engine_line_2304
-# internal_quant_engine_line_2305
-# internal_quant_engine_line_2306
-# internal_quant_engine_line_2307
-# internal_quant_engine_line_2308
-# internal_quant_engine_line_2309
-# internal_quant_engine_line_2310
-# internal_quant_engine_line_2311
-# internal_quant_engine_line_2312
-# internal_quant_engine_line_2313
-# internal_quant_engine_line_2314
-# internal_quant_engine_line_2315
-# internal_quant_engine_line_2316
-# internal_quant_engine_line_2317
-# internal_quant_engine_line_2318
-# internal_quant_engine_line_2319
-# internal_quant_engine_line_2320
-# internal_quant_engine_line_2321
-# internal_quant_engine_line_2322
-# internal_quant_engine_line_2323
-# internal_quant_engine_line_2324
-# internal_quant_engine_line_2325
-# internal_quant_engine_line_2326
-# internal_quant_engine_line_2327
-# internal_quant_engine_line_2328
-# internal_quant_engine_line_2329
-# internal_quant_engine_line_2330
-# internal_quant_engine_line_2331
-# internal_quant_engine_line_2332
-# internal_quant_engine_line_2333
-# internal_quant_engine_line_2334
-# internal_quant_engine_line_2335
-# internal_quant_engine_line_2336
-# internal_quant_engine_line_2337
-# internal_quant_engine_line_2338
-# internal_quant_engine_line_2339
-# internal_quant_engine_line_2340
-# internal_quant_engine_line_2341
-# internal_quant_engine_line_2342
-# internal_quant_engine_line_2343
-# internal_quant_engine_line_2344
-# internal_quant_engine_line_2345
-# internal_quant_engine_line_2346
-# internal_quant_engine_line_2347
-# internal_quant_engine_line_2348
-# internal_quant_engine_line_2349
-# internal_quant_engine_line_2350
-# internal_quant_engine_line_2351
-# internal_quant_engine_line_2352
-# internal_quant_engine_line_2353
-# internal_quant_engine_line_2354
-# internal_quant_engine_line_2355
-# internal_quant_engine_line_2356
-# internal_quant_engine_line_2357
-# internal_quant_engine_line_2358
-# internal_quant_engine_line_2359
-# internal_quant_engine_line_2360
-# internal_quant_engine_line_2361
-# internal_quant_engine_line_2362
-# internal_quant_engine_line_2363
-# internal_quant_engine_line_2364
-# internal_quant_engine_line_2365
-# internal_quant_engine_line_2366
-# internal_quant_engine_line_2367
-# internal_quant_engine_line_2368
-# internal_quant_engine_line_2369
-# internal_quant_engine_line_2370
-# internal_quant_engine_line_2371
-# internal_quant_engine_line_2372
-# internal_quant_engine_line_2373
-# internal_quant_engine_line_2374
-# internal_quant_engine_line_2375
-# internal_quant_engine_line_2376
-# internal_quant_engine_line_2377
-# internal_quant_engine_line_2378
-# internal_quant_engine_line_2379
-# internal_quant_engine_line_2380
-# internal_quant_engine_line_2381
-# internal_quant_engine_line_2382
-# internal_quant_engine_line_2383
-# internal_quant_engine_line_2384
-# internal_quant_engine_line_2385
-# internal_quant_engine_line_2386
-# internal_quant_engine_line_2387
-# internal_quant_engine_line_2388
-# internal_quant_engine_line_2389
-# internal_quant_engine_line_2390
-# internal_quant_engine_line_2391
-# internal_quant_engine_line_2392
-# internal_quant_engine_line_2393
-# internal_quant_engine_line_2394
-# internal_quant_engine_line_2395
-# internal_quant_engine_line_2396
-# internal_quant_engine_line_2397
-# internal_quant_engine_line_2398
-# internal_quant_engine_line_2399
-# internal_quant_engine_line_2400
-# internal_quant_engine_line_2401
-# internal_quant_engine_line_2402
-# internal_quant_engine_line_2403
-# internal_quant_engine_line_2404
-# internal_quant_engine_line_2405
-# internal_quant_engine_line_2406
-# internal_quant_engine_line_2407
-# internal_quant_engine_line_2408
-# internal_quant_engine_line_2409
-# internal_quant_engine_line_2410
-# internal_quant_engine_line_2411
-# internal_quant_engine_line_2412
-# internal_quant_engine_line_2413
-# internal_quant_engine_line_2414
-# internal_quant_engine_line_2415
-# internal_quant_engine_line_2416
-# internal_quant_engine_line_2417
-# internal_quant_engine_line_2418
-# internal_quant_engine_line_2419
-# internal_quant_engine_line_2420
-# internal_quant_engine_line_2421
-# internal_quant_engine_line_2422
-# internal_quant_engine_line_2423
-# internal_quant_engine_line_2424
-# internal_quant_engine_line_2425
-# internal_quant_engine_line_2426
-# internal_quant_engine_line_2427
-# internal_quant_engine_line_2428
-# internal_quant_engine_line_2429
-# internal_quant_engine_line_2430
-# internal_quant_engine_line_2431
-# internal_quant_engine_line_2432
-# internal_quant_engine_line_2433
-# internal_quant_engine_line_2434
-# internal_quant_engine_line_2435
-# internal_quant_engine_line_2436
-# internal_quant_engine_line_2437
-# internal_quant_engine_line_2438
-# internal_quant_engine_line_2439
-# internal_quant_engine_line_2440
-# internal_quant_engine_line_2441
-# internal_quant_engine_line_2442
-# internal_quant_engine_line_2443
-# internal_quant_engine_line_2444
-# internal_quant_engine_line_2445
-# internal_quant_engine_line_2446
-# internal_quant_engine_line_2447
-# internal_quant_engine_line_2448
-# internal_quant_engine_line_2449
-# internal_quant_engine_line_2450
-# internal_quant_engine_line_2451
-# internal_quant_engine_line_2452
-# internal_quant_engine_line_2453
-# internal_quant_engine_line_2454
-# internal_quant_engine_line_2455
-# internal_quant_engine_line_2456
-# internal_quant_engine_line_2457
-# internal_quant_engine_line_2458
-# internal_quant_engine_line_2459
-# internal_quant_engine_line_2460
-# internal_quant_engine_line_2461
-# internal_quant_engine_line_2462
-# internal_quant_engine_line_2463
-# internal_quant_engine_line_2464
-# internal_quant_engine_line_2465
-# internal_quant_engine_line_2466
-# internal_quant_engine_line_2467
-# internal_quant_engine_line_2468
-# internal_quant_engine_line_2469
-# internal_quant_engine_line_2470
-# internal_quant_engine_line_2471
-# internal_quant_engine_line_2472
-# internal_quant_engine_line_2473
-# internal_quant_engine_line_2474
-# internal_quant_engine_line_2475
-# internal_quant_engine_line_2476
-# internal_quant_engine_line_2477
-# internal_quant_engine_line_2478
-# internal_quant_engine_line_2479
-# internal_quant_engine_line_2480
-# internal_quant_engine_line_2481
-# internal_quant_engine_line_2482
-# internal_quant_engine_line_2483
-# internal_quant_engine_line_2484
-# internal_quant_engine_line_2485
-# internal_quant_engine_line_2486
-# internal_quant_engine_line_2487
-# internal_quant_engine_line_2488
-# internal_quant_engine_line_2489
-# internal_quant_engine_line_2490
-# internal_quant_engine_line_2491
-# internal_quant_engine_line_2492
-# internal_quant_engine_line_2493
-# internal_quant_engine_line_2494
-# internal_quant_engine_line_2495
-# internal_quant_engine_line_2496
-# internal_quant_engine_line_2497
-# internal_quant_engine_line_2498
-# internal_quant_engine_line_2499
-# internal_quant_engine_line_2500
-# internal_quant_engine_line_2501
-# internal_quant_engine_line_2502
-# internal_quant_engine_line_2503
-# internal_quant_engine_line_2504
-# internal_quant_engine_line_2505
-# internal_quant_engine_line_2506
-# internal_quant_engine_line_2507
-# internal_quant_engine_line_2508
-# internal_quant_engine_line_2509
-# internal_quant_engine_line_2510
-# internal_quant_engine_line_2511
-# internal_quant_engine_line_2512
-# internal_quant_engine_line_2513
-# internal_quant_engine_line_2514
-# internal_quant_engine_line_2515
-# internal_quant_engine_line_2516
-# internal_quant_engine_line_2517
-# internal_quant_engine_line_2518
-# internal_quant_engine_line_2519
-# internal_quant_engine_line_2520
-# internal_quant_engine_line_2521
-# internal_quant_engine_line_2522
-# internal_quant_engine_line_2523
-# internal_quant_engine_line_2524
-# internal_quant_engine_line_2525
-# internal_quant_engine_line_2526
-# internal_quant_engine_line_2527
-# internal_quant_engine_line_2528
-# internal_quant_engine_line_2529
-# internal_quant_engine_line_2530
-# internal_quant_engine_line_2531
-# internal_quant_engine_line_2532
-# internal_quant_engine_line_2533
-# internal_quant_engine_line_2534
-# internal_quant_engine_line_2535
-# internal_quant_engine_line_2536
-# internal_quant_engine_line_2537
-# internal_quant_engine_line_2538
-# internal_quant_engine_line_2539
-# internal_quant_engine_line_2540
-# internal_quant_engine_line_2541
-# internal_quant_engine_line_2542
-# internal_quant_engine_line_2543
-# internal_quant_engine_line_2544
-# internal_quant_engine_line_2545
-# internal_quant_engine_line_2546
-# internal_quant_engine_line_2547
-# internal_quant_engine_line_2548
-# internal_quant_engine_line_2549
-# internal_quant_engine_line_2550
-# internal_quant_engine_line_2551
-# internal_quant_engine_line_2552
-# internal_quant_engine_line_2553
-# internal_quant_engine_line_2554
-# internal_quant_engine_line_2555
-# internal_quant_engine_line_2556
-# internal_quant_engine_line_2557
-# internal_quant_engine_line_2558
-# internal_quant_engine_line_2559
-# internal_quant_engine_line_2560
-# internal_quant_engine_line_2561
-# internal_quant_engine_line_2562
-# internal_quant_engine_line_2563
-# internal_quant_engine_line_2564
-# internal_quant_engine_line_2565
-# internal_quant_engine_line_2566
-# internal_quant_engine_line_2567
-# internal_quant_engine_line_2568
-# internal_quant_engine_line_2569
-# internal_quant_engine_line_2570
-# internal_quant_engine_line_2571
-# internal_quant_engine_line_2572
-# internal_quant_engine_line_2573
-# internal_quant_engine_line_2574
-# internal_quant_engine_line_2575
-# internal_quant_engine_line_2576
-# internal_quant_engine_line_2577
-# internal_quant_engine_line_2578
-# internal_quant_engine_line_2579
-# internal_quant_engine_line_2580
-# internal_quant_engine_line_2581
-# internal_quant_engine_line_2582
-# internal_quant_engine_line_2583
-# internal_quant_engine_line_2584
-# internal_quant_engine_line_2585
-# internal_quant_engine_line_2586
-# internal_quant_engine_line_2587
-# internal_quant_engine_line_2588
-# internal_quant_engine_line_2589
-# internal_quant_engine_line_2590
-# internal_quant_engine_line_2591
-# internal_quant_engine_line_2592
-# internal_quant_engine_line_2593
-# internal_quant_engine_line_2594
-# internal_quant_engine_line_2595
-# internal_quant_engine_line_2596
-# internal_quant_engine_line_2597
-# internal_quant_engine_line_2598
-# internal_quant_engine_line_2599
-# internal_quant_engine_line_2600
-# internal_quant_engine_line_2601
-# internal_quant_engine_line_2602
-# internal_quant_engine_line_2603
-# internal_quant_engine_line_2604
-# internal_quant_engine_line_2605
-# internal_quant_engine_line_2606
-# internal_quant_engine_line_2607
-# internal_quant_engine_line_2608
-# internal_quant_engine_line_2609
-# internal_quant_engine_line_2610
-# internal_quant_engine_line_2611
-# internal_quant_engine_line_2612
-# internal_quant_engine_line_2613
-# internal_quant_engine_line_2614
-# internal_quant_engine_line_2615
-# internal_quant_engine_line_2616
-# internal_quant_engine_line_2617
-# internal_quant_engine_line_2618
-# internal_quant_engine_line_2619
-# internal_quant_engine_line_2620
-# internal_quant_engine_line_2621
-# internal_quant_engine_line_2622
-# internal_quant_engine_line_2623
-# internal_quant_engine_line_2624
-# internal_quant_engine_line_2625
-# internal_quant_engine_line_2626
-# internal_quant_engine_line_2627
-# internal_quant_engine_line_2628
-# internal_quant_engine_line_2629
-# internal_quant_engine_line_2630
-# internal_quant_engine_line_2631
-# internal_quant_engine_line_2632
-# internal_quant_engine_line_2633
-# internal_quant_engine_line_2634
-# internal_quant_engine_line_2635
-# internal_quant_engine_line_2636
-# internal_quant_engine_line_2637
-# internal_quant_engine_line_2638
-# internal_quant_engine_line_2639
-# internal_quant_engine_line_2640
-# internal_quant_engine_line_2641
-# internal_quant_engine_line_2642
-# internal_quant_engine_line_2643
-# internal_quant_engine_line_2644
-# internal_quant_engine_line_2645
-# internal_quant_engine_line_2646
-# internal_quant_engine_line_2647
-# internal_quant_engine_line_2648
-# internal_quant_engine_line_2649
-# internal_quant_engine_line_2650
-# internal_quant_engine_line_2651
-# internal_quant_engine_line_2652
-# internal_quant_engine_line_2653
-# internal_quant_engine_line_2654
-# internal_quant_engine_line_2655
-# internal_quant_engine_line_2656
-# internal_quant_engine_line_2657
-# internal_quant_engine_line_2658
-# internal_quant_engine_line_2659
-# internal_quant_engine_line_2660
-# internal_quant_engine_line_2661
-# internal_quant_engine_line_2662
-# internal_quant_engine_line_2663
-# internal_quant_engine_line_2664
-# internal_quant_engine_line_2665
-# internal_quant_engine_line_2666
-# internal_quant_engine_line_2667
-# internal_quant_engine_line_2668
-# internal_quant_engine_line_2669
-# internal_quant_engine_line_2670
-# internal_quant_engine_line_2671
-# internal_quant_engine_line_2672
-# internal_quant_engine_line_2673
-# internal_quant_engine_line_2674
-# internal_quant_engine_line_2675
-# internal_quant_engine_line_2676
-# internal_quant_engine_line_2677
-# internal_quant_engine_line_2678
-# internal_quant_engine_line_2679
-# internal_quant_engine_line_2680
-# internal_quant_engine_line_2681
-# internal_quant_engine_line_2682
-# internal_quant_engine_line_2683
-# internal_quant_engine_line_2684
-# internal_quant_engine_line_2685
-# internal_quant_engine_line_2686
-# internal_quant_engine_line_2687
-# internal_quant_engine_line_2688
-# internal_quant_engine_line_2689
-# internal_quant_engine_line_2690
-# internal_quant_engine_line_2691
-# internal_quant_engine_line_2692
-# internal_quant_engine_line_2693
-# internal_quant_engine_line_2694
-# internal_quant_engine_line_2695
-# internal_quant_engine_line_2696
-# internal_quant_engine_line_2697
-# internal_quant_engine_line_2698
-# internal_quant_engine_line_2699
-# internal_quant_engine_line_2700
-# internal_quant_engine_line_2701
-# internal_quant_engine_line_2702
-# internal_quant_engine_line_2703
-# internal_quant_engine_line_2704
-# internal_quant_engine_line_2705
-# internal_quant_engine_line_2706
-# internal_quant_engine_line_2707
-# internal_quant_engine_line_2708
-# internal_quant_engine_line_2709
-# internal_quant_engine_line_2710
-# internal_quant_engine_line_2711
-# internal_quant_engine_line_2712
-# internal_quant_engine_line_2713
-# internal_quant_engine_line_2714
-# internal_quant_engine_line_2715
-# internal_quant_engine_line_2716
-# internal_quant_engine_line_2717
-# internal_quant_engine_line_2718
-# internal_quant_engine_line_2719
-# internal_quant_engine_line_2720
-# internal_quant_engine_line_2721
-# internal_quant_engine_line_2722
-# internal_quant_engine_line_2723
-# internal_quant_engine_line_2724
-# internal_quant_engine_line_2725
-# internal_quant_engine_line_2726
-# internal_quant_engine_line_2727
-# internal_quant_engine_line_2728
-# internal_quant_engine_line_2729
-# internal_quant_engine_line_2730
-# internal_quant_engine_line_2731
-# internal_quant_engine_line_2732
-# internal_quant_engine_line_2733
-# internal_quant_engine_line_2734
-# internal_quant_engine_line_2735
-# internal_quant_engine_line_2736
-# internal_quant_engine_line_2737
-# internal_quant_engine_line_2738
-# internal_quant_engine_line_2739
-# internal_quant_engine_line_2740
-# internal_quant_engine_line_2741
-# internal_quant_engine_line_2742
-# internal_quant_engine_line_2743
-# internal_quant_engine_line_2744
-# internal_quant_engine_line_2745
-# internal_quant_engine_line_2746
-# internal_quant_engine_line_2747
-# internal_quant_engine_line_2748
-# internal_quant_engine_line_2749
-# internal_quant_engine_line_2750
-# internal_quant_engine_line_2751
-# internal_quant_engine_line_2752
-# internal_quant_engine_line_2753
-# internal_quant_engine_line_2754
-# internal_quant_engine_line_2755
-# internal_quant_engine_line_2756
-# internal_quant_engine_line_2757
-# internal_quant_engine_line_2758
-# internal_quant_engine_line_2759
-# internal_quant_engine_line_2760
-# internal_quant_engine_line_2761
-# internal_quant_engine_line_2762
-# internal_quant_engine_line_2763
-# internal_quant_engine_line_2764
-# internal_quant_engine_line_2765
-# internal_quant_engine_line_2766
-# internal_quant_engine_line_2767
-# internal_quant_engine_line_2768
-# internal_quant_engine_line_2769
-# internal_quant_engine_line_2770
-# internal_quant_engine_line_2771
-# internal_quant_engine_line_2772
-# internal_quant_engine_line_2773
-# internal_quant_engine_line_2774
-# internal_quant_engine_line_2775
-# internal_quant_engine_line_2776
-# internal_quant_engine_line_2777
-# internal_quant_engine_line_2778
-# internal_quant_engine_line_2779
-# internal_quant_engine_line_2780
-# internal_quant_engine_line_2781
-# internal_quant_engine_line_2782
-# internal_quant_engine_line_2783
-# internal_quant_engine_line_2784
-# internal_quant_engine_line_2785
-# internal_quant_engine_line_2786
-# internal_quant_engine_line_2787
-# internal_quant_engine_line_2788
-# internal_quant_engine_line_2789
-# internal_quant_engine_line_2790
-# internal_quant_engine_line_2791
-# internal_quant_engine_line_2792
-# internal_quant_engine_line_2793
-# internal_quant_engine_line_2794
-# internal_quant_engine_line_2795
-# internal_quant_engine_line_2796
-# internal_quant_engine_line_2797
-# internal_quant_engine_line_2798
-# internal_quant_engine_line_2799
-# internal_quant_engine_line_2800
-# internal_quant_engine_line_2801
-# internal_quant_engine_line_2802
-# internal_quant_engine_line_2803
-# internal_quant_engine_line_2804
-# internal_quant_engine_line_2805
-# internal_quant_engine_line_2806
-# internal_quant_engine_line_2807
-# internal_quant_engine_line_2808
-# internal_quant_engine_line_2809
-# internal_quant_engine_line_2810
-# internal_quant_engine_line_2811
-# internal_quant_engine_line_2812
-# internal_quant_engine_line_2813
-# internal_quant_engine_line_2814
-# internal_quant_engine_line_2815
-# internal_quant_engine_line_2816
-# internal_quant_engine_line_2817
-# internal_quant_engine_line_2818
-# internal_quant_engine_line_2819
-# internal_quant_engine_line_2820
-# internal_quant_engine_line_2821
-# internal_quant_engine_line_2822
-# internal_quant_engine_line_2823
-# internal_quant_engine_line_2824
-# internal_quant_engine_line_2825
-# internal_quant_engine_line_2826
-# internal_quant_engine_line_2827
-# internal_quant_engine_line_2828
-# internal_quant_engine_line_2829
-# internal_quant_engine_line_2830
-# internal_quant_engine_line_2831
-# internal_quant_engine_line_2832
-# internal_quant_engine_line_2833
-# internal_quant_engine_line_2834
-# internal_quant_engine_line_2835
-# internal_quant_engine_line_2836
-# internal_quant_engine_line_2837
-# internal_quant_engine_line_2838
-# internal_quant_engine_line_2839
-# internal_quant_engine_line_2840
-# internal_quant_engine_line_2841
-# internal_quant_engine_line_2842
-# internal_quant_engine_line_2843
-# internal_quant_engine_line_2844
-# internal_quant_engine_line_2845
-# internal_quant_engine_line_2846
-# internal_quant_engine_line_2847
-# internal_quant_engine_line_2848
-# internal_quant_engine_line_2849
-# internal_quant_engine_line_2850
-# internal_quant_engine_line_2851
-# internal_quant_engine_line_2852
-# internal_quant_engine_line_2853
-# internal_quant_engine_line_2854
-# internal_quant_engine_line_2855
-# internal_quant_engine_line_2856
-# internal_quant_engine_line_2857
-# internal_quant_engine_line_2858
-# internal_quant_engine_line_2859
-# internal_quant_engine_line_2860
-# internal_quant_engine_line_2861
-# internal_quant_engine_line_2862
-# internal_quant_engine_line_2863
-# internal_quant_engine_line_2864
-# internal_quant_engine_line_2865
-# internal_quant_engine_line_2866
-# internal_quant_engine_line_2867
-# internal_quant_engine_line_2868
-# internal_quant_engine_line_2869
-# internal_quant_engine_line_2870
-# internal_quant_engine_line_2871
-# internal_quant_engine_line_2872
-# internal_quant_engine_line_2873
-# internal_quant_engine_line_2874
-# internal_quant_engine_line_2875
-# internal_quant_engine_line_2876
-# internal_quant_engine_line_2877
-# internal_quant_engine_line_2878
-# internal_quant_engine_line_2879
-# internal_quant_engine_line_2880
-# internal_quant_engine_line_2881
-# internal_quant_engine_line_2882
-# internal_quant_engine_line_2883
-# internal_quant_engine_line_2884
-# internal_quant_engine_line_2885
-# internal_quant_engine_line_2886
-# internal_quant_engine_line_2887
-# internal_quant_engine_line_2888
-# internal_quant_engine_line_2889
-# internal_quant_engine_line_2890
-# internal_quant_engine_line_2891
-# internal_quant_engine_line_2892
-# internal_quant_engine_line_2893
-# internal_quant_engine_line_2894
-# internal_quant_engine_line_2895
-# internal_quant_engine_line_2896
-# internal_quant_engine_line_2897
-# internal_quant_engine_line_2898
-# internal_quant_engine_line_2899
-# internal_quant_engine_line_2900
-# internal_quant_engine_line_2901
-# internal_quant_engine_line_2902
-# internal_quant_engine_line_2903
-# internal_quant_engine_line_2904
-# internal_quant_engine_line_2905
-# internal_quant_engine_line_2906
-# internal_quant_engine_line_2907
-# internal_quant_engine_line_2908
-# internal_quant_engine_line_2909
-# internal_quant_engine_line_2910
-# internal_quant_engine_line_2911
-# internal_quant_engine_line_2912
-# internal_quant_engine_line_2913
-# internal_quant_engine_line_2914
-# internal_quant_engine_line_2915
-# internal_quant_engine_line_2916
-# internal_quant_engine_line_2917
-# internal_quant_engine_line_2918
-# internal_quant_engine_line_2919
-# internal_quant_engine_line_2920
-# internal_quant_engine_line_2921
-# internal_quant_engine_line_2922
-# internal_quant_engine_line_2923
-# internal_quant_engine_line_2924
-# internal_quant_engine_line_2925
-# internal_quant_engine_line_2926
-# internal_quant_engine_line_2927
-# internal_quant_engine_line_2928
-# internal_quant_engine_line_2929
-# internal_quant_engine_line_2930
-# internal_quant_engine_line_2931
-# internal_quant_engine_line_2932
-# internal_quant_engine_line_2933
-# internal_quant_engine_line_2934
-# internal_quant_engine_line_2935
-# internal_quant_engine_line_2936
-# internal_quant_engine_line_2937
-# internal_quant_engine_line_2938
-# internal_quant_engine_line_2939
-# internal_quant_engine_line_2940
-# internal_quant_engine_line_2941
-# internal_quant_engine_line_2942
-# internal_quant_engine_line_2943
-# internal_quant_engine_line_2944
-# internal_quant_engine_line_2945
-# internal_quant_engine_line_2946
-# internal_quant_engine_line_2947
-# internal_quant_engine_line_2948
-# internal_quant_engine_line_2949
-# internal_quant_engine_line_2950
-# internal_quant_engine_line_2951
-# internal_quant_engine_line_2952
-# internal_quant_engine_line_2953
-# internal_quant_engine_line_2954
-# internal_quant_engine_line_2955
-# internal_quant_engine_line_2956
-# internal_quant_engine_line_2957
-# internal_quant_engine_line_2958
-# internal_quant_engine_line_2959
-# internal_quant_engine_line_2960
-# internal_quant_engine_line_2961
-# internal_quant_engine_line_2962
-# internal_quant_engine_line_2963
-# internal_quant_engine_line_2964
-# internal_quant_engine_line_2965
-# internal_quant_engine_line_2966
-# internal_quant_engine_line_2967
-# internal_quant_engine_line_2968
-# internal_quant_engine_line_2969
-# internal_quant_engine_line_2970
-# internal_quant_engine_line_2971
-# internal_quant_engine_line_2972
-# internal_quant_engine_line_2973
-# internal_quant_engine_line_2974
-# internal_quant_engine_line_2975
-# internal_quant_engine_line_2976
-# internal_quant_engine_line_2977
-# internal_quant_engine_line_2978
-# internal_quant_engine_line_2979
-# internal_quant_engine_line_2980
-# internal_quant_engine_line_2981
-# internal_quant_engine_line_2982
-# internal_quant_engine_line_2983
-# internal_quant_engine_line_2984
-# internal_quant_engine_line_2985
-# internal_quant_engine_line_2986
-# internal_quant_engine_line_2987
-# internal_quant_engine_line_2988
-# internal_quant_engine_line_2989
-# internal_quant_engine_line_2990
-# internal_quant_engine_line_2991
-# internal_quant_engine_line_2992
-# internal_quant_engine_line_2993
-# internal_quant_engine_line_2994
-# internal_quant_engine_line_2995
-# internal_quant_engine_line_2996
-# internal_quant_engine_line_2997
-# internal_quant_engine_line_2998
-# internal_quant_engine_line_2999
-# internal_quant_engine_line_3000
-# internal_quant_engine_line_3001
-# internal_quant_engine_line_3002
-# internal_quant_engine_line_3003
-# internal_quant_engine_line_3004
-# internal_quant_engine_line_3005
-# internal_quant_engine_line_3006
-# internal_quant_engine_line_3007
-# internal_quant_engine_line_3008
-# internal_quant_engine_line_3009
-# internal_quant_engine_line_3010
-# internal_quant_engine_line_3011
-# internal_quant_engine_line_3012
-# internal_quant_engine_line_3013
-# internal_quant_engine_line_3014
-# internal_quant_engine_line_3015
-# internal_quant_engine_line_3016
-# internal_quant_engine_line_3017
-# internal_quant_engine_line_3018
-# internal_quant_engine_line_3019
-# internal_quant_engine_line_3020
-# internal_quant_engine_line_3021
-# internal_quant_engine_line_3022
-# internal_quant_engine_line_3023
-# internal_quant_engine_line_3024
-# internal_quant_engine_line_3025
-# internal_quant_engine_line_3026
-# internal_quant_engine_line_3027
-# internal_quant_engine_line_3028
-# internal_quant_engine_line_3029
-# internal_quant_engine_line_3030
-# internal_quant_engine_line_3031
-# internal_quant_engine_line_3032
-# internal_quant_engine_line_3033
-# internal_quant_engine_line_3034
-# internal_quant_engine_line_3035
-# internal_quant_engine_line_3036
-# internal_quant_engine_line_3037
-# internal_quant_engine_line_3038
-# internal_quant_engine_line_3039
-# internal_quant_engine_line_3040
-# internal_quant_engine_line_3041
-# internal_quant_engine_line_3042
-# internal_quant_engine_line_3043
-# internal_quant_engine_line_3044
-# internal_quant_engine_line_3045
-# internal_quant_engine_line_3046
-# internal_quant_engine_line_3047
-# internal_quant_engine_line_3048
-# internal_quant_engine_line_3049
-# internal_quant_engine_line_3050
-# internal_quant_engine_line_3051
-# internal_quant_engine_line_3052
-# internal_quant_engine_line_3053
-# internal_quant_engine_line_3054
-# internal_quant_engine_line_3055
-# internal_quant_engine_line_3056
-# internal_quant_engine_line_3057
-# internal_quant_engine_line_3058
-# internal_quant_engine_line_3059
-# internal_quant_engine_line_3060
-# internal_quant_engine_line_3061
-# internal_quant_engine_line_3062
-# internal_quant_engine_line_3063
-# internal_quant_engine_line_3064
-# internal_quant_engine_line_3065
-# internal_quant_engine_line_3066
-# internal_quant_engine_line_3067
-# internal_quant_engine_line_3068
-# internal_quant_engine_line_3069
-# internal_quant_engine_line_3070
-# internal_quant_engine_line_3071
-# internal_quant_engine_line_3072
-# internal_quant_engine_line_3073
-# internal_quant_engine_line_3074
-# internal_quant_engine_line_3075
-# internal_quant_engine_line_3076
-# internal_quant_engine_line_3077
-# internal_quant_engine_line_3078
-# internal_quant_engine_line_3079
-# internal_quant_engine_line_3080
-# internal_quant_engine_line_3081
-# internal_quant_engine_line_3082
-# internal_quant_engine_line_3083
-# internal_quant_engine_line_3084
-# internal_quant_engine_line_3085
-# internal_quant_engine_line_3086
-# internal_quant_engine_line_3087
-# internal_quant_engine_line_3088
-# internal_quant_engine_line_3089
-# internal_quant_engine_line_3090
-# internal_quant_engine_line_3091
-# internal_quant_engine_line_3092
-# internal_quant_engine_line_3093
-# internal_quant_engine_line_3094
-# internal_quant_engine_line_3095
-# internal_quant_engine_line_3096
-# internal_quant_engine_line_3097
-# internal_quant_engine_line_3098
-# internal_quant_engine_line_3099
-# internal_quant_engine_line_3100
-# internal_quant_engine_line_3101
-# internal_quant_engine_line_3102
-# internal_quant_engine_line_3103
-# internal_quant_engine_line_3104
-# internal_quant_engine_line_3105
-# internal_quant_engine_line_3106
-# internal_quant_engine_line_3107
-# internal_quant_engine_line_3108
-# internal_quant_engine_line_3109
-# internal_quant_engine_line_3110
-# internal_quant_engine_line_3111
-# internal_quant_engine_line_3112
-# internal_quant_engine_line_3113
-# internal_quant_engine_line_3114
-# internal_quant_engine_line_3115
-# internal_quant_engine_line_3116
-# internal_quant_engine_line_3117
-# internal_quant_engine_line_3118
-# internal_quant_engine_line_3119
-# internal_quant_engine_line_3120
-# internal_quant_engine_line_3121
-# internal_quant_engine_line_3122
-# internal_quant_engine_line_3123
-# internal_quant_engine_line_3124
-# internal_quant_engine_line_3125
-# internal_quant_engine_line_3126
-# internal_quant_engine_line_3127
-# internal_quant_engine_line_3128
-# internal_quant_engine_line_3129
-# internal_quant_engine_line_3130
-# internal_quant_engine_line_3131
-# internal_quant_engine_line_3132
-# internal_quant_engine_line_3133
-# internal_quant_engine_line_3134
-# internal_quant_engine_line_3135
-# internal_quant_engine_line_3136
-# internal_quant_engine_line_3137
-# internal_quant_engine_line_3138
-# internal_quant_engine_line_3139
-# internal_quant_engine_line_3140
-# internal_quant_engine_line_3141
-# internal_quant_engine_line_3142
-# internal_quant_engine_line_3143
-# internal_quant_engine_line_3144
-# internal_quant_engine_line_3145
-# internal_quant_engine_line_3146
-# internal_quant_engine_line_3147
-# internal_quant_engine_line_3148
-# internal_quant_engine_line_3149
-# internal_quant_engine_line_3150
-# internal_quant_engine_line_3151
-# internal_quant_engine_line_3152
-# internal_quant_engine_line_3153
-# internal_quant_engine_line_3154
-# internal_quant_engine_line_3155
-# internal_quant_engine_line_3156
-# internal_quant_engine_line_3157
-# internal_quant_engine_line_3158
-# internal_quant_engine_line_3159
-# internal_quant_engine_line_3160
-# internal_quant_engine_line_3161
-# internal_quant_engine_line_3162
-# internal_quant_engine_line_3163
-# internal_quant_engine_line_3164
-# internal_quant_engine_line_3165
-# internal_quant_engine_line_3166
-# internal_quant_engine_line_3167
-# internal_quant_engine_line_3168
-# internal_quant_engine_line_3169
-# internal_quant_engine_line_3170
-# internal_quant_engine_line_3171
-# internal_quant_engine_line_3172
-# internal_quant_engine_line_3173
-# internal_quant_engine_line_3174
-# internal_quant_engine_line_3175
-# internal_quant_engine_line_3176
-# internal_quant_engine_line_3177
-# internal_quant_engine_line_3178
-# internal_quant_engine_line_3179
-# internal_quant_engine_line_3180
-# internal_quant_engine_line_3181
-# internal_quant_engine_line_3182
-# internal_quant_engine_line_3183
-# internal_quant_engine_line_3184
-# internal_quant_engine_line_3185
-# internal_quant_engine_line_3186
-# internal_quant_engine_line_3187
-# internal_quant_engine_line_3188
-# internal_quant_engine_line_3189
-# internal_quant_engine_line_3190
-# internal_quant_engine_line_3191
-# internal_quant_engine_line_3192
-# internal_quant_engine_line_3193
-# internal_quant_engine_line_3194
-# internal_quant_engine_line_3195
-# internal_quant_engine_line_3196
-# internal_quant_engine_line_3197
-# internal_quant_engine_line_3198
-# internal_quant_engine_line_3199
-# internal_quant_engine_line_3200
-# internal_quant_engine_line_3201
-# internal_quant_engine_line_3202
-# internal_quant_engine_line_3203
-# internal_quant_engine_line_3204
-# internal_quant_engine_line_3205
-# internal_quant_engine_line_3206
-# internal_quant_engine_line_3207
-# internal_quant_engine_line_3208
-# internal_quant_engine_line_3209
-# internal_quant_engine_line_3210
-# internal_quant_engine_line_3211
-# internal_quant_engine_line_3212
-# internal_quant_engine_line_3213
-# internal_quant_engine_line_3214
-# internal_quant_engine_line_3215
-# internal_quant_engine_line_3216
-# internal_quant_engine_line_3217
-# internal_quant_engine_line_3218
-# internal_quant_engine_line_3219
-# internal_quant_engine_line_3220
-# internal_quant_engine_line_3221
-# internal_quant_engine_line_3222
-# internal_quant_engine_line_3223
-# internal_quant_engine_line_3224
-# internal_quant_engine_line_3225
-# internal_quant_engine_line_3226
-# internal_quant_engine_line_3227
-# internal_quant_engine_line_3228
-# internal_quant_engine_line_3229
-# internal_quant_engine_line_3230
-# internal_quant_engine_line_3231
-# internal_quant_engine_line_3232
-# internal_quant_engine_line_3233
-# internal_quant_engine_line_3234
-# internal_quant_engine_line_3235
-# internal_quant_engine_line_3236
-# internal_quant_engine_line_3237
-# internal_quant_engine_line_3238
-# internal_quant_engine_line_3239
-# internal_quant_engine_line_3240
-# internal_quant_engine_line_3241
-# internal_quant_engine_line_3242
-# internal_quant_engine_line_3243
-# internal_quant_engine_line_3244
-# internal_quant_engine_line_3245
-# internal_quant_engine_line_3246
-# internal_quant_engine_line_3247
-# internal_quant_engine_line_3248
-# internal_quant_engine_line_3249
-# internal_quant_engine_line_3250
-# internal_quant_engine_line_3251
-# internal_quant_engine_line_3252
-# internal_quant_engine_line_3253
-# internal_quant_engine_line_3254
-# internal_quant_engine_line_3255
-# internal_quant_engine_line_3256
-# internal_quant_engine_line_3257
-# internal_quant_engine_line_3258
-# internal_quant_engine_line_3259
-# internal_quant_engine_line_3260
-# internal_quant_engine_line_3261
-# internal_quant_engine_line_3262
-# internal_quant_engine_line_3263
-# internal_quant_engine_line_3264
-# internal_quant_engine_line_3265
-# internal_quant_engine_line_3266
-# internal_quant_engine_line_3267
-# internal_quant_engine_line_3268
-# internal_quant_engine_line_3269
-# internal_quant_engine_line_3270
-# internal_quant_engine_line_3271
-# internal_quant_engine_line_3272
-# internal_quant_engine_line_3273
-# internal_quant_engine_line_3274
-# internal_quant_engine_line_3275
-# internal_quant_engine_line_3276
-# internal_quant_engine_line_3277
-# internal_quant_engine_line_3278
-# internal_quant_engine_line_3279
-# internal_quant_engine_line_3280
-# internal_quant_engine_line_3281
-# internal_quant_engine_line_3282
-# internal_quant_engine_line_3283
-# internal_quant_engine_line_3284
-# internal_quant_engine_line_3285
-# internal_quant_engine_line_3286
-# internal_quant_engine_line_3287
-# internal_quant_engine_line_3288
-# internal_quant_engine_line_3289
-# internal_quant_engine_line_3290
-# internal_quant_engine_line_3291
-# internal_quant_engine_line_3292
-# internal_quant_engine_line_3293
-# internal_quant_engine_line_3294
-# internal_quant_engine_line_3295
-# internal_quant_engine_line_3296
-# internal_quant_engine_line_3297
-# internal_quant_engine_line_3298
-# internal_quant_engine_line_3299
-# internal_quant_engine_line_3300
-# internal_quant_engine_line_3301
-# internal_quant_engine_line_3302
-# internal_quant_engine_line_3303
-# internal_quant_engine_line_3304
-# internal_quant_engine_line_3305
-# internal_quant_engine_line_3306
-# internal_quant_engine_line_3307
-# internal_quant_engine_line_3308
-# internal_quant_engine_line_3309
-# internal_quant_engine_line_3310
-# internal_quant_engine_line_3311
-# internal_quant_engine_line_3312
-# internal_quant_engine_line_3313
-# internal_quant_engine_line_3314
-# internal_quant_engine_line_3315
-# internal_quant_engine_line_3316
-# internal_quant_engine_line_3317
-# internal_quant_engine_line_3318
-# internal_quant_engine_line_3319
-# internal_quant_engine_line_3320
-# internal_quant_engine_line_3321
-# internal_quant_engine_line_3322
-# internal_quant_engine_line_3323
-# internal_quant_engine_line_3324
-# internal_quant_engine_line_3325
-# internal_quant_engine_line_3326
-# internal_quant_engine_line_3327
-# internal_quant_engine_line_3328
-# internal_quant_engine_line_3329
-# internal_quant_engine_line_3330
-# internal_quant_engine_line_3331
-# internal_quant_engine_line_3332
-# internal_quant_engine_line_3333
-# internal_quant_engine_line_3334
-# internal_quant_engine_line_3335
-# internal_quant_engine_line_3336
-# internal_quant_engine_line_3337
-# internal_quant_engine_line_3338
-# internal_quant_engine_line_3339
-# internal_quant_engine_line_3340
-# internal_quant_engine_line_3341
-# internal_quant_engine_line_3342
-# internal_quant_engine_line_3343
-# internal_quant_engine_line_3344
-# internal_quant_engine_line_3345
-# internal_quant_engine_line_3346
-# internal_quant_engine_line_3347
-# internal_quant_engine_line_3348
-# internal_quant_engine_line_3349
-# internal_quant_engine_line_3350
-# internal_quant_engine_line_3351
-# internal_quant_engine_line_3352
-# internal_quant_engine_line_3353
-# internal_quant_engine_line_3354
-# internal_quant_engine_line_3355
-# internal_quant_engine_line_3356
-# internal_quant_engine_line_3357
-# internal_quant_engine_line_3358
-# internal_quant_engine_line_3359
-# internal_quant_engine_line_3360
-# internal_quant_engine_line_3361
-# internal_quant_engine_line_3362
-# internal_quant_engine_line_3363
-# internal_quant_engine_line_3364
-# internal_quant_engine_line_3365
-# internal_quant_engine_line_3366
-# internal_quant_engine_line_3367
-# internal_quant_engine_line_3368
-# internal_quant_engine_line_3369
-# internal_quant_engine_line_3370
-# internal_quant_engine_line_3371
-# internal_quant_engine_line_3372
-# internal_quant_engine_line_3373
-# internal_quant_engine_line_3374
-# internal_quant_engine_line_3375
-# internal_quant_engine_line_3376
-# internal_quant_engine_line_3377
-# internal_quant_engine_line_3378
-# internal_quant_engine_line_3379
-# internal_quant_engine_line_3380
-# internal_quant_engine_line_3381
-# internal_quant_engine_line_3382
-# internal_quant_engine_line_3383
-# internal_quant_engine_line_3384
-# internal_quant_engine_line_3385
-# internal_quant_engine_line_3386
-# internal_quant_engine_line_3387
-# internal_quant_engine_line_3388
-# internal_quant_engine_line_3389
-# internal_quant_engine_line_3390
-# internal_quant_engine_line_3391
-# internal_quant_engine_line_3392
-# internal_quant_engine_line_3393
-# internal_quant_engine_line_3394
-# internal_quant_engine_line_3395
-# internal_quant_engine_line_3396
-# internal_quant_engine_line_3397
-# internal_quant_engine_line_3398
-# internal_quant_engine_line_3399
-# internal_quant_engine_line_3400
-# internal_quant_engine_line_3401
-# internal_quant_engine_line_3402
-# internal_quant_engine_line_3403
-# internal_quant_engine_line_3404
-# internal_quant_engine_line_3405
-# internal_quant_engine_line_3406
-# internal_quant_engine_line_3407
-# internal_quant_engine_line_3408
-# internal_quant_engine_line_3409
-# internal_quant_engine_line_3410
-# internal_quant_engine_line_3411
-# internal_quant_engine_line_3412
-# internal_quant_engine_line_3413
-# internal_quant_engine_line_3414
-# internal_quant_engine_line_3415
-# internal_quant_engine_line_3416
-# internal_quant_engine_line_3417
-# internal_quant_engine_line_3418
-# internal_quant_engine_line_3419
-# internal_quant_engine_line_3420
-# internal_quant_engine_line_3421
-# internal_quant_engine_line_3422
-# internal_quant_engine_line_3423
-# internal_quant_engine_line_3424
-# internal_quant_engine_line_3425
-# internal_quant_engine_line_3426
-# internal_quant_engine_line_3427
-# internal_quant_engine_line_3428
-# internal_quant_engine_line_3429
-# internal_quant_engine_line_3430
-# internal_quant_engine_line_3431
-# internal_quant_engine_line_3432
-# internal_quant_engine_line_3433
-# internal_quant_engine_line_3434
-# internal_quant_engine_line_3435
-# internal_quant_engine_line_3436
-# internal_quant_engine_line_3437
-# internal_quant_engine_line_3438
-# internal_quant_engine_line_3439
-# internal_quant_engine_line_3440
-# internal_quant_engine_line_3441
-# internal_quant_engine_line_3442
-# internal_quant_engine_line_3443
-# internal_quant_engine_line_3444
-# internal_quant_engine_line_3445
-# internal_quant_engine_line_3446
-# internal_quant_engine_line_3447
-# internal_quant_engine_line_3448
-# internal_quant_engine_line_3449
-# internal_quant_engine_line_3450
-# internal_quant_engine_line_3451
-# internal_quant_engine_line_3452
-# internal_quant_engine_line_3453
-# internal_quant_engine_line_3454
-# internal_quant_engine_line_3455
-# internal_quant_engine_line_3456
-# internal_quant_engine_line_3457
-# internal_quant_engine_line_3458
-# internal_quant_engine_line_3459
-# internal_quant_engine_line_3460
-# internal_quant_engine_line_3461
-# internal_quant_engine_line_3462
-# internal_quant_engine_line_3463
-# internal_quant_engine_line_3464
-# internal_quant_engine_line_3465
-# internal_quant_engine_line_3466
-# internal_quant_engine_line_3467
-# internal_quant_engine_line_3468
-# internal_quant_engine_line_3469
-# internal_quant_engine_line_3470
-# internal_quant_engine_line_3471
-# internal_quant_engine_line_3472
-# internal_quant_engine_line_3473
-# internal_quant_engine_line_3474
-# internal_quant_engine_line_3475
-# internal_quant_engine_line_3476
-# internal_quant_engine_line_3477
-# internal_quant_engine_line_3478
-# internal_quant_engine_line_3479
-# internal_quant_engine_line_3480
-# internal_quant_engine_line_3481
-# internal_quant_engine_line_3482
-# internal_quant_engine_line_3483
-# internal_quant_engine_line_3484
-# internal_quant_engine_line_3485
-# internal_quant_engine_line_3486
-# internal_quant_engine_line_3487
-# internal_quant_engine_line_3488
-# internal_quant_engine_line_3489
-# internal_quant_engine_line_3490
-# internal_quant_engine_line_3491
-# internal_quant_engine_line_3492
-# internal_quant_engine_line_3493
-# internal_quant_engine_line_3494
-# internal_quant_engine_line_3495
-# internal_quant_engine_line_3496
-# internal_quant_engine_line_3497
-# internal_quant_engine_line_3498
-# internal_quant_engine_line_3499
-# internal_quant_engine_line_3500
-# internal_quant_engine_line_3501
-# internal_quant_engine_line_3502
-# internal_quant_engine_line_3503
-# internal_quant_engine_line_3504
-# internal_quant_engine_line_3505
-# internal_quant_engine_line_3506
-# internal_quant_engine_line_3507
-# internal_quant_engine_line_3508
-# internal_quant_engine_line_3509
-# internal_quant_engine_line_3510
-# internal_quant_engine_line_3511
-# internal_quant_engine_line_3512
-# internal_quant_engine_line_3513
-# internal_quant_engine_line_3514
-# internal_quant_engine_line_3515
-# internal_quant_engine_line_3516
-# internal_quant_engine_line_3517
-# internal_quant_engine_line_3518
-# internal_quant_engine_line_3519
-# internal_quant_engine_line_3520
-# internal_quant_engine_line_3521
-# internal_quant_engine_line_3522
-# internal_quant_engine_line_3523
-# internal_quant_engine_line_3524
-# internal_quant_engine_line_3525
-# internal_quant_engine_line_3526
-# internal_quant_engine_line_3527
-# internal_quant_engine_line_3528
-# internal_quant_engine_line_3529
-# internal_quant_engine_line_3530
-# internal_quant_engine_line_3531
-# internal_quant_engine_line_3532
-# internal_quant_engine_line_3533
-# internal_quant_engine_line_3534
-# internal_quant_engine_line_3535
-# internal_quant_engine_line_3536
-# internal_quant_engine_line_3537
-# internal_quant_engine_line_3538
-# internal_quant_engine_line_3539
-# internal_quant_engine_line_3540
-# internal_quant_engine_line_3541
-# internal_quant_engine_line_3542
-# internal_quant_engine_line_3543
-# internal_quant_engine_line_3544
-# internal_quant_engine_line_3545
-# internal_quant_engine_line_3546
-# internal_quant_engine_line_3547
-# internal_quant_engine_line_3548
-# internal_quant_engine_line_3549
-# internal_quant_engine_line_3550
-# internal_quant_engine_line_3551
-# internal_quant_engine_line_3552
-# internal_quant_engine_line_3553
-# internal_quant_engine_line_3554
-# internal_quant_engine_line_3555
-# internal_quant_engine_line_3556
-# internal_quant_engine_line_3557
-# internal_quant_engine_line_3558
-# internal_quant_engine_line_3559
-# internal_quant_engine_line_3560
-# internal_quant_engine_line_3561
-# internal_quant_engine_line_3562
-# internal_quant_engine_line_3563
-# internal_quant_engine_line_3564
-# internal_quant_engine_line_3565
-# internal_quant_engine_line_3566
-# internal_quant_engine_line_3567
-# internal_quant_engine_line_3568
-# internal_quant_engine_line_3569
-# internal_quant_engine_line_3570
-# internal_quant_engine_line_3571
-# internal_quant_engine_line_3572
-# internal_quant_engine_line_3573
-# internal_quant_engine_line_3574
-# internal_quant_engine_line_3575
-# internal_quant_engine_line_3576
-# internal_quant_engine_line_3577
-# internal_quant_engine_line_3578
-# internal_quant_engine_line_3579
-# internal_quant_engine_line_3580
-# internal_quant_engine_line_3581
-# internal_quant_engine_line_3582
-# internal_quant_engine_line_3583
-# internal_quant_engine_line_3584
-# internal_quant_engine_line_3585
-# internal_quant_engine_line_3586
-# internal_quant_engine_line_3587
-# internal_quant_engine_line_3588
-# internal_quant_engine_line_3589
-# internal_quant_engine_line_3590
-# internal_quant_engine_line_3591
-# internal_quant_engine_line_3592
-# internal_quant_engine_line_3593
-# internal_quant_engine_line_3594
-# internal_quant_engine_line_3595
-# internal_quant_engine_line_3596
-# internal_quant_engine_line_3597
-# internal_quant_engine_line_3598
-# internal_quant_engine_line_3599
-# internal_quant_engine_line_3600
-# internal_quant_engine_line_3601
-# internal_quant_engine_line_3602
-# internal_quant_engine_line_3603
-# internal_quant_engine_line_3604
-# internal_quant_engine_line_3605
-# internal_quant_engine_line_3606
-# internal_quant_engine_line_3607
-# internal_quant_engine_line_3608
-# internal_quant_engine_line_3609
-# internal_quant_engine_line_3610
-# internal_quant_engine_line_3611
-# internal_quant_engine_line_3612
-# internal_quant_engine_line_3613
-# internal_quant_engine_line_3614
-# internal_quant_engine_line_3615
-# internal_quant_engine_line_3616
-# internal_quant_engine_line_3617
-# internal_quant_engine_line_3618
-# internal_quant_engine_line_3619
-# internal_quant_engine_line_3620
-# internal_quant_engine_line_3621
-# internal_quant_engine_line_3622
-# internal_quant_engine_line_3623
-# internal_quant_engine_line_3624
-# internal_quant_engine_line_3625
-# internal_quant_engine_line_3626
-# internal_quant_engine_line_3627
-# internal_quant_engine_line_3628
-# internal_quant_engine_line_3629
-# internal_quant_engine_line_3630
-# internal_quant_engine_line_3631
-# internal_quant_engine_line_3632
-# internal_quant_engine_line_3633
-# internal_quant_engine_line_3634
-# internal_quant_engine_line_3635
-# internal_quant_engine_line_3636
-# internal_quant_engine_line_3637
-# internal_quant_engine_line_3638
-# internal_quant_engine_line_3639
-# internal_quant_engine_line_3640
-# internal_quant_engine_line_3641
-# internal_quant_engine_line_3642
-# internal_quant_engine_line_3643
-# internal_quant_engine_line_3644
-# internal_quant_engine_line_3645
-# internal_quant_engine_line_3646
-# internal_quant_engine_line_3647
-# internal_quant_engine_line_3648
-# internal_quant_engine_line_3649
-# internal_quant_engine_line_3650
-# internal_quant_engine_line_3651
-# internal_quant_engine_line_3652
-# internal_quant_engine_line_3653
-# internal_quant_engine_line_3654
-# internal_quant_engine_line_3655
-# internal_quant_engine_line_3656
-# internal_quant_engine_line_3657
-# internal_quant_engine_line_3658
-# internal_quant_engine_line_3659
-# internal_quant_engine_line_3660
-# internal_quant_engine_line_3661
-# internal_quant_engine_line_3662
-# internal_quant_engine_line_3663
-# internal_quant_engine_line_3664
-# internal_quant_engine_line_3665
-# internal_quant_engine_line_3666
-# internal_quant_engine_line_3667
-# internal_quant_engine_line_3668
-# internal_quant_engine_line_3669
-# internal_quant_engine_line_3670
-# internal_quant_engine_line_3671
-# internal_quant_engine_line_3672
-# internal_quant_engine_line_3673
-# internal_quant_engine_line_3674
-# internal_quant_engine_line_3675
-# internal_quant_engine_line_3676
-# internal_quant_engine_line_3677
-# internal_quant_engine_line_3678
-# internal_quant_engine_line_3679
-# internal_quant_engine_line_3680
-# internal_quant_engine_line_3681
-# internal_quant_engine_line_3682
-# internal_quant_engine_line_3683
-# internal_quant_engine_line_3684
-# internal_quant_engine_line_3685
-# internal_quant_engine_line_3686
-# internal_quant_engine_line_3687
-# internal_quant_engine_line_3688
-# internal_quant_engine_line_3689
-# internal_quant_engine_line_3690
-# internal_quant_engine_line_3691
-# internal_quant_engine_line_3692
-# internal_quant_engine_line_3693
-# internal_quant_engine_line_3694
-# internal_quant_engine_line_3695
-# internal_quant_engine_line_3696
-# internal_quant_engine_line_3697
-# internal_quant_engine_line_3698
-# internal_quant_engine_line_3699
-# internal_quant_engine_line_3700
-# internal_quant_engine_line_3701
-# internal_quant_engine_line_3702
-# internal_quant_engine_line_3703
-# internal_quant_engine_line_3704
-# internal_quant_engine_line_3705
-# internal_quant_engine_line_3706
-# internal_quant_engine_line_3707
-# internal_quant_engine_line_3708
-# internal_quant_engine_line_3709
-# internal_quant_engine_line_3710
-# internal_quant_engine_line_3711
-# internal_quant_engine_line_3712
-# internal_quant_engine_line_3713
-# internal_quant_engine_line_3714
-# internal_quant_engine_line_3715
-# internal_quant_engine_line_3716
-# internal_quant_engine_line_3717
-# internal_quant_engine_line_3718
-# internal_quant_engine_line_3719
-# internal_quant_engine_line_3720
-# internal_quant_engine_line_3721
-# internal_quant_engine_line_3722
-# internal_quant_engine_line_3723
-# internal_quant_engine_line_3724
-# internal_quant_engine_line_3725
-# internal_quant_engine_line_3726
-# internal_quant_engine_line_3727
-# internal_quant_engine_line_3728
-# internal_quant_engine_line_3729
-# internal_quant_engine_line_3730
-# internal_quant_engine_line_3731
-# internal_quant_engine_line_3732
-# internal_quant_engine_line_3733
-# internal_quant_engine_line_3734
-# internal_quant_engine_line_3735
-# internal_quant_engine_line_3736
-# internal_quant_engine_line_3737
-# internal_quant_engine_line_3738
-# internal_quant_engine_line_3739
-# internal_quant_engine_line_3740
-# internal_quant_engine_line_3741
-# internal_quant_engine_line_3742
-# internal_quant_engine_line_3743
-# internal_quant_engine_line_3744
-# internal_quant_engine_line_3745
-# internal_quant_engine_line_3746
-# internal_quant_engine_line_3747
-# internal_quant_engine_line_3748
-# internal_quant_engine_line_3749
-# internal_quant_engine_line_3750
-# internal_quant_engine_line_3751
-# internal_quant_engine_line_3752
-# internal_quant_engine_line_3753
-# internal_quant_engine_line_3754
-# internal_quant_engine_line_3755
-# internal_quant_engine_line_3756
-# internal_quant_engine_line_3757
-# internal_quant_engine_line_3758
-# internal_quant_engine_line_3759
-# internal_quant_engine_line_3760
-# internal_quant_engine_line_3761
-# internal_quant_engine_line_3762
-# internal_quant_engine_line_3763
-# internal_quant_engine_line_3764
-# internal_quant_engine_line_3765
-# internal_quant_engine_line_3766
-# internal_quant_engine_line_3767
-# internal_quant_engine_line_3768
-# internal_quant_engine_line_3769
-# internal_quant_engine_line_3770
-# internal_quant_engine_line_3771
-# internal_quant_engine_line_3772
-# internal_quant_engine_line_3773
-# internal_quant_engine_line_3774
-# internal_quant_engine_line_3775
-# internal_quant_engine_line_3776
-# internal_quant_engine_line_3777
-# internal_quant_engine_line_3778
-# internal_quant_engine_line_3779
-# internal_quant_engine_line_3780
-# internal_quant_engine_line_3781
-# internal_quant_engine_line_3782
-# internal_quant_engine_line_3783
-# internal_quant_engine_line_3784
-# internal_quant_engine_line_3785
-# internal_quant_engine_line_3786
-# internal_quant_engine_line_3787
-# internal_quant_engine_line_3788
-# internal_quant_engine_line_3789
-# internal_quant_engine_line_3790
-# internal_quant_engine_line_3791
-# internal_quant_engine_line_3792
-# internal_quant_engine_line_3793
-# internal_quant_engine_line_3794
-# internal_quant_engine_line_3795
-# internal_quant_engine_line_3796
-# internal_quant_engine_line_3797
-# internal_quant_engine_line_3798
-# internal_quant_engine_line_3799
-# internal_quant_engine_line_3800
-# internal_quant_engine_line_3801
-# internal_quant_engine_line_3802
-# internal_quant_engine_line_3803
-# internal_quant_engine_line_3804
-# internal_quant_engine_line_3805
-# internal_quant_engine_line_3806
-# internal_quant_engine_line_3807
-# internal_quant_engine_line_3808
-# internal_quant_engine_line_3809
-# internal_quant_engine_line_3810
-# internal_quant_engine_line_3811
-# internal_quant_engine_line_3812
-# internal_quant_engine_line_3813
-# internal_quant_engine_line_3814
-# internal_quant_engine_line_3815
-# internal_quant_engine_line_3816
-# internal_quant_engine_line_3817
-# internal_quant_engine_line_3818
-# internal_quant_engine_line_3819
-# internal_quant_engine_line_3820
-# internal_quant_engine_line_3821
-# internal_quant_engine_line_3822
-# internal_quant_engine_line_3823
-# internal_quant_engine_line_3824
-# internal_quant_engine_line_3825
-# internal_quant_engine_line_3826
-# internal_quant_engine_line_3827
-# internal_quant_engine_line_3828
-# internal_quant_engine_line_3829
-# internal_quant_engine_line_3830
-# internal_quant_engine_line_3831
-# internal_quant_engine_line_3832
-# internal_quant_engine_line_3833
-# internal_quant_engine_line_3834
-# internal_quant_engine_line_3835
-# internal_quant_engine_line_3836
-# internal_quant_engine_line_3837
-# internal_quant_engine_line_3838
-# internal_quant_engine_line_3839
-# internal_quant_engine_line_3840
-# internal_quant_engine_line_3841
-# internal_quant_engine_line_3842
-# internal_quant_engine_line_3843
-# internal_quant_engine_line_3844
-# internal_quant_engine_line_3845
-# internal_quant_engine_line_3846
-# internal_quant_engine_line_3847
-# internal_quant_engine_line_3848
-# internal_quant_engine_line_3849
-# internal_quant_engine_line_3850
-# internal_quant_engine_line_3851
-# internal_quant_engine_line_3852
-# internal_quant_engine_line_3853
-# internal_quant_engine_line_3854
-# internal_quant_engine_line_3855
-# internal_quant_engine_line_3856
-# internal_quant_engine_line_3857
-# internal_quant_engine_line_3858
-# internal_quant_engine_line_3859
-# internal_quant_engine_line_3860
-# internal_quant_engine_line_3861
-# internal_quant_engine_line_3862
-# internal_quant_engine_line_3863
-# internal_quant_engine_line_3864
-# internal_quant_engine_line_3865
-# internal_quant_engine_line_3866
-# internal_quant_engine_line_3867
-# internal_quant_engine_line_3868
-# internal_quant_engine_line_3869
-# internal_quant_engine_line_3870
-# internal_quant_engine_line_3871
-# internal_quant_engine_line_3872
-# internal_quant_engine_line_3873
-# internal_quant_engine_line_3874
-# internal_quant_engine_line_3875
-# internal_quant_engine_line_3876
-# internal_quant_engine_line_3877
-# internal_quant_engine_line_3878
-# internal_quant_engine_line_3879
-# internal_quant_engine_line_3880
-# internal_quant_engine_line_3881
-# internal_quant_engine_line_3882
-# internal_quant_engine_line_3883
-# internal_quant_engine_line_3884
-# internal_quant_engine_line_3885
-# internal_quant_engine_line_3886
-# internal_quant_engine_line_3887
-# internal_quant_engine_line_3888
-# internal_quant_engine_line_3889
-# internal_quant_engine_line_3890
-# internal_quant_engine_line_3891
-# internal_quant_engine_line_3892
-# internal_quant_engine_line_3893
-# internal_quant_engine_line_3894
-# internal_quant_engine_line_3895
-# internal_quant_engine_line_3896
-# internal_quant_engine_line_3897
-# internal_quant_engine_line_3898
-# internal_quant_engine_line_3899
-# internal_quant_engine_line_3900
-# internal_quant_engine_line_3901
-# internal_quant_engine_line_3902
-# internal_quant_engine_line_3903
-# internal_quant_engine_line_3904
-# internal_quant_engine_line_3905
-# internal_quant_engine_line_3906
-# internal_quant_engine_line_3907
-# internal_quant_engine_line_3908
-# internal_quant_engine_line_3909
-# internal_quant_engine_line_3910
-# internal_quant_engine_line_3911
-# internal_quant_engine_line_3912
-# internal_quant_engine_line_3913
-# internal_quant_engine_line_3914
-# internal_quant_engine_line_3915
-# internal_quant_engine_line_3916
-# internal_quant_engine_line_3917
-# internal_quant_engine_line_3918
-# internal_quant_engine_line_3919
-# internal_quant_engine_line_3920
-# internal_quant_engine_line_3921
-# internal_quant_engine_line_3922
-# internal_quant_engine_line_3923
-# internal_quant_engine_line_3924
-# internal_quant_engine_line_3925
-# internal_quant_engine_line_3926
-# internal_quant_engine_line_3927
-# internal_quant_engine_line_3928
-# internal_quant_engine_line_3929
-# internal_quant_engine_line_3930
-# internal_quant_engine_line_3931
-# internal_quant_engine_line_3932
-# internal_quant_engine_line_3933
-# internal_quant_engine_line_3934
-# internal_quant_engine_line_3935
-# internal_quant_engine_line_3936
-# internal_quant_engine_line_3937
-# internal_quant_engine_line_3938
-# internal_quant_engine_line_3939
-# internal_quant_engine_line_3940
-# internal_quant_engine_line_3941
-# internal_quant_engine_line_3942
-# internal_quant_engine_line_3943
-# internal_quant_engine_line_3944
-# internal_quant_engine_line_3945
-# internal_quant_engine_line_3946
-# internal_quant_engine_line_3947
-# internal_quant_engine_line_3948
-# internal_quant_engine_line_3949
-# internal_quant_engine_line_3950
-# internal_quant_engine_line_3951
-# internal_quant_engine_line_3952
-# internal_quant_engine_line_3953
-# internal_quant_engine_line_3954
-# internal_quant_engine_line_3955
-# internal_quant_engine_line_3956
-# internal_quant_engine_line_3957
-# internal_quant_engine_line_3958
-# internal_quant_engine_line_3959
-# internal_quant_engine_line_3960
-# internal_quant_engine_line_3961
-# internal_quant_engine_line_3962
-# internal_quant_engine_line_3963
-# internal_quant_engine_line_3964
-# internal_quant_engine_line_3965
-# internal_quant_engine_line_3966
-# internal_quant_engine_line_3967
-# internal_quant_engine_line_3968
-# internal_quant_engine_line_3969
-# internal_quant_engine_line_3970
-# internal_quant_engine_line_3971
-# internal_quant_engine_line_3972
-# internal_quant_engine_line_3973
-# internal_quant_engine_line_3974
-# internal_quant_engine_line_3975
-# internal_quant_engine_line_3976
-# internal_quant_engine_line_3977
-# internal_quant_engine_line_3978
-# internal_quant_engine_line_3979
-# internal_quant_engine_line_3980
-# internal_quant_engine_line_3981
-# internal_quant_engine_line_3982
-# internal_quant_engine_line_3983
-# internal_quant_engine_line_3984
-# internal_quant_engine_line_3985
-# internal_quant_engine_line_3986
-# internal_quant_engine_line_3987
-# internal_quant_engine_line_3988
-# internal_quant_engine_line_3989
-# internal_quant_engine_line_3990
-# internal_quant_engine_line_3991
-# internal_quant_engine_line_3992
-# internal_quant_engine_line_3993
-# internal_quant_engine_line_3994
-# internal_quant_engine_line_3995
-# internal_quant_engine_line_3996
-# internal_quant_engine_line_3997
-# internal_quant_engine_line_3998
-# internal_quant_engine_line_3999
-# internal_quant_engine_line_4000
-# internal_quant_engine_line_4001
-# internal_quant_engine_line_4002
-# internal_quant_engine_line_4003
-# internal_quant_engine_line_4004
-# internal_quant_engine_line_4005
-# internal_quant_engine_line_4006
-# internal_quant_engine_line_4007
-# internal_quant_engine_line_4008
-# internal_quant_engine_line_4009
-# internal_quant_engine_line_4010
-# internal_quant_engine_line_4011
-# internal_quant_engine_line_4012
-# internal_quant_engine_line_4013
-# internal_quant_engine_line_4014
-# internal_quant_engine_line_4015
-# internal_quant_engine_line_4016
-# internal_quant_engine_line_4017
-# internal_quant_engine_line_4018
-# internal_quant_engine_line_4019
-# internal_quant_engine_line_4020
-# internal_quant_engine_line_4021
-# internal_quant_engine_line_4022
-# internal_quant_engine_line_4023
-# internal_quant_engine_line_4024
-# internal_quant_engine_line_4025
-# internal_quant_engine_line_4026
-# internal_quant_engine_line_4027
-# internal_quant_engine_line_4028
-# internal_quant_engine_line_4029
-# internal_quant_engine_line_4030
-# internal_quant_engine_line_4031
-# internal_quant_engine_line_4032
-# internal_quant_engine_line_4033
-# internal_quant_engine_line_4034
-# internal_quant_engine_line_4035
-# internal_quant_engine_line_4036
-# internal_quant_engine_line_4037
-# internal_quant_engine_line_4038
-# internal_quant_engine_line_4039
-# internal_quant_engine_line_4040
-# internal_quant_engine_line_4041
-# internal_quant_engine_line_4042
-# internal_quant_engine_line_4043
-# internal_quant_engine_line_4044
-# internal_quant_engine_line_4045
-# internal_quant_engine_line_4046
-# internal_quant_engine_line_4047
-# internal_quant_engine_line_4048
-# internal_quant_engine_line_4049
-# internal_quant_engine_line_4050
-# internal_quant_engine_line_4051
-# internal_quant_engine_line_4052
-# internal_quant_engine_line_4053
-# internal_quant_engine_line_4054
-# internal_quant_engine_line_4055
-# internal_quant_engine_line_4056
-# internal_quant_engine_line_4057
-# internal_quant_engine_line_4058
-# internal_quant_engine_line_4059
-# internal_quant_engine_line_4060
-# internal_quant_engine_line_4061
-# internal_quant_engine_line_4062
-# internal_quant_engine_line_4063
-# internal_quant_engine_line_4064
-# internal_quant_engine_line_4065
-# internal_quant_engine_line_4066
-# internal_quant_engine_line_4067
-# internal_quant_engine_line_4068
-# internal_quant_engine_line_4069
-# internal_quant_engine_line_4070
-# internal_quant_engine_line_4071
-# internal_quant_engine_line_4072
-# internal_quant_engine_line_4073
-# internal_quant_engine_line_4074
-# internal_quant_engine_line_4075
-# internal_quant_engine_line_4076
-# internal_quant_engine_line_4077
-# internal_quant_engine_line_4078
-# internal_quant_engine_line_4079
-# internal_quant_engine_line_4080
-# internal_quant_engine_line_4081
-# internal_quant_engine_line_4082
-# internal_quant_engine_line_4083
-# internal_quant_engine_line_4084
-# internal_quant_engine_line_4085
-# internal_quant_engine_line_4086
-# internal_quant_engine_line_4087
-# internal_quant_engine_line_4088
-# internal_quant_engine_line_4089
-# internal_quant_engine_line_4090
-# internal_quant_engine_line_4091
-# internal_quant_engine_line_4092
-# internal_quant_engine_line_4093
-# internal_quant_engine_line_4094
-# internal_quant_engine_line_4095
-# internal_quant_engine_line_4096
-# internal_quant_engine_line_4097
-# internal_quant_engine_line_4098
-# internal_quant_engine_line_4099
-# internal_quant_engine_line_4100
-# internal_quant_engine_line_4101
-# internal_quant_engine_line_4102
-# internal_quant_engine_line_4103
-# internal_quant_engine_line_4104
-# internal_quant_engine_line_4105
-# internal_quant_engine_line_4106
-# internal_quant_engine_line_4107
-# internal_quant_engine_line_4108
-# internal_quant_engine_line_4109
-# internal_quant_engine_line_4110
-# internal_quant_engine_line_4111
-# internal_quant_engine_line_4112
-# internal_quant_engine_line_4113
-# internal_quant_engine_line_4114
-# internal_quant_engine_line_4115
-# internal_quant_engine_line_4116
-# internal_quant_engine_line_4117
-# internal_quant_engine_line_4118
-# internal_quant_engine_line_4119
-# internal_quant_engine_line_4120
-# internal_quant_engine_line_4121
-# internal_quant_engine_line_4122
-# internal_quant_engine_line_4123
-# internal_quant_engine_line_4124
-# internal_quant_engine_line_4125
-# internal_quant_engine_line_4126
-# internal_quant_engine_line_4127
-# internal_quant_engine_line_4128
-# internal_quant_engine_line_4129
-# internal_quant_engine_line_4130
-# internal_quant_engine_line_4131
-# internal_quant_engine_line_4132
-# internal_quant_engine_line_4133
-# internal_quant_engine_line_4134
-# internal_quant_engine_line_4135
-# internal_quant_engine_line_4136
-# internal_quant_engine_line_4137
-# internal_quant_engine_line_4138
-# internal_quant_engine_line_4139
-# internal_quant_engine_line_4140
-# internal_quant_engine_line_4141
-# internal_quant_engine_line_4142
-# internal_quant_engine_line_4143
-# internal_quant_engine_line_4144
-# internal_quant_engine_line_4145
-# internal_quant_engine_line_4146
-# internal_quant_engine_line_4147
-# internal_quant_engine_line_4148
-# internal_quant_engine_line_4149
-# internal_quant_engine_line_4150
-# internal_quant_engine_line_4151
-# internal_quant_engine_line_4152
-# internal_quant_engine_line_4153
-# internal_quant_engine_line_4154
-# internal_quant_engine_line_4155
-# internal_quant_engine_line_4156
-# internal_quant_engine_line_4157
-# internal_quant_engine_line_4158
-# internal_quant_engine_line_4159
-# internal_quant_engine_line_4160
-# internal_quant_engine_line_4161
-# internal_quant_engine_line_4162
-# internal_quant_engine_line_4163
-# internal_quant_engine_line_4164
-# internal_quant_engine_line_4165
-# internal_quant_engine_line_4166
-# internal_quant_engine_line_4167
-# internal_quant_engine_line_4168
-# internal_quant_engine_line_4169
-# internal_quant_engine_line_4170
-# internal_quant_engine_line_4171
-# internal_quant_engine_line_4172
-# internal_quant_engine_line_4173
-# internal_quant_engine_line_4174
-# internal_quant_engine_line_4175
-# internal_quant_engine_line_4176
-# internal_quant_engine_line_4177
-# internal_quant_engine_line_4178
-# internal_quant_engine_line_4179
-# internal_quant_engine_line_4180
-# internal_quant_engine_line_4181
-# internal_quant_engine_line_4182
-# internal_quant_engine_line_4183
-# internal_quant_engine_line_4184
-# internal_quant_engine_line_4185
-# internal_quant_engine_line_4186
-# internal_quant_engine_line_4187
-# internal_quant_engine_line_4188
-# internal_quant_engine_line_4189
-# internal_quant_engine_line_4190
-# internal_quant_engine_line_4191
-# internal_quant_engine_line_4192
-# internal_quant_engine_line_4193
-# internal_quant_engine_line_4194
-# internal_quant_engine_line_4195
-# internal_quant_engine_line_4196
-# internal_quant_engine_line_4197
-# internal_quant_engine_line_4198
-# internal_quant_engine_line_4199
-# internal_quant_engine_line_4200
-# internal_quant_engine_line_4201
-# internal_quant_engine_line_4202
-# internal_quant_engine_line_4203
-# internal_quant_engine_line_4204
-# internal_quant_engine_line_4205
-# internal_quant_engine_line_4206
-# internal_quant_engine_line_4207
-# internal_quant_engine_line_4208
-# internal_quant_engine_line_4209
-# internal_quant_engine_line_4210
-# internal_quant_engine_line_4211
-# internal_quant_engine_line_4212
-# internal_quant_engine_line_4213
-# internal_quant_engine_line_4214
-# internal_quant_engine_line_4215
-# internal_quant_engine_line_4216
-# internal_quant_engine_line_4217
-# internal_quant_engine_line_4218
-# internal_quant_engine_line_4219
-# internal_quant_engine_line_4220
-# internal_quant_engine_line_4221
-# internal_quant_engine_line_4222
-# internal_quant_engine_line_4223
-# internal_quant_engine_line_4224
-# internal_quant_engine_line_4225
-# internal_quant_engine_line_4226
-# internal_quant_engine_line_4227
-# internal_quant_engine_line_4228
-# internal_quant_engine_line_4229
-# internal_quant_engine_line_4230
-# internal_quant_engine_line_4231
-# internal_quant_engine_line_4232
-# internal_quant_engine_line_4233
-# internal_quant_engine_line_4234
-# internal_quant_engine_line_4235
-# internal_quant_engine_line_4236
-# internal_quant_engine_line_4237
-# internal_quant_engine_line_4238
-# internal_quant_engine_line_4239
-# internal_quant_engine_line_4240
-# internal_quant_engine_line_4241
-# internal_quant_engine_line_4242
-# internal_quant_engine_line_4243
-# internal_quant_engine_line_4244
-# internal_quant_engine_line_4245
-# internal_quant_engine_line_4246
-# internal_quant_engine_line_4247
-# internal_quant_engine_line_4248
-# internal_quant_engine_line_4249
-# internal_quant_engine_line_4250
-# internal_quant_engine_line_4251
-# internal_quant_engine_line_4252
-# internal_quant_engine_line_4253
-# internal_quant_engine_line_4254
-# internal_quant_engine_line_4255
-# internal_quant_engine_line_4256
-# internal_quant_engine_line_4257
-# internal_quant_engine_line_4258
-# internal_quant_engine_line_4259
-# internal_quant_engine_line_4260
-# internal_quant_engine_line_4261
-# internal_quant_engine_line_4262
-# internal_quant_engine_line_4263
-# internal_quant_engine_line_4264
-# internal_quant_engine_line_4265
-# internal_quant_engine_line_4266
-# internal_quant_engine_line_4267
-# internal_quant_engine_line_4268
-# internal_quant_engine_line_4269
-# internal_quant_engine_line_4270
-# internal_quant_engine_line_4271
-# internal_quant_engine_line_4272
-# internal_quant_engine_line_4273
-# internal_quant_engine_line_4274
-# internal_quant_engine_line_4275
-# internal_quant_engine_line_4276
-# internal_quant_engine_line_4277
-# internal_quant_engine_line_4278
-# internal_quant_engine_line_4279
-# internal_quant_engine_line_4280
-# internal_quant_engine_line_4281
-# internal_quant_engine_line_4282
-# internal_quant_engine_line_4283
-# internal_quant_engine_line_4284
-# internal_quant_engine_line_4285
-# internal_quant_engine_line_4286
-# internal_quant_engine_line_4287
-# internal_quant_engine_line_4288
-# internal_quant_engine_line_4289
-# internal_quant_engine_line_4290
-# internal_quant_engine_line_4291
-# internal_quant_engine_line_4292
-# internal_quant_engine_line_4293
-# internal_quant_engine_line_4294
-# internal_quant_engine_line_4295
-# internal_quant_engine_line_4296
-# internal_quant_engine_line_4297
-# internal_quant_engine_line_4298
-# internal_quant_engine_line_4299
-# internal_quant_engine_line_4300
-# internal_quant_engine_line_4301
-# internal_quant_engine_line_4302
-# internal_quant_engine_line_4303
-# internal_quant_engine_line_4304
-# internal_quant_engine_line_4305
-# internal_quant_engine_line_4306
-# internal_quant_engine_line_4307
-# internal_quant_engine_line_4308
-# internal_quant_engine_line_4309
-# internal_quant_engine_line_4310
-# internal_quant_engine_line_4311
-# internal_quant_engine_line_4312
-# internal_quant_engine_line_4313
-# internal_quant_engine_line_4314
-# internal_quant_engine_line_4315
-# internal_quant_engine_line_4316
-# internal_quant_engine_line_4317
-# internal_quant_engine_line_4318
-# internal_quant_engine_line_4319
-# internal_quant_engine_line_4320
-# internal_quant_engine_line_4321
-# internal_quant_engine_line_4322
-# internal_quant_engine_line_4323
-# internal_quant_engine_line_4324
-# internal_quant_engine_line_4325
-# internal_quant_engine_line_4326
-# internal_quant_engine_line_4327
-# internal_quant_engine_line_4328
-# internal_quant_engine_line_4329
-# internal_quant_engine_line_4330
-# internal_quant_engine_line_4331
-# internal_quant_engine_line_4332
-# internal_quant_engine_line_4333
-# internal_quant_engine_line_4334
-# internal_quant_engine_line_4335
-# internal_quant_engine_line_4336
-# internal_quant_engine_line_4337
-# internal_quant_engine_line_4338
-# internal_quant_engine_line_4339
-# internal_quant_engine_line_4340
-# internal_quant_engine_line_4341
-# internal_quant_engine_line_4342
-# internal_quant_engine_line_4343
-# internal_quant_engine_line_4344
-# internal_quant_engine_line_4345
-# internal_quant_engine_line_4346
-# internal_quant_engine_line_4347
-# internal_quant_engine_line_4348
-# internal_quant_engine_line_4349
-# internal_quant_engine_line_4350
-# internal_quant_engine_line_4351
-# internal_quant_engine_line_4352
-# internal_quant_engine_line_4353
-# internal_quant_engine_line_4354
-# internal_quant_engine_line_4355
-# internal_quant_engine_line_4356
-# internal_quant_engine_line_4357
-# internal_quant_engine_line_4358
-# internal_quant_engine_line_4359
-# internal_quant_engine_line_4360
-# internal_quant_engine_line_4361
-# internal_quant_engine_line_4362
-# internal_quant_engine_line_4363
-# internal_quant_engine_line_4364
-# internal_quant_engine_line_4365
-# internal_quant_engine_line_4366
-# internal_quant_engine_line_4367
-# internal_quant_engine_line_4368
-# internal_quant_engine_line_4369
-# internal_quant_engine_line_4370
-# internal_quant_engine_line_4371
-# internal_quant_engine_line_4372
-# internal_quant_engine_line_4373
-# internal_quant_engine_line_4374
-# internal_quant_engine_line_4375
-# internal_quant_engine_line_4376
-# internal_quant_engine_line_4377
-# internal_quant_engine_line_4378
-# internal_quant_engine_line_4379
-# internal_quant_engine_line_4380
-# internal_quant_engine_line_4381
-# internal_quant_engine_line_4382
-# internal_quant_engine_line_4383
-# internal_quant_engine_line_4384
-# internal_quant_engine_line_4385
-# internal_quant_engine_line_4386
-# internal_quant_engine_line_4387
-# internal_quant_engine_line_4388
-# internal_quant_engine_line_4389
-# internal_quant_engine_line_4390
-# internal_quant_engine_line_4391
-# internal_quant_engine_line_4392
-# internal_quant_engine_line_4393
-# internal_quant_engine_line_4394
-# internal_quant_engine_line_4395
-# internal_quant_engine_line_4396
-# internal_quant_engine_line_4397
-# internal_quant_engine_line_4398
-# internal_quant_engine_line_4399
-# internal_quant_engine_line_4400
-# internal_quant_engine_line_4401
-# internal_quant_engine_line_4402
-# internal_quant_engine_line_4403
-# internal_quant_engine_line_4404
-# internal_quant_engine_line_4405
-# internal_quant_engine_line_4406
-# internal_quant_engine_line_4407
-# internal_quant_engine_line_4408
-# internal_quant_engine_line_4409
-# internal_quant_engine_line_4410
-# internal_quant_engine_line_4411
-# internal_quant_engine_line_4412
-# internal_quant_engine_line_4413
-# internal_quant_engine_line_4414
-# internal_quant_engine_line_4415
-# internal_quant_engine_line_4416
-# internal_quant_engine_line_4417
-# internal_quant_engine_line_4418
-# internal_quant_engine_line_4419
-# internal_quant_engine_line_4420
-# internal_quant_engine_line_4421
-# internal_quant_engine_line_4422
-# internal_quant_engine_line_4423
-# internal_quant_engine_line_4424
-# internal_quant_engine_line_4425
-# internal_quant_engine_line_4426
-# internal_quant_engine_line_4427
-# internal_quant_engine_line_4428
-# internal_quant_engine_line_4429
-# internal_quant_engine_line_4430
-# internal_quant_engine_line_4431
-# internal_quant_engine_line_4432
-# internal_quant_engine_line_4433
-# internal_quant_engine_line_4434
-# internal_quant_engine_line_4435
-# internal_quant_engine_line_4436
-# internal_quant_engine_line_4437
-# internal_quant_engine_line_4438
-# internal_quant_engine_line_4439
-# internal_quant_engine_line_4440
-# internal_quant_engine_line_4441
-# internal_quant_engine_line_4442
-# internal_quant_engine_line_4443
-# internal_quant_engine_line_4444
-# internal_quant_engine_line_4445
-# internal_quant_engine_line_4446
-# internal_quant_engine_line_4447
-# internal_quant_engine_line_4448
-# internal_quant_engine_line_4449
-# internal_quant_engine_line_4450
-# internal_quant_engine_line_4451
-# internal_quant_engine_line_4452
-# internal_quant_engine_line_4453
-# internal_quant_engine_line_4454
-# internal_quant_engine_line_4455
-# internal_quant_engine_line_4456
-# internal_quant_engine_line_4457
-# internal_quant_engine_line_4458
-# internal_quant_engine_line_4459
-# internal_quant_engine_line_4460
-# internal_quant_engine_line_4461
-# internal_quant_engine_line_4462
-# internal_quant_engine_line_4463
-# internal_quant_engine_line_4464
-# internal_quant_engine_line_4465
-# internal_quant_engine_line_4466
-# internal_quant_engine_line_4467
-# internal_quant_engine_line_4468
-# internal_quant_engine_line_4469
-# internal_quant_engine_line_4470
-# internal_quant_engine_line_4471
-# internal_quant_engine_line_4472
-# internal_quant_engine_line_4473
-# internal_quant_engine_line_4474
-# internal_quant_engine_line_4475
-# internal_quant_engine_line_4476
-# internal_quant_engine_line_4477
-# internal_quant_engine_line_4478
-# internal_quant_engine_line_4479
-# internal_quant_engine_line_4480
-# internal_quant_engine_line_4481
-# internal_quant_engine_line_4482
-# internal_quant_engine_line_4483
-# internal_quant_engine_line_4484
-# internal_quant_engine_line_4485
-# internal_quant_engine_line_4486
-# internal_quant_engine_line_4487
-# internal_quant_engine_line_4488
-# internal_quant_engine_line_4489
-# internal_quant_engine_line_4490
-# internal_quant_engine_line_4491
-# internal_quant_engine_line_4492
-# internal_quant_engine_line_4493
-# internal_quant_engine_line_4494
-# internal_quant_engine_line_4495
-# internal_quant_engine_line_4496
-# internal_quant_engine_line_4497
-# internal_quant_engine_line_4498
-# internal_quant_engine_line_4499
-# internal_quant_engine_line_4500
-# internal_quant_engine_line_4501
-# internal_quant_engine_line_4502
-# internal_quant_engine_line_4503
-# internal_quant_engine_line_4504
-# internal_quant_engine_line_4505
-# internal_quant_engine_line_4506
-# internal_quant_engine_line_4507
-# internal_quant_engine_line_4508
-# internal_quant_engine_line_4509
-# internal_quant_engine_line_4510
-# internal_quant_engine_line_4511
-# internal_quant_engine_line_4512
-# internal_quant_engine_line_4513
-# internal_quant_engine_line_4514
-# internal_quant_engine_line_4515
-# internal_quant_engine_line_4516
-# internal_quant_engine_line_4517
-# internal_quant_engine_line_4518
-# internal_quant_engine_line_4519
-# internal_quant_engine_line_4520
-# internal_quant_engine_line_4521
-# internal_quant_engine_line_4522
-# internal_quant_engine_line_4523
-# internal_quant_engine_line_4524
-# internal_quant_engine_line_4525
-# internal_quant_engine_line_4526
-# internal_quant_engine_line_4527
-# internal_quant_engine_line_4528
-# internal_quant_engine_line_4529
-# internal_quant_engine_line_4530
-# internal_quant_engine_line_4531
-# internal_quant_engine_line_4532
-# internal_quant_engine_line_4533
-# internal_quant_engine_line_4534
-# internal_quant_engine_line_4535
-# internal_quant_engine_line_4536
-# internal_quant_engine_line_4537
-# internal_quant_engine_line_4538
-# internal_quant_engine_line_4539
-# internal_quant_engine_line_4540
-# internal_quant_engine_line_4541
-# internal_quant_engine_line_4542
-# internal_quant_engine_line_4543
-# internal_quant_engine_line_4544
-# internal_quant_engine_line_4545
-# internal_quant_engine_line_4546
-# internal_quant_engine_line_4547
-# internal_quant_engine_line_4548
-# internal_quant_engine_line_4549
-# internal_quant_engine_line_4550
-# internal_quant_engine_line_4551
-# internal_quant_engine_line_4552
-# internal_quant_engine_line_4553
-# internal_quant_engine_line_4554
-# internal_quant_engine_line_4555
-# internal_quant_engine_line_4556
-# internal_quant_engine_line_4557
-# internal_quant_engine_line_4558
-# internal_quant_engine_line_4559
-# internal_quant_engine_line_4560
-# internal_quant_engine_line_4561
-# internal_quant_engine_line_4562
-# internal_quant_engine_line_4563
-# internal_quant_engine_line_4564
-# internal_quant_engine_line_4565
-# internal_quant_engine_line_4566
-# internal_quant_engine_line_4567
-# internal_quant_engine_line_4568
-# internal_quant_engine_line_4569
-# internal_quant_engine_line_4570
-# internal_quant_engine_line_4571
-# internal_quant_engine_line_4572
-# internal_quant_engine_line_4573
-# internal_quant_engine_line_4574
-# internal_quant_engine_line_4575
-# internal_quant_engine_line_4576
-# internal_quant_engine_line_4577
-# internal_quant_engine_line_4578
-# internal_quant_engine_line_4579
-# internal_quant_engine_line_4580
-# internal_quant_engine_line_4581
-# internal_quant_engine_line_4582
-# internal_quant_engine_line_4583
-# internal_quant_engine_line_4584
-# internal_quant_engine_line_4585
-# internal_quant_engine_line_4586
-# internal_quant_engine_line_4587
-# internal_quant_engine_line_4588
-# internal_quant_engine_line_4589
-# internal_quant_engine_line_4590
-# internal_quant_engine_line_4591
-# internal_quant_engine_line_4592
-# internal_quant_engine_line_4593
-# internal_quant_engine_line_4594
-# internal_quant_engine_line_4595
-# internal_quant_engine_line_4596
-# internal_quant_engine_line_4597
-# internal_quant_engine_line_4598
-# internal_quant_engine_line_4599
-# internal_quant_engine_line_4600
-# internal_quant_engine_line_4601
-# internal_quant_engine_line_4602
-# internal_quant_engine_line_4603
-# internal_quant_engine_line_4604
-# internal_quant_engine_line_4605
-# internal_quant_engine_line_4606
-# internal_quant_engine_line_4607
-# internal_quant_engine_line_4608
-# internal_quant_engine_line_4609
-# internal_quant_engine_line_4610
-# internal_quant_engine_line_4611
-# internal_quant_engine_line_4612
-# internal_quant_engine_line_4613
-# internal_quant_engine_line_4614
-# internal_quant_engine_line_4615
-# internal_quant_engine_line_4616
-# internal_quant_engine_line_4617
-# internal_quant_engine_line_4618
-# internal_quant_engine_line_4619
-# internal_quant_engine_line_4620
-# internal_quant_engine_line_4621
-# internal_quant_engine_line_4622
-# internal_quant_engine_line_4623
-# internal_quant_engine_line_4624
-# internal_quant_engine_line_4625
-# internal_quant_engine_line_4626
-# internal_quant_engine_line_4627
-# internal_quant_engine_line_4628
-# internal_quant_engine_line_4629
-# internal_quant_engine_line_4630
-# internal_quant_engine_line_4631
-# internal_quant_engine_line_4632
-# internal_quant_engine_line_4633
-# internal_quant_engine_line_4634
-# internal_quant_engine_line_4635
-# internal_quant_engine_line_4636
-# internal_quant_engine_line_4637
-# internal_quant_engine_line_4638
-# internal_quant_engine_line_4639
-# internal_quant_engine_line_4640
-# internal_quant_engine_line_4641
-# internal_quant_engine_line_4642
-# internal_quant_engine_line_4643
-# internal_quant_engine_line_4644
-# internal_quant_engine_line_4645
-# internal_quant_engine_line_4646
-# internal_quant_engine_line_4647
-# internal_quant_engine_line_4648
-# internal_quant_engine_line_4649
-# internal_quant_engine_line_4650
-# internal_quant_engine_line_4651
-# internal_quant_engine_line_4652
-# internal_quant_engine_line_4653
-# internal_quant_engine_line_4654
-# internal_quant_engine_line_4655
-# internal_quant_engine_line_4656
-# internal_quant_engine_line_4657
-# internal_quant_engine_line_4658
-# internal_quant_engine_line_4659
-# internal_quant_engine_line_4660
-# internal_quant_engine_line_4661
-# internal_quant_engine_line_4662
-# internal_quant_engine_line_4663
-# internal_quant_engine_line_4664
-# internal_quant_engine_line_4665
-# internal_quant_engine_line_4666
-# internal_quant_engine_line_4667
-# internal_quant_engine_line_4668
-# internal_quant_engine_line_4669
-# internal_quant_engine_line_4670
-# internal_quant_engine_line_4671
-# internal_quant_engine_line_4672
-# internal_quant_engine_line_4673
-# internal_quant_engine_line_4674
-# internal_quant_engine_line_4675
-# internal_quant_engine_line_4676
-# internal_quant_engine_line_4677
-# internal_quant_engine_line_4678
-# internal_quant_engine_line_4679
-# internal_quant_engine_line_4680
-# internal_quant_engine_line_4681
-# internal_quant_engine_line_4682
-# internal_quant_engine_line_4683
-# internal_quant_engine_line_4684
-# internal_quant_engine_line_4685
-# internal_quant_engine_line_4686
-# internal_quant_engine_line_4687
-# internal_quant_engine_line_4688
-# internal_quant_engine_line_4689
-# internal_quant_engine_line_4690
-# internal_quant_engine_line_4691
-# internal_quant_engine_line_4692
-# internal_quant_engine_line_4693
-# internal_quant_engine_line_4694
-# internal_quant_engine_line_4695
-# internal_quant_engine_line_4696
-# internal_quant_engine_line_4697
-# internal_quant_engine_line_4698
-# internal_quant_engine_line_4699
-# internal_quant_engine_line_4700
-# internal_quant_engine_line_4701
-# internal_quant_engine_line_4702
-# internal_quant_engine_line_4703
-# internal_quant_engine_line_4704
-# internal_quant_engine_line_4705
-# internal_quant_engine_line_4706
-# internal_quant_engine_line_4707
-# internal_quant_engine_line_4708
-# internal_quant_engine_line_4709
-# internal_quant_engine_line_4710
-# internal_quant_engine_line_4711
-# internal_quant_engine_line_4712
-# internal_quant_engine_line_4713
-# internal_quant_engine_line_4714
-# internal_quant_engine_line_4715
-# internal_quant_engine_line_4716
-# internal_quant_engine_line_4717
-# internal_quant_engine_line_4718
-# internal_quant_engine_line_4719
-# internal_quant_engine_line_4720
-# internal_quant_engine_line_4721
-# internal_quant_engine_line_4722
-# internal_quant_engine_line_4723
-# internal_quant_engine_line_4724
-# internal_quant_engine_line_4725
-# internal_quant_engine_line_4726
-# internal_quant_engine_line_4727
-# internal_quant_engine_line_4728
-# internal_quant_engine_line_4729
-# internal_quant_engine_line_4730
-# internal_quant_engine_line_4731
-# internal_quant_engine_line_4732
-# internal_quant_engine_line_4733
-# internal_quant_engine_line_4734
-# internal_quant_engine_line_4735
-# internal_quant_engine_line_4736
-# internal_quant_engine_line_4737
-# internal_quant_engine_line_4738
-# internal_quant_engine_line_4739
-# internal_quant_engine_line_4740
-# internal_quant_engine_line_4741
-# internal_quant_engine_line_4742
-# internal_quant_engine_line_4743
-# internal_quant_engine_line_4744
-# internal_quant_engine_line_4745
-# internal_quant_engine_line_4746
-# internal_quant_engine_line_4747
-# internal_quant_engine_line_4748
-# internal_quant_engine_line_4749
-# internal_quant_engine_line_4750
-# internal_quant_engine_line_4751
-# internal_quant_engine_line_4752
-# internal_quant_engine_line_4753
-# internal_quant_engine_line_4754
-# internal_quant_engine_line_4755
-# internal_quant_engine_line_4756
-# internal_quant_engine_line_4757
-# internal_quant_engine_line_4758
-# internal_quant_engine_line_4759
-# internal_quant_engine_line_4760
-# internal_quant_engine_line_4761
-# internal_quant_engine_line_4762
-# internal_quant_engine_line_4763
-# internal_quant_engine_line_4764
-# internal_quant_engine_line_4765
-# internal_quant_engine_line_4766
-# internal_quant_engine_line_4767
-# internal_quant_engine_line_4768
-# internal_quant_engine_line_4769
-# internal_quant_engine_line_4770
-# internal_quant_engine_line_4771
-# internal_quant_engine_line_4772
-# internal_quant_engine_line_4773
-# internal_quant_engine_line_4774
-# internal_quant_engine_line_4775
-# internal_quant_engine_line_4776
-# internal_quant_engine_line_4777
-# internal_quant_engine_line_4778
-# internal_quant_engine_line_4779
-# internal_quant_engine_line_4780
-# internal_quant_engine_line_4781
-# internal_quant_engine_line_4782
-# internal_quant_engine_line_4783
-# internal_quant_engine_line_4784
-# internal_quant_engine_line_4785
-# internal_quant_engine_line_4786
-# internal_quant_engine_line_4787
-# internal_quant_engine_line_4788
-# internal_quant_engine_line_4789
-# internal_quant_engine_line_4790
-# internal_quant_engine_line_4791
-# internal_quant_engine_line_4792
-# internal_quant_engine_line_4793
-# internal_quant_engine_line_4794
-# internal_quant_engine_line_4795
-# internal_quant_engine_line_4796
-# internal_quant_engine_line_4797
-# internal_quant_engine_line_4798
-# internal_quant_engine_line_4799
-# internal_quant_engine_line_4800
-# internal_quant_engine_line_4801
-# internal_quant_engine_line_4802
-# internal_quant_engine_line_4803
-# internal_quant_engine_line_4804
-# internal_quant_engine_line_4805
-# internal_quant_engine_line_4806
-# internal_quant_engine_line_4807
-# internal_quant_engine_line_4808
-# internal_quant_engine_line_4809
-# internal_quant_engine_line_4810
-# internal_quant_engine_line_4811
-# internal_quant_engine_line_4812
-# internal_quant_engine_line_4813
-# internal_quant_engine_line_4814
-# internal_quant_engine_line_4815
-# internal_quant_engine_line_4816
-# internal_quant_engine_line_4817
-# internal_quant_engine_line_4818
-# internal_quant_engine_line_4819
-# internal_quant_engine_line_4820
-# internal_quant_engine_line_4821
-# internal_quant_engine_line_4822
-# internal_quant_engine_line_4823
-# internal_quant_engine_line_4824
-# internal_quant_engine_line_4825
-# internal_quant_engine_line_4826
-# internal_quant_engine_line_4827
-# internal_quant_engine_line_4828
-# internal_quant_engine_line_4829
-# internal_quant_engine_line_4830
-# internal_quant_engine_line_4831
-# internal_quant_engine_line_4832
-# internal_quant_engine_line_4833
-# internal_quant_engine_line_4834
-# internal_quant_engine_line_4835
-# internal_quant_engine_line_4836
-# internal_quant_engine_line_4837
-# internal_quant_engine_line_4838
-# internal_quant_engine_line_4839
-# internal_quant_engine_line_4840
+    # Stage0
+    s0, sec, m0 = stage0_select(min_price=min_price, min_avg_volume=min_avg_volume, keep=int(stage0_keep))
+    diag["stage0"] = m0
+    if s0.empty:
+        diag["stage"] = "done"
+        diag["mode"] = "degraded"
+        diag["errors"].append("Stage0 empty: DB更新不足 or フィルタが厳しすぎます")
+        diag["elapsed_sec"] = time.time() - t0
+        return {"selected": pd.DataFrame(), "guide": pd.DataFrame(), "sector_strength": sec, "diag": diag}
+
+    # Stage1
+    s1, m1 = stage1_select(s0, keep=int(stage1_keep), atr_pct_min=float(atr_pct_min), atr_pct_max=float(atr_pct_max))
+    diag["stage1"] = m1
+    if s1.empty:
+        diag["stage"] = "done"
+        diag["mode"] = "degraded"
+        diag["errors"].append("Stage1 empty: ATR%条件/履歴不足")
+        diag["elapsed_sec"] = time.time() - t0
+        return {"selected": pd.DataFrame(), "guide": pd.DataFrame(), "sector_strength": sec, "diag": diag}
+
+    # Stage2
+    sel, guide, m2 = stage2_rank(
+        s1,
+        keep=int(stage2_keep),
+        stage2_days=int(stage2_days),
+        min_bars=int(stage2_min_bars),
+        include_fundamentals=bool(include_fundamentals),
+        fundamentals_top_n=int(fundamentals_top_n),
+    )
+    diag["stage2"] = m2
+    if sel.empty:
+        diag["mode"] = "degraded"
+        diag["errors"].append("Stage2 empty: 利確評価失敗")
+        diag["stage"] = "done"
+        diag["elapsed_sec"] = time.time() - t0
+        return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
+
+    # Stage3: capital efficiency (資金効率最優先)
+    try:
+        # lot size from universe table
+        conn_l = _connect()
+        try:
+            with conn_l.cursor() as cur:
+                cur.execute(
+                    "SELECT symbol, COALESCE(lot_size,100) FROM universe_symbols WHERE symbol = ANY(%s);",
+                    (sel["銘柄"].astype(str).tolist(),),
+                )
+                lot_rows = cur.fetchall()
+        finally:
+            conn_l.close()
+        lot_map = {r[0]: int(r[1] or 100) for r in lot_rows} if lot_rows else {}
+
+        mp = max(int(max_positions), 1)
+        per_pos = float(capital_total) / mp
+
+        shares_list = []
+        use_list = []
+        prof_list = []
+        daily_list = []
+        eff_list = []
+        for _, r in sel.iterrows():
+            sym = str(r["銘柄"])
+            entry = float(r["現在値（終値）"])
+            tp = float(r["TP目安"])
+            lot = lot_map.get(sym, 100)
+
+            lots = int(per_pos // (entry * lot))
+            shares = lots * lot
+            use = shares * entry
+            prof = shares * (tp - entry)
+            avg_days = float(r.get("平均利確日数", 10.0))
+            daily = prof / max(avg_days, 1.0)
+            eff = prof / max(use, 1.0)
+
+            shares_list.append(shares)
+            use_list.append(use)
+            prof_list.append(prof)
+            daily_list.append(daily)
+            eff_list.append(eff)
+
+        sel["推奨株数"] = shares_list
+        sel["想定投入額(円)"] = np.round(use_list, 0)
+        sel["想定利確額(円)"] = np.round(prof_list, 0)
+        sel["想定日次利確(円/日)"] = np.round(daily_list, 0)
+        sel["資金効率(利確/投入)"] = np.round(np.array(eff_list) * 100.0, 3)  # %
+
+        # drop unaffordable
+        sel = sel[sel["推奨株数"] > 0].copy()
+        if sel.empty:
+            diag["mode"] = "degraded"
+            diag["errors"].append("Stage3: 資金制約により購入可能な銘柄がありません（単元が高すぎます）")
+            diag["stage"] = "done"
+            diag["elapsed_sec"] = time.time() - t0
+            return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
+
+        def _z(x: np.ndarray) -> np.ndarray:
+            x = np.asarray(x, dtype=float)
+            mn = np.nanmin(x)
+            mx = np.nanmax(x)
+            if not np.isfinite(mn) or not np.isfinite(mx) or (mx - mn) < 1e-9:
+                return np.zeros_like(x)
+            return (x - mn) / (mx - mn)
+
+        eff_n = _z(sel["資金効率(利確/投入)"].values)
+        daily_n = _z(sel["想定日次利確(円/日)"].values)
+        ev_n = _z(sel["期待値EV(R)"].values)
+        wr_n = _z(sel["TP到達率"].values)
+        dd_n = 1.0 - _z(sel["平均逆行(R)"].values)
+
+        # weights: growth-first (資金効率最優先)
+        sel["資金最適スコア"] = np.round(
+            0.35 * eff_n + 0.20 * daily_n + 0.20 * ev_n + 0.15 * wr_n + 0.10 * dd_n,
+            6,
+        )
+        sel = sel.sort_values("資金最適スコア", ascending=False).reset_index(drop=True)
+        sel.insert(0, "順位", range(1, len(sel) + 1))
+    except Exception as e:
+        diag["mode"] = "degraded"
+        diag["errors"].append(f"Stage3 warning: 資金最適化で例外（ランキングはStage2のまま）: {type(e).__name__}: {e}")
+
+    diag["stage"] = "done"
+    diag["elapsed_sec"] = time.time() - t0
+    return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
+
+def save_last_diag(diag: Dict[str, Any]) -> None:
+    try:
+        with open(LAST_DIAG_PATH, "w", encoding="utf-8") as f:
+            json.dump(diag, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def load_last_diag() -> Optional[Dict[str, Any]]:
+    try:
+        if os.path.exists(LAST_DIAG_PATH):
+            with open(LAST_DIAG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        return None
+    return None
+
+
+
+# =====================================================
+# ===== Institutional AI Extensions (v12 add-on) ======
+# =====================================================
+
+import numpy as _np
+import pandas as _pd
+
+# ---- Liquidity Flow AI ----
+def liquidity_flow_ai(df):
+    try:
+        if df is None or len(df) < 25:
+            return 0.0
+        close = df["Close"].astype(float)
+        volume = df["Volume"].astype(float)
+        ret = close.pct_change()
+        money_flow = (ret * volume).rolling(10).sum()
+        vol_surge = volume.iloc[-1] / (volume.rolling(20).mean().iloc[-1] + 1e-9)
+        trend = close.rolling(20).mean()
+        trend_align = 1 if close.iloc[-1] > trend.iloc[-1] else -1
+        volatility = ret.rolling(20).std()
+        flow_score = (
+            0.4 * vol_surge +
+            0.3 * float(money_flow.iloc[-1]) +
+            0.2 * trend_align -
+            0.1 * float(volatility.iloc[-1])
+        )
+        if _np.isfinite(flow_score):
+            return float(flow_score)
+        return 0.0
+    except Exception:
+        return 0.0
+
+# ---- Sector Flow AI ----
+def sector_flow_ai(df):
+    try:
+        if "sector33_name" not in df.columns:
+            return None
+        sec = df.groupby("sector33_name")["RET_3M"].mean()
+        return sec.sort_values(ascending=False)
+    except Exception:
+        return None
+
+# ---- Market Regime AI ----
+def market_regime_ai(index_df):
+    try:
+        close = index_df["Close"].astype(float)
+        ma200 = close.rolling(200).mean()
+        vol = close.pct_change().rolling(20).std()
+        price = close.iloc[-1]
+        if price > ma200.iloc[-1] and vol.iloc[-1] < 0.25:
+            return "BULL"
+        if price < ma200.iloc[-1] and vol.iloc[-1] > 0.30:
+            return "BEAR"
+        return "RANGE"
+    except Exception:
+        return "UNKNOWN"
+
+# ---- MonteCarlo Drawdown ----
+def montecarlo_dd_ext(returns, n=2000):
+    try:
+        dd=[]
+        returns=_np.array(returns)
+        for _ in range(n):
+            sim=_np.random.choice(returns,len(returns))
+            eq=_np.cumprod(1+sim)
+            peak=_np.maximum.accumulate(eq)
+            dd.append(_np.min(eq/peak-1))
+        return float(_np.percentile(dd,5))
+    except Exception:
+        return 0.0
+
+# ---- Institutional Risk Engine ----
+def institutional_risk_engine(returns):
+    try:
+        vol=_np.std(returns)
+        dd=_np.min(_np.cumsum(returns))
+        sharpe=_np.mean(returns)/(_np.std(returns)+1e-9)
+        risk = vol + abs(dd) - sharpe
+        return float(risk)
+    except Exception:
+        return 0.0
+
+# ---- WalkForward Evaluation ----
+def walkforward_test_ext(returns):
+    try:
+        split=int(len(returns)*0.7)
+        train=returns[:split]
+        test=returns[split:]
+        sharpe_train=_np.mean(train)/(_np.std(train)+1e-9)
+        sharpe_test=_np.mean(test)/(_np.std(test)+1e-9)
+        return float(sharpe_train),float(sharpe_test)
+    except Exception:
+        return 0.0,0.0
+
+# ---- Final Institutional AI Score ----
+def final_ai_score_ext(row):
+    try:
+        score=(
+            0.15*row.get("trend_score",0)+
+            0.15*row.get("liquidity_flow",0)+
+            0.12*row.get("sector_flow",0)+
+            0.10*row.get("wf_oos_wr",0)+
+            0.10*row.get("wf_oos_rr",0)+
+            0.10*row.get("mc_dd5",0)+
+            0.08*row.get("kelly_f",0)+
+            0.08*row.get("trend_score",0)+
+            0.07*row.get("buffett_score",0)+
+            0.05*(1-row.get("risk_score",0))
+        )
+        if _np.isfinite(score):
+            return float(score)
+        return 0.0
+    except Exception:
+        return 0.0
