@@ -276,9 +276,10 @@ if run_scan:
         st.success(f"スキャン完了（{elapsed:.1f}秒） / mode={diag.get('mode','?')}")
         with st.expander("📊 診断（JSON）", expanded=False):
             st.json(diag)
-        st.subheader("🏁 セクター強度ランキング（Stage0）")
-        st.caption("（補足）セクターが「不明」ばかりの場合は、銘柄マスタの33業種がDBに入っていません。サイドバーの『33業種を再同期（JPX）』を実行してください。")
-        st.caption("※ここは **33業種ごとの“強度（中央値）”** ランキングです。銘柄ランキングではありません。")
+        show_sector_panel = st.sidebar.checkbox("セクター強弱（表示）", value=False, help="通常は非表示。内部ではセクター強弱で絞り込みに利用します。")
+if show_sector_panel:
+    with st.expander("🏁 セクター強度ランキング（Stage0）", expanded=False):
+        st.caption("※内部ロジックではセクター強弱で絞り込みを行います。表示は任意です。")
         sec = out.get("sector_strength")
         if isinstance(sec, pd.DataFrame) and len(sec):
             if mobile_cards:
@@ -288,9 +289,10 @@ if run_scan:
             else:
                 st.dataframe(sec, width="stretch")
         else:
-            st.info("セクター情報が不足しているため、セクター強度は非表示です（銘柄マスタに33業種が入っているか確認してください）。")
+            st.info("セクター情報が不足しているため、セクター強度は非表示です。")
 
-        st.subheader("🏆 AI最終選定銘柄（利確スコア統合）")
+st.subheader("🏆 AI最終選定銘柄（利確スコア統合）")
+
         st.caption("どれを買うか？（利確評価＋資金効率でランキング）")
         st.caption("※ここは **Stage2（固定TP/SL/最大保有）で“利確が再現しやすい順”** に並べた最終ランキングです。")
         df = out.get("selected")
@@ -387,23 +389,3 @@ if run_scan:
 
 st.markdown("---")
 st.caption("※注意：本ツールは投資助言ではありません。最終判断はご自身で行ってください。")
-
-
-# ==========================================================
-# v11 GUI列
-# ==========================================================
-def add_v11_columns(df):
-    if df is None:
-        return df
-    cols=[
-        "市場レジーム",
-        "WFスコア",
-        "Sharpe",
-        "MC_DD",
-        "破産確率",
-        "AIスコア"
-    ]
-    for c in cols:
-        if c not in df.columns:
-            df[c]=None
-    return df
