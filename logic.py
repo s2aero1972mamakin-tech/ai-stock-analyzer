@@ -1903,6 +1903,92 @@ def run_scan_3stage(
         diag["v13_engines_integrated"] = False
         diag["errors"].append(f"v13 engines skipped: {type(_e_v13).__name__}: {_e_v13}")
 
+
+    # ---- v13 必須エントリー情報を必ず埋める（None禁止） ----
+    try:
+        if "銘柄" in sel.columns and "symbol" not in sel.columns:
+            sel["symbol"] = sel["銘柄"]
+
+        # Name / Sector
+        if "企業名" not in sel.columns:
+            if "name" in sel.columns:
+                sel["企業名"] = sel["name"]
+            elif "銘柄名" in sel.columns:
+                sel["企業名"] = sel["銘柄名"]
+            else:
+                sel["企業名"] = ""
+        if "セクター" not in sel.columns:
+            if "sector33_name" in sel.columns:
+                sel["セクター"] = sel["sector33_name"]
+            else:
+                sel["セクター"] = ""
+
+        # fallback from universe meta
+        try:
+            meta = universe_load_meta()
+            if meta is not None and len(meta):
+                meta2 = meta.copy()
+                if "name" in meta2.columns and "企業名" not in meta2.columns:
+                    meta2["企業名"] = meta2["name"]
+                if "sector33_name" in meta2.columns and "セクター" not in meta2.columns:
+                    meta2["セクター"] = meta2["sector33_name"]
+                meta2["symbol_norm"] = meta2["symbol"].astype(str).map(_norm_symbol)
+                sel["symbol_norm"] = sel["symbol"].astype(str).map(_norm_symbol)
+                sel = sel.merge(meta2[["symbol_norm","企業名","セクター"]], on="symbol_norm", how="left", suffixes=("","_meta"))
+                if "企業名_meta" in sel.columns:
+                    sel["企業名"] = sel["企業名"].astype(str).replace("None","").fillna("")
+                    sel["企業名"] = sel["企業名"].where(sel["企業名"].str.strip()!="", sel["企業名_meta"].fillna(""))
+                    sel.drop(columns=["企業名_meta"], inplace=True)
+                if "セクター_meta" in sel.columns:
+                    sel["セクター"] = sel["セクター"].astype(str).replace("None","").fillna("")
+                    sel["セクター"] = sel["セクター"].where(sel["セクター"].str.strip()!="", sel["セクター_meta"].fillna(""))
+                    sel.drop(columns=["セクター_meta"], inplace=True)
+        except Exception:
+            pass
+
+        sel["企業名"] = sel["企業名"].apply(lambda x: _fill_text(x, "不明"))
+        sel["セクター"] = sel["セクター"].apply(lambda x: _fill_text(x, "不明"))
+
+        # Entry plan (top N only)
+        topN_entry = min(len(sel), max(30, int(stage2_keep)))
+        plans = []
+        for sym in sel["symbol"].astype(str).tolist()[:topN_entry]:
+            dfh = fetch_last_n_days([sym], n_days=160)
+            if dfh is None or dfh.empty:
+                plans.append({"現在値（終値）": None, "Entry目安": None, "SL目安": None, "TP目安": None, "最大保有": 10, "ATR14": None})
+            else:
+                plans.append(_compute_entry_plan_from_history(dfh, tp_atr=1.5, sl_atr=1.0, max_hold_days=10))
+
+        plan_df = pd.DataFrame(plans)
+        for col in ["現在値（終値）","Entry目安","SL目安","TP目安","最大保有","ATR14"]:
+            if col not in plan_df.columns:
+                plan_df[col] = None
+
+        for col in ["現在値（終値）","Entry目安","SL目安","TP目安","最大保有","ATR14"]:
+            sel.loc[:topN_entry-1, col] = plan_df[col].values
+
+        for c in ["現在値（終値）","Entry目安","SL目安","TP目安","ATR14"]:
+            if c not in sel.columns:
+                sel[c] = None
+            sel[c] = sel[c].apply(lambda x: _safe_float(x, 0.0))
+
+        if "最大保有" in sel.columns:
+            sel["最大保有"] = sel["最大保有"].fillna(10).astype(int)
+        else:
+            sel["最大保有"] = 10
+
+        if "イベント注意" not in sel.columns:
+            sel["イベント注意"] = ""
+        sel["イベント注意"] = sel["イベント注意"].apply(lambda x: _fill_text(x, ""))
+
+        diag["entry_info_filled"] = True
+    except Exception as _e_entry:
+        diag["entry_info_filled"] = False
+        try:
+            diag["errors"].append(f"entry fill failed: {type(_e_entry).__name__}: {_e_entry}")
+        except Exception:
+            pass
+
 # Stage3: capital efficiency (資金効率最優先)
     try:
         # lot size from universe table
@@ -2152,3 +2238,65 @@ def institutional_score(row):
     except Exception:
         return 0.0
 
+
+
+
+# =====================================================
+# v13 Entry Info (必須情報) - full-data fill helpers
+# =====================================================
+def _safe_float(x, default=0.0):
+    try:
+        v = float(x)
+        if np.isfinite(v):
+            return float(v)
+        return float(default)
+    except Exception:
+        return float(default)
+
+def _fill_text(x, default="不明"):
+    try:
+        s = "" if x is None else str(x)
+        s = s.strip()
+        return s if s else default
+    except Exception:
+        return default
+
+def _compute_entry_plan_from_history(df_hist, tp_atr=1.5, sl_atr=1.0, max_hold_days=10):
+    # df_hist: DataFrame with Close/High/Low/Volume (at least 60 bars preferred)
+    out = {
+        "現在値（終値）": None, "Entry目安": None, "SL目安": None, "TP目安": None,
+        "最大保有": int(max_hold_days), "ATR14": None,
+    }
+    try:
+        if df_hist is None or df_hist.empty:
+            return out
+        d = df_hist.copy()
+        for col in ["Close","High","Low","Volume"]:
+            if col not in d.columns and col.lower() in d.columns:
+                d[col] = d[col.lower()]
+        if "Close" not in d.columns:
+            return out
+        close = d["Close"].astype(float)
+        last_close = float(close.iloc[-1])
+        out["現在値（終値）"] = last_close
+        out["Entry目安"] = last_close
+
+        # ATR14 (reuse existing _atr14 if available)
+        atr14 = None
+        try:
+            if all(c in d.columns for c in ["High","Low","Close"]):
+                atr = _atr14(d.rename(columns={"High":"High","Low":"Low","Close":"Close"})).dropna()
+                atr14 = float(atr.iloc[-1]) if len(atr) else None
+        except Exception:
+            atr14 = None
+
+        if atr14 is None or (not np.isfinite(atr14)) or atr14 <= 0:
+            ret = close.pct_change().dropna()
+            atr14 = float(close.iloc[-1] * (ret.tail(14).std() if len(ret) else 0.02))
+
+        out["ATR14"] = atr14
+        out["TP目安"] = float(last_close + tp_atr*atr14)
+        out["SL目安"] = float(last_close - sl_atr*atr14)
+        return out
+    except Exception:
+        return out
