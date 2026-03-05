@@ -1869,3 +1869,69 @@ def load_last_diag() -> Optional[Dict[str, Any]]:
     except Exception:
         return None
     return None
+
+
+# ==========================================================
+# JPX Scanner Quant Hedge Fund Engine (Extended)
+# セクターフローAI / WalkForward / 相関ポートフォリオ / Sharpe / 破産確率
+# ==========================================================
+import numpy as np
+import pandas as pd
+
+def quant_sector_flow(df):
+    if df is None or "sector33_name" not in df.columns:
+        return None
+    g = df.groupby("sector33_name")["stage0_score"].mean().sort_values(ascending=False)
+    out = pd.DataFrame({
+        "sector": g.index,
+        "flow_score": g.values
+    })
+    out["rank"] = range(1, len(out)+1)
+    return out
+
+def quant_walkforward(price_series, window=120, step=20):
+    if price_series is None or len(price_series) < window + step:
+        return None
+    returns = price_series.pct_change().dropna()
+    scores = []
+    for i in range(0, len(returns)-window, step):
+        train = returns[i:i+window]
+        test = returns[i+window:i+window+step]
+        if len(test) == 0:
+            continue
+        mu = train.mean()
+        sigma = train.std() + 1e-9
+        scores.append((test.mean()-mu)/sigma)
+    if not scores:
+        return None
+    return float(np.mean(scores))
+
+def quant_sharpe(returns):
+    r = np.array(returns)
+    if len(r) < 20:
+        return None
+    return float(np.mean(r)/(np.std(r)+1e-9)*np.sqrt(252))
+
+def quant_correlation_portfolio(price_df):
+    try:
+        ret = price_df.pct_change().dropna()
+        corr = ret.corr()
+        scores = []
+        for c in corr.columns:
+            val = corr[c].abs().mean()
+            scores.append((c, val))
+        scores.sort(key=lambda x: x[1])
+        return [s[0] for s in scores]
+    except Exception:
+        return []
+
+def quant_risk_of_ruin(win_rate, rr, risk=0.02):
+    try:
+        w = float(win_rate)
+        b = float(rr)
+        edge = w*b - (1-w)
+        if edge <= 0:
+            return 1.0
+        return float(((1-edge)/(1+edge))**(1/risk))
+    except Exception:
+        return 1.0
