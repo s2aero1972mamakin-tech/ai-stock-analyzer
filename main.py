@@ -387,3 +387,21 @@ if run_scan:
 
 st.markdown("---")
 st.caption("※注意：本ツールは投資助言ではありません。最終判断はご自身で行ってください。")
+
+
+# ==========================================================
+# Quant Engine UI Columns
+# ==========================================================
+def add_quant_columns(df):
+    if df is None:
+        return df
+    cols = [
+        "セクターフロー",
+        "WFスコア",
+        "Sharpe",
+        "破産確率"
+    ]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    return df
