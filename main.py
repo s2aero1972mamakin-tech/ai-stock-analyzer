@@ -328,11 +328,23 @@ if run_scan:
             for k,v in list(col_map.items()):
                 if k in df.columns and v not in df.columns:
                     df[v] = df[k]
-            # 列が無い場合は作る（落ちない）
-            for v in ["銘柄","企業名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式","Kelly最適化（f）","AIトレンド"]:
+            
+            # --- v13 UI bridge (optional columns) ---
+            if "liquidity_flow" in df.columns and "LiquidityFlow" not in df.columns: df["LiquidityFlow"] = df["liquidity_flow"]
+            if "sharpe_opt" in df.columns and "Sharpe最適化" not in df.columns: df["Sharpe最適化"] = df["sharpe_opt"]
+            if "mc_port" in df.columns and "MC Portfolio" not in df.columns: df["MC Portfolio"] = df["mc_port"]
+            if "bankruptcy_p" in df.columns and "破産確率" not in df.columns: df["破産確率"] = df["bankruptcy_p"]
+            if "transformer_pred" in df.columns and "Transformer予測" not in df.columns: df["Transformer予測"] = df["transformer_pred"]
+            if "macro_factor" in df.columns and "Macro因子" not in df.columns: df["Macro因子"] = df["macro_factor"]
+            if "institutional_score" in df.columns and "Institutionalスコア" not in df.columns: df["Institutionalスコア"] = df["institutional_score"]
+# 列が無い場合は作る（落ちない）
+                        # v13 fix: company/sector carry
+            if "銘柄名" in df.columns and "企業名" not in df.columns: df["企業名"] = df["銘柄名"]
+            if "name" in df.columns and "企業名" not in df.columns: df["企業名"] = df["name"]
+for v in ["銘柄","企業名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式","Kelly最適化（f）","AIトレンド"]:
                 if v not in df.columns:
                     df[v] = None
-            show_cols = ["順位","銘柄","企業名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式","Kelly最適化（f）","AIトレンド"]
+            show_cols = ["順位","銘柄","企業名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式","Kelly最適化（f）","AIトレンド","LiquidityFlow","Sharpe最適化","MC Portfolio","破産確率","Transformer予測","Macro因子","Institutionalスコア"]
             df = df[show_cols]
             try:
                 for c in ["3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","Kelly最適化（f）","AIトレンド"]:
