@@ -1665,8 +1665,10 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_
         df["イベント注意"] = "-"
         df["財務メモ"] = "OFF"
 
+    
     for c in ["利確スコア","TP到達率","期待値EV(R)","平均利確日数","平均逆行(R)","総合スコア"]:
-        df[c] = df[c].astype(float).round(4)
+        if c in df.columns:
+            df[c] = df[c].astype(float).round(4)
     df["TP到達率"] = (df["TP到達率"]*100.0).round(2)
 
     # 表示用: セクター/銘柄名（無い場合は空）
@@ -1682,7 +1684,14 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_
             df["銘柄名"] = ""
 
     cols = ["銘柄","銘柄名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式","Kelly最適化（f）","AIトレンド","現在値（終値）","TP目安","SL目安","TP到達率","期待値EV(R)","平均利確日数","平均逆行(R)","検証回数","利確スコア","バフェット簡易スコア","イベント注意","財務メモ"]
-    df = df[cols]
+    # --- column safety: ensure optional AI columns exist (avoid KeyError) ---
+    for _c in ["3ヶ月リターン","AIトレンド","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","Kelly最適化（f）"]:
+        if _c not in df.columns:
+            df[_c] = np.nan
+
+    # keep column order; missing columns become NaN
+    df = df.reindex(columns=cols)
+
 
     meta = {"ok": True, "elapsed_sec": time.time()-t0, "errors": errors, "sample_failures": sample_fail, "stage2_selected": int(len(df)), "diag": diag}
     return df, guide, meta
