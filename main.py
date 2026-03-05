@@ -87,6 +87,12 @@ if "NEON_DATABASE_URL" in st.secrets and not os.environ.get("NEON_DATABASE_URL")
     os.environ["NEON_DATABASE_URL"] = st.secrets["NEON_DATABASE_URL"]
 
 st.sidebar.header("💰 資金設定")
+
+st.sidebar.caption("※ 元資金30万円想定。S株(1株)や単元(100株)など最小単位を選べます。")
+lot_mode = st.sidebar.selectbox("注文単位", ["S株（1株）","単元（100株）","銘柄マスタ優先"], index=0, key="lot_mode")
+risk_pct_per_pos = st.sidebar.slider("1ポジション許容損失（%）", 0.2, 2.0, 1.0, 0.1, key="risk_pct_per_pos") / 100.0
+max_alloc_pct_per_pos = st.sidebar.slider("1ポジション最大投入（%）", 10.0, 80.0, 35.0, 1.0, key="max_alloc_pct_per_pos") / 100.0
+
 capital_total = st.sidebar.number_input("運用資金（円）", min_value=50000.0, value=300000.0, step=10000.0)
 max_positions = st.sidebar.selectbox("同時保有数（最大）", [1,2,3], index=0, key="max_positions")
 mobile_mode = st.sidebar.toggle("📱スマホ表示（カード）", value=True)
@@ -255,6 +261,9 @@ if run_scan:
             out = logic.run_scan_3stage(
                 capital_total=capital_total,
                 max_positions=int(max_positions),
+                lot_mode=str(lot_mode),
+                risk_pct_per_pos=float(risk_pct_per_pos),
+                max_alloc_pct_per_pos=float(max_alloc_pct_per_pos),
 
                 stage0_keep=stage0_keep,
                 stage1_keep=stage1_keep,
@@ -276,7 +285,6 @@ if run_scan:
         st.success(f"スキャン完了（{elapsed:.1f}秒） / mode={diag.get('mode','?')}")
         with st.expander("📊 診断（JSON）", expanded=False):
             st.json(diag)
-        with st.expander("🏁 セクター強度（参考）", expanded=False):
         st.subheader("🏁 セクター強度ランキング（Stage0）")
         st.caption("（補足）セクターが「不明」ばかりの場合は、銘柄マスタの33業種がDBに入っていません。サイドバーの『33業種を再同期（JPX）』を実行してください。")
         st.caption("※ここは **33業種ごとの“強度（中央値）”** ランキングです。銘柄ランキングではありません。")
@@ -291,8 +299,7 @@ if run_scan:
         else:
             st.info("セクター情報が不足しているため、セクター強度は非表示です（銘柄マスタに33業種が入っているか確認してください）。")
 
-        
-st.subheader("🏆 AI最終選定銘柄（利確スコア統合）")
+        st.subheader("🏆 AI最終選定銘柄（利確スコア統合）")
         st.caption("どれを買うか？（利確評価＋資金効率でランキング）")
         st.caption("※ここは **Stage2（固定TP/SL/最大保有）で“利確が再現しやすい順”** に並べた最終ランキングです。")
         df = out.get("selected")
@@ -330,24 +337,35 @@ st.subheader("🏆 AI最終選定銘柄（利確スコア統合）")
             for k,v in list(col_map.items()):
                 if k in df.columns and v not in df.columns:
                     df[v] = df[k]
-            
-            # --- v13 UI bridge (optional columns) ---
-            if "liquidity_flow" in df.columns and "LiquidityFlow" not in df.columns: df["LiquidityFlow"] = df["liquidity_flow"]
-            if "sharpe_opt" in df.columns and "Sharpe最適化" not in df.columns: df["Sharpe最適化"] = df["sharpe_opt"]
-            if "mc_port" in df.columns and "MC Portfolio" not in df.columns: df["MC Portfolio"] = df["mc_port"]
-            if "bankruptcy_p" in df.columns and "破産確率" not in df.columns: df["破産確率"] = df["bankruptcy_p"]
-            if "transformer_pred" in df.columns and "Transformer予測" not in df.columns: df["Transformer予測"] = df["transformer_pred"]
-            if "macro_factor" in df.columns and "Macro因子" not in df.columns: df["Macro因子"] = df["macro_factor"]
-            if "institutional_score" in df.columns and "Institutionalスコア" not in df.columns: df["Institutionalスコア"] = df["institutional_score"]
-# 列が無い場合は作る（落ちない）
-                        # v13 fix: company/sector carry
-            if "銘柄名" in df.columns and "企業名" not in df.columns: df["企業名"] = df["銘柄名"]
-            if "name" in df.columns and "企業名" not in df.columns: df["企業名"] = df["name"]
-for v in ["銘柄","企業名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式","Kelly最適化（f）","AIトレンド"]:
+            # 列が無い場合は作る（落ちない）
+            for v in ["銘柄","企業名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式","Kelly最適化（f）","AIトレンド"]:
                 if v not in df.columns:
                     df[v] = None
-            show_cols = ["順位","銘柄","企業名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式","Kelly最適化（f）","AIトレンド","LiquidityFlow","Sharpe最適化","MC Portfolio","破産確率","Transformer予測","Macro因子","Institutionalスコア"]
+            show_cols = ["順位","銘柄","企業名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式","Kelly最適化（f）","AIトレンド"]
             df = df[show_cols]
+            # ================================
+            # v14: メイン表示「エントリー必須情報」
+            # ================================
+            entry_cols = [
+                "順位","銘柄","企業名","セクター",
+                "現在値（終値）","Entry目安","SL目安","TP目安","RR","最大保有",
+                "推奨株数(株)","推奨投資額(円)","想定損失(円)",
+                "総合スコア","推奨方式","イベント注意","Entry状態"
+            ]
+            for c in entry_cols:
+                if c not in df.columns:
+                    df[c] = None
+            for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","推奨投資額(円)","想定損失(円)","総合スコア"]:
+                try:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+                except Exception:
+                    pass
+            try:
+                df["推奨株数(株)"] = pd.to_numeric(df["推奨株数(株)"], errors="coerce").fillna(0).astype(int)
+            except Exception:
+                pass
+            df_entry = df[entry_cols].copy()
+
             try:
                 for c in ["3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","Kelly最適化（f）","AIトレンド"]:
                     df[c] = pd.to_numeric(df[c], errors="coerce").round(4)
@@ -358,7 +376,7 @@ for v in ["銘柄","企業名","セクター","3ヶ月リターン","WF勝率（
             if mobile_cards:
                 render_cards_selected(df.head(show_top_n))
                 with st.expander("表で見る（PC向け）", expanded=False):
-                    st.dataframe(df_main if "df_main" in locals() else df, width="stretch")
+                    st.dataframe(df_entry if 'df_entry' in locals() else df, width="stretch")
             else:
                 st.dataframe(df, width="stretch")
 
