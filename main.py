@@ -191,8 +191,6 @@ atr_pct_max = st.sidebar.number_input("ATR% 上限", min_value=0.0, value=8.0, s
 
 stage2_days = st.sidebar.slider("Stage2 利確評価に使う履歴日数", 60, 365, 180, 5)
 stage2_min_bars = st.sidebar.slider("Stage2 最低バー数（短期は暫定評価）", 40, 140, 60, 5)
-
-
 include_fund = st.sidebar.checkbox("🧾 財務/イベント簡易チェック（RateLimit時は自動スキップ）", value=True)
 fund_top_n = st.sidebar.slider("財務/イベント取得数（上位Nのみ）", 0, 60, 20, 5)
 
@@ -284,17 +282,16 @@ if run_scan:
         st.caption("※ここは **Stage2（固定TP/SL/最大保有）で“利確が再現しやすい順”** に並べた最終ランキングです。")
         df = out.get("selected")
 
-        # v17.2 dataframe string clean
+        # v17.2 clean object/string fields before display
         if isinstance(df, pd.DataFrame):
             for c in df.columns:
                 if df[c].dtype == object:
                     df[c] = (
                         df[c]
+                        .replace([None, "None", "none", "nan", "NaN"], "")
                         .astype(str)
-                        .replace(["None","none","nan","NaN",""], "")
                         .str.strip()
                     )
-
         # --- column bridge (logic.py output may use JP labels) ---
         if isinstance(df, pd.DataFrame) and len(df):
             if "銘柄" in df.columns and "symbol" not in df.columns: df["symbol"] = df["銘柄"]
@@ -343,7 +340,7 @@ if run_scan:
                 pass
 
 
-            if mobile_cards:
+            if mobile_mode:
                 render_cards_selected(df.head(show_top_n))
                 with st.expander("表で見る（PC向け）", expanded=False):
                     st.dataframe(df, width="stretch")
@@ -371,7 +368,7 @@ if run_scan:
                 pass
             guide = guide.reset_index(drop=True)
             guide.insert(0, "順位", range(1, len(guide)+1))
-            if mobile_cards:
+            if mobile_mode:
                 render_cards_guide(guide.head(show_top_n))
                 with st.expander("表で見る（PC向け）", expanded=False):
                     st.dataframe(guide, width="stretch")
