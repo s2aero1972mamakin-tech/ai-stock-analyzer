@@ -40,10 +40,12 @@ def render_cards_sector(sec: pd.DataFrame):
 def render_cards_guide(df: pd.DataFrame):
     for _, r in df.iterrows():
         sym = r.get("銘柄","")
+        name = r.get("企業名","")
+        sector = r.get("セクター","")
         strat = r.get("推奨方式","")
-        title = f"{sym} / {strat}"
+        title = f"{sym} / {name} / {strat}"
         items = []
-        for k in ["Entry目安","SL目安","TP目安","最大保有"]:
+        for k in ["セクター","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有"]:
             if k in df.columns:
                 items.append(f"{k}:{r.get(k)}")
         st.markdown(
@@ -192,8 +194,7 @@ stage2_days = st.sidebar.slider("Stage2 利確評価に使う履歴日数", 60, 
 stage2_min_bars = st.sidebar.slider("Stage2 最低バー数（短期は暫定評価）", 40, 140, 60, 5)
 
 
-mobile_cards = st.sidebar.checkbox("📱 スマホ表示（カード）", value=True)
-include_fund = st.sidebar.checkbox("🧾 財務/イベント簡易チェック（RateLimit時は自動スキップ）", value=True)
+include_fund = st.sidebar.checkbox("🧾 財務簡易チェック（上位銘柄のみ。バフェット簡易スコア/イベント注意を付与）", value=True)
 fund_top_n = st.sidebar.slider("財務/イベント取得数（上位Nのみ）", 0, 60, 20, 5)
 
 st.sidebar.markdown("---")
@@ -331,7 +332,7 @@ if run_scan:
                 pass
 
 
-            if mobile_cards:
+            if mobile_mode:
                 render_cards_selected(df.head(show_top_n))
                 with st.expander("表で見る（PC向け）", expanded=False):
                     st.dataframe(df, width="stretch")
@@ -352,14 +353,18 @@ if run_scan:
         st.caption("どう買うか？（Entry/SL/TP と最大保有日数の具体案）")
         guide = out.get("guide")
         if isinstance(guide, pd.DataFrame) and len(guide):
-            # 表示は同時保有数ぶんだけ（実用優先）
             try:
+                # selected側の銘柄名/セクター/株数/投資額/損失/発注単位をguideへ付与
+                if isinstance(df, pd.DataFrame) and len(df) and "銘柄" in guide.columns and "銘柄" in df.columns:
+                    extra_cols = [c for c in ["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)"] if c in df.columns]
+                    if len(extra_cols) >= 2:
+                        guide = guide.merge(df[extra_cols].drop_duplicates(subset=["銘柄"]), on="銘柄", how="left", suffixes=("","_sel"))
                 guide = guide.head(int(max_positions))
             except Exception:
                 pass
             guide = guide.reset_index(drop=True)
             guide.insert(0, "順位", range(1, len(guide)+1))
-            if mobile_cards:
+            if mobile_mode:
                 render_cards_guide(guide.head(show_top_n))
                 with st.expander("表で見る（PC向け）", expanded=False):
                     st.dataframe(guide, width="stretch")
