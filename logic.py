@@ -1767,9 +1767,54 @@ def run_scan_3stage(
         diag["elapsed_sec"] = time.time() - t0
         return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
 
-    # Stage3: capital efficiency (資金効率最優先)
+
+    # Stage3: capital efficiency + execution sizing (v16.1 integrated)
     try:
-        # lot size from universe table
+        lot_mode = _ignored.get("lot_mode", "S株（1株）")
+        force_lot = 1 if "S株" in str(lot_mode) else 100
+
+        # merge guide (Entry/SL/TP/最大保有) into selected
+        try:
+            if isinstance(guide, pd.DataFrame) and not guide.empty:
+                _g = guide.copy()
+                keep_cols = [c for c in ["銘柄","Entry目安","SL目安","TP目安","最大保有"] if c in _g.columns]
+                _g = _g[keep_cols].drop_duplicates(subset=["銘柄"])
+                sel = sel.merge(_g, on="銘柄", how="left", suffixes=("","_guide"))
+                for c in ["Entry目安","SL目安","TP目安","最大保有"]:
+                    cg = f"{c}_guide"
+                    if cg in sel.columns:
+                        if c not in sel.columns:
+                            sel[c] = sel[cg]
+                        else:
+                            sel[c] = sel[c].where(pd.notna(sel[c]), sel[cg])
+                        sel.drop(columns=[cg], inplace=True)
+        except Exception as _e_merge:
+            diag["errors"].append(f"Stage3 guide merge warning: {type(_e_merge).__name__}: {_e_merge}")
+
+        # company/sector from universe meta
+        try:
+            meta_df = universe_load_meta()
+            if isinstance(meta_df, pd.DataFrame) and not meta_df.empty:
+                cols = [c for c in ["symbol","name","sector33_name"] if c in meta_df.columns]
+                m = meta_df[cols].copy()
+                m = m.rename(columns={"symbol":"銘柄","name":"企業名","sector33_name":"セクター"})
+                m = m.drop_duplicates(subset=["銘柄"])
+                sel = sel.merge(m, on="銘柄", how="left", suffixes=("","_meta"))
+                if "企業名_meta" in sel.columns:
+                    if "企業名" not in sel.columns:
+                        sel["企業名"] = sel["企業名_meta"]
+                    else:
+                        sel["企業名"] = sel["企業名"].where(sel["企業名"].astype(str).str.strip()!="", sel["企業名_meta"])
+                    sel.drop(columns=["企業名_meta"], inplace=True)
+                if "セクター_meta" in sel.columns:
+                    if "セクター" not in sel.columns:
+                        sel["セクター"] = sel["セクター_meta"]
+                    else:
+                        sel["セクター"] = sel["セクター"].where(sel["セクター"].astype(str).str.strip()!="", sel["セクター_meta"])
+                    sel.drop(columns=["セクター_meta"], inplace=True)
+        except Exception as _e_meta:
+            diag["errors"].append(f"Stage3 meta warning: {type(_e_meta).__name__}: {_e_meta}")
+
         conn_l = _connect()
         try:
             with conn_l.cursor() as cur:
@@ -1782,134 +1827,115 @@ def run_scan_3stage(
             conn_l.close()
         lot_map = {r[0]: int(r[1] or 100) for r in lot_rows} if lot_rows else {}
 
-        mp = max(int(max_positions), 1)
-        per_pos = float(capital_total) / mp
+        risk_budget = float(capital_total) * 0.01
 
         shares_list = []
-        use_list = []
-        prof_list = []
-        daily_list = []
-        eff_list = []
+        invest_list = []
+        loss_list = []
+        reason_list = []
+        rr_list = []
+        status_list = []
+
         for _, r in sel.iterrows():
             sym = str(r["銘柄"])
-            entry = float(r["現在値（終値）"])
-            tp = float(r["TP目安"])
-            lot = lot_map.get(sym, 100)
+            entry = float(r.get("Entry目安", r.get("現在値（終値）", 0)) or 0)
+            sl = float(r.get("SL目安", 0) or 0)
+            tp = float(r.get("TP目安", 0) or 0)
+            current = float(r.get("現在値（終値）", 0) or 0)
 
-            lots = int(per_pos // (entry * lot))
-            shares = lots * lot
-            use = shares * entry
-            prof = shares * (tp - entry)
-            avg_days = float(r.get("平均利確日数", 10.0))
-            daily = prof / max(avg_days, 1.0)
-            eff = prof / max(use, 1.0)
+            lot = force_lot
+            if "S株" not in str(lot_mode):
+                lot = int(lot_map.get(sym, 100) or 100)
 
-            shares_list.append(shares)
-            use_list.append(use)
-            prof_list.append(prof)
-            daily_list.append(daily)
-            eff_list.append(eff)
+            risk_per_share = max(entry - sl, 0.0)
+            shares = 0
+            invest = 0.0
+            loss = 0.0
+            reason = ""
+
+            if entry <= 0 or sl <= 0 or tp <= 0:
+                reason = "エントリー未計算"
+            elif risk_per_share <= 0:
+                reason = "損切幅不正"
+            else:
+                shares_risk = int(risk_budget // risk_per_share)
+                shares = (shares_risk // max(lot,1)) * max(lot,1)
+                invest = shares * entry
+                loss = shares * risk_per_share
+                if shares <= 0:
+                    reason = "資金不足または単元未満"
+
+            rr = ((tp - entry) / risk_per_share) if risk_per_share > 0 else 0.0
+            status = "未判定"
+            if current > 0 and entry > 0:
+                status = "ブレイク済" if current >= entry else "未ブレイク"
+
+            shares_list.append(int(shares))
+            invest_list.append(float(invest))
+            loss_list.append(float(loss))
+            reason_list.append(reason)
+            rr_list.append(float(rr))
+            status_list.append(status)
 
         sel["推奨株数"] = shares_list
-        sel["想定投入額(円)"] = np.round(use_list, 0)
-        sel["想定利確額(円)"] = np.round(prof_list, 0)
-        sel["想定日次利確(円/日)"] = np.round(daily_list, 0)
-        sel["資金効率(利確/投入)"] = np.round(np.array(eff_list) * 100.0, 3)  # %
-
-        # drop unaffordable
-        sel = sel[sel["推奨株数"] > 0].copy()
-        if sel.empty:
-            diag["mode"] = "degraded"
-            diag["errors"].append("Stage3: 資金制約により購入可能な銘柄がありません（単元が高すぎます）")
-            diag["stage"] = "done"
-            diag["elapsed_sec"] = time.time() - t0
-            return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
+        sel["推奨投資額(円)"] = np.round(invest_list, 0)
+        sel["想定損失(円)"] = np.round(loss_list, 0)
+        sel["発注不可理由"] = reason_list
+        sel["RR"] = np.round(rr_list, 3)
+        sel["Entry状態"] = status_list
 
         def _z(x: np.ndarray) -> np.ndarray:
             x = np.asarray(x, dtype=float)
+            if x.size == 0:
+                return x
             mn = np.nanmin(x)
             mx = np.nanmax(x)
             if not np.isfinite(mn) or not np.isfinite(mx) or (mx - mn) < 1e-9:
                 return np.zeros_like(x)
             return (x - mn) / (mx - mn)
 
-        eff_n = _z(sel["資金効率(利確/投入)"].values)
-        daily_n = _z(sel["想定日次利確(円/日)"].values)
-        ev_n = _z(sel["期待値EV(R)"].values)
-        wr_n = _z(sel["TP到達率"].values)
-        dd_n = 1.0 - _z(sel["平均逆行(R)"].values)
+        if "資金効率(利確/投入)" not in sel.columns:
+            entry_arr = pd.to_numeric(sel.get("Entry目安", 0), errors="coerce").fillna(0).values
+            tp_arr = pd.to_numeric(sel.get("TP目安", 0), errors="coerce").fillna(0).values
+            invest_arr = pd.to_numeric(sel.get("推奨投資額(円)", 0), errors="coerce").fillna(0).values
+            prof_arr = np.maximum(tp_arr - entry_arr, 0) * pd.to_numeric(sel.get("推奨株数", 0), errors="coerce").fillna(0).values
+            sel["想定利確額(円)"] = np.round(prof_arr, 0)
+            sel["資金効率(利確/投入)"] = np.where(invest_arr > 0, (prof_arr / np.maximum(invest_arr,1))*100.0, 0.0)
 
-        # weights: growth-first (資金効率最優先)
+        eff_n = _z(pd.to_numeric(sel["資金効率(利確/投入)"], errors="coerce").fillna(0).values)
+        daily_n = _z(pd.to_numeric(sel.get("想定日次利確(円/日)", 0), errors="coerce").fillna(0).values)
+        ev_n = _z(pd.to_numeric(sel.get("期待値EV(R)", 0), errors="coerce").fillna(0).values)
+        wr_n = _z(pd.to_numeric(sel.get("TP到達率", 0), errors="coerce").fillna(0).values)
+        dd_n = 1.0 - _z(pd.to_numeric(sel.get("平均逆行(R)", 0), errors="coerce").fillna(0).values)
+
         sel["資金最適スコア"] = np.round(
             0.35 * eff_n + 0.20 * daily_n + 0.20 * ev_n + 0.15 * wr_n + 0.10 * dd_n,
             6,
         )
-        sel = sel.sort_values("資金最適スコア", ascending=False).reset_index(drop=True)
+        sel = sel.sort_values(["資金最適スコア","総合スコア"], ascending=False).reset_index(drop=True)
         sel.insert(0, "順位", range(1, len(sel) + 1))
     except Exception as e:
         diag["mode"] = "degraded"
-        diag["errors"].append(f"Stage3 warning: 資金最適化で例外（ランキングはStage2のまま）: {type(e).__name__}: {e}")
+        diag["errors"].append(f"Stage3 warning: 資金最適化/発注計画で例外: {type(e).__name__}: {e}")
+
+    for c in ["企業名","セクター","発注不可理由","Entry状態"]:
+        if c not in sel.columns:
+            sel[c] = ""
+        sel[c] = sel[c].fillna("").replace("", "不明" if c in ["企業名","セクター"] else "")
+    for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","推奨投資額(円)","想定損失(円)","総合スコア"]:
+        if c not in sel.columns:
+            sel[c] = 0.0
+        sel[c] = pd.to_numeric(sel[c], errors="coerce").fillna(0.0)
+    if "推奨株数" not in sel.columns:
+        sel["推奨株数"] = 0
+    sel["推奨株数"] = pd.to_numeric(sel["推奨株数"], errors="coerce").fillna(0).astype(int)
+    if "最大保有" not in sel.columns:
+        sel["最大保有"] = "10営業日"
+    sel["最大保有"] = sel["最大保有"].fillna("10営業日").astype(str)
 
     diag["stage"] = "done"
     diag["elapsed_sec"] = time.time() - t0
-    
-    # --- v16 execution sizing (non-filtering) ---
-    try:
-        lot_mode=_ignored.get("lot_mode","S株（1株）")
-        lot=1 if "S株" in str(lot_mode) else 100
-
-        if "Entry目安" not in sel.columns:
-            sel["Entry目安"]=0
-        if "SL目安" not in sel.columns:
-            sel["SL目安"]=0
-
-        shares=[]
-        reasons=[]
-        invest=[]
-        loss=[]
-
-        for _,r in sel.iterrows():
-            entry=float(r.get("Entry目安",0))
-            sl=float(r.get("SL目安",0))
-            risk=max(entry-sl,0)
-
-            if risk<=0:
-                shares.append(0)
-                invest.append(0)
-                loss.append(0)
-                reasons.append("エントリー未計算")
-                continue
-
-            risk_budget=capital_total*0.01
-            s=int(risk_budget/risk)
-            s=(s//lot)*lot
-
-            shares.append(s)
-            invest.append(s*entry)
-            loss.append(s*risk)
-
-            if s==0:
-                reasons.append("資金不足または単元未満")
-            else:
-                reasons.append("")
-
-        sel["推奨株数"]=shares
-        sel["推奨投資額"]=invest
-        sel["想定損失"]=loss
-        sel["発注不可理由"]=reasons
-
-        sel=sel.fillna({
-            "企業名":"不明",
-            "セクター":"不明",
-            "Entry目安":0,
-            "SL目安":0,
-            "TP目安":0,
-            "RR":0
-        })
-    except Exception as _e:
-        diag["errors"].append(f"v16 sizing failed: {type(_e).__name__}:{_e}")
-
-return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
+    return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
 
 def save_last_diag(diag: Dict[str, Any]) -> None:
     try:
