@@ -283,6 +283,18 @@ if run_scan:
         st.caption("どれを買うか？（利確評価＋資金効率でランキング）")
         st.caption("※ここは **Stage2（固定TP/SL/最大保有）で“利確が再現しやすい順”** に並べた最終ランキングです。")
         df = out.get("selected")
+
+        # v17.2 dataframe string clean
+        if isinstance(df, pd.DataFrame):
+            for c in df.columns:
+                if df[c].dtype == object:
+                    df[c] = (
+                        df[c]
+                        .astype(str)
+                        .replace(["None","none","nan","NaN",""], "")
+                        .str.strip()
+                    )
+
         # --- column bridge (logic.py output may use JP labels) ---
         if isinstance(df, pd.DataFrame) and len(df):
             if "銘柄" in df.columns and "symbol" not in df.columns: df["symbol"] = df["銘柄"]
@@ -324,12 +336,6 @@ if run_scan:
                     df[v] = None
             show_cols = ["順位","銘柄","企業名","セクター","現在値（終値）","Entry目安","SL目安","TP目安","RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由"]
             df = df[show_cols]
-
-# v17.1 column clean
-for c in df.columns:
-    if df[c].dtype == object:
-        df[c] = df[c].astype(str).replace(["None","none","nan"],"").str.strip()
-
             try:
                 for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","推奨投資額(円)","想定損失(円)","総合スコア"]:
                     df[c] = pd.to_numeric(df[c], errors="coerce").round(4)
