@@ -1,3 +1,13 @@
+
+# --- v17.1 sector normalization ---
+def _normalize_sector(x):
+    if x is None:
+        return "不明"
+    s = str(x).strip()
+    if s.lower() in ["none","nan",""]:
+        return "不明"
+    return s
+
 import os
 import json
 import time
@@ -1135,7 +1145,7 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
     u_df['_sym_norm'] = u_df['symbol'].astype(str).map(_norm_symbol)
     df["_key"] = df["symbol"].astype(str).map(_sym_key)
     df = df.merge(u_df.drop(columns=["symbol","_sym_norm"], errors="ignore"), left_on="_key", right_on="_key", how="left")
-    df["sector33_name"] = df.get("sector33_name").replace("", None).fillna("不明")
+    df["sector33_name"] = df.get("sector33_name").apply(_normalize_sector)
     df["name"] = df.get("name").fillna("")
     df["pct_change_1d"] = (df["close_latest"] / (df["close_prev"] + 1e-12) - 1.0) * 100.0
 
