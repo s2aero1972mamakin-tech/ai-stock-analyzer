@@ -1,1682 +1,2114 @@
-
-
-
-# logic_fixed28_trend_entry_engine_compat.py
-# Drop-in replacement for logic.py
-# - Adds self-contained: HH/HL detection, breakout strength, continuation probability, phase-aware EV thresholding,
-#   momentum bonus (capped), and breakout gate.
-# - Designed to be backward-compatible with existing main.py callers.
-#
-# NOTE: This module does not depend on ctx keys being passed from main.py; it computes needed signals from price history.
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Dict, Any, Optional, Tuple, List
-
-import math
-import numpy as np
-import pandas as pd
-
-# ---------------------------------------------------------------------
-# Economic calendar / event risk (optional, free feed)
-# ---------------------------------------------------------------------
-# This tool is swing-oriented but macro events can cause gaps/slippage.
-# We therefore compute an "event_risk_score" from upcoming releases and
-# optionally block trades within a high-impact window.
-#
-# Default feed: Forex Factory weekly export (JSON)
-# - https://nfs.faireconomy.media/ff_calendar_thisweek.json
-#
-# Notes:
-# - If the feed is unavailable, we fail safe (event_risk_score=0) and
-#   expose status in ctx_out so the UI can warn the operator.
-#
+import os
 import json
 import time
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
-import ssl
-import tempfile
-from pathlib import Path
-import xml.etree.ElementTree as ET
-
-_FF_CAL_URL_DEFAULT = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-_EVENT_CACHE = {
-    "ts": 0.0,     # epoch seconds
-    "url": None,
-    "data": None,  # list
-    "err": None,   # str
-}
+import re
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 
-
-# Persistent file cache (survives Streamlit reruns / transient rate limits)
-_EVENT_FILE_CACHE_PATH = Path(tempfile.gettempdir()) / "fx_analyzer_ff_calendar_cache.json"
-
-def _read_event_file_cache(max_age_sec: int = 24 * 3600) -> Optional[List[dict]]:
+def compute_buffett_score(payload: dict) -> Optional[float]:
+    """Simple heuristic score 0..1. Missing -> None."""
+    if not isinstance(payload, dict) or not payload:
+        return None
+    def g(*keys):
+        for k in keys:
+            if k in payload and payload[k] not in (None, "", "None"):
+                return payload[k]
+        return None
     try:
-        p = _EVENT_FILE_CACHE_PATH
-        if not p.exists():
+        scores=[]
+        pe = g("trailingPE","pe","PER","per")
+        pb = g("priceToBook","pb","PBR","pbr")
+        de = g("debtToEquity","debt_equity","DE")
+        margin = g("profitMargins","netMargin","margin")
+        roe = g("returnOnEquity","roe")
+        if pe is not None:
+            pe=float(pe)
+            if pe>0: scores.append(max(0.0, min(1.0, (30.0-pe)/30.0)))
+        if pb is not None:
+            pb=float(pb)
+            if pb>0: scores.append(max(0.0, min(1.0, (3.0-pb)/3.0)))
+        if de is not None:
+            de=float(de)
+            scores.append(max(0.0, min(1.0, (200.0-de)/200.0)))
+        if margin is not None:
+            margin=float(margin)
+            if margin<=1.0: scores.append(max(0.0, min(1.0, margin/0.15)))
+            else: scores.append(max(0.0, min(1.0, (margin/100.0)/0.15)))
+        if roe is not None:
+            roe=float(roe)
+            if roe<=1.0: scores.append(max(0.0, min(1.0, roe/0.15)))
+            else: scores.append(max(0.0, min(1.0, (roe/100.0)/0.15)))
+        if not scores:
             return None
-        obj = json.loads(p.read_text(encoding="utf-8", errors="replace"))
-        if not isinstance(obj, dict):
-            return None
-        ts = float(obj.get("ts", 0.0) or 0.0)
-        data = obj.get("data", None)
-        if not isinstance(data, list):
-            return None
-        if ts > 0 and (time.time() - ts) > float(max_age_sec):
-            return None
-        return data
+        return float(sum(scores)/len(scores))
     except Exception:
         return None
 
-def _write_event_file_cache(url: str, data: List[dict]) -> None:
+
+def _sym_key(sym: str) -> str:
+    """Join key for JP symbols: strip suffix and non-digits, keep last 4 digits, zfill(4)."""
+    s = (sym or "").strip()
+    if not s:
+        return s
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if not digits:
+        return s
+    if len(digits) >= 4:
+        digits = digits[-4:]
+    return digits.zfill(4)
+
+
+def _norm_symbol(sym: str) -> str:
+    """Normalize symbol to JP format: '1301' -> '1301.T'."""
+    s = (sym or "").strip()
+    if not s:
+        return s
+    if "." in s:
+        return s
+    if s.isdigit():
+        return s.zfill(4) + ".T"
+    return s
+
+
+def _json_safe(obj: Any):
+    """json.dumps default helper (date/datetime/numpy)."""
     try:
-        p = _EVENT_FILE_CACHE_PATH
-        payload = {"ts": time.time(), "url": url, "data": data}
-        p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        import datetime as _dt
+        if isinstance(obj, (_dt.date, _dt.datetime)):
+            return obj.isoformat()
     except Exception:
         pass
-
-def _derive_xml_url(url: str) -> str:
-    u = str(url or "").strip()
-    if not u:
-        return "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
-    if ".json" in u:
-        return u.replace(".json", ".xml")
-    if u.endswith("/"):
-        u = u[:-1]
-    # fallback
-    return "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
-
-def _fetch_ff_calendar_xml(url: str, timeout: int = 12) -> Optional[List[dict]]:
-    """Parse ForexFactory weekly XML export into list[dict] compatible with _compute_event_risk."""
     try:
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0 (fx-analyzer; event-guard)"})
-        ctx = None
-        try:
-            ctx = ssl.create_default_context()
-        except Exception:
-            ctx = None
-        try:
-            with urlopen(req, timeout=timeout, context=ctx) as resp:
-                raw = resp.read()
-        except TypeError:
-            # python without context param
-            with urlopen(req, timeout=timeout) as resp:
-                raw = resp.read()
+        import numpy as _np
+        if isinstance(obj, (_np.integer,)):
+            return int(obj)
+        if isinstance(obj, (_np.floating,)):
+            return float(obj)
+        if isinstance(obj, (_np.bool_,)):
+            return bool(obj)
+    except Exception:
+        pass
+    return str(obj)
 
-        # XML is often windows-1252
-        txt = raw.decode("utf-8", errors="replace")
-        # Some servers send the XML declaration with windows-1252; ElementTree can parse bytes too.
-        root = ET.fromstring(txt)
-        out: List[dict] = []
-        ny_tz = ZoneInfo("America/New_York")
-        for ev in root.findall(".//event"):
-            title = (ev.findtext("title") or "").strip()
-            ctry = (ev.findtext("country") or "").strip().upper()
-            impact = (ev.findtext("impact") or "").strip()
-            date_s = (ev.findtext("date") or "").strip()
-            time_s = (ev.findtext("time") or "").strip()
-            # Date is typically MM-DD-YYYY in FF XML export
-            dt_obj = None
-            try:
-                mm, dd, yy = date_s.split("-")
-                hh, mi = (time_s.split(":") + ["0"])[:2] if time_s else ("0","0")
-                dt_obj = datetime(int(yy), int(mm), int(dd), int(hh), int(mi), 0, tzinfo=ny_tz)
-            except Exception:
-                dt_obj = None
-            if dt_obj is None:
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+JST = timezone(timedelta(hours=9))
+
+RATE_LIMIT_SLEEP_SEC = float(os.environ.get('RATE_LIMIT_SLEEP_SEC','0.4'))
+
+LAST_DIAG_PATH = "last_diag.json"
+
+# --- DB URL ---
+def _get_db_url() -> Optional[str]:
+    return os.environ.get("NEON_DATABASE_URL") or os.environ.get("DATABASE_URL")
+
+def check_db_config() -> Tuple[bool, str]:
+    url = _get_db_url()
+    if not url or "postgres" not in url:
+        return False, "Neonの接続URLが見つかりません（NEON_DATABASE_URL）。"
+    return True, "ok"
+
+def driver_diagnostics() -> Dict[str, Any]:
+    info: Dict[str, Any] = {"python": None, "psycopg": None, "psycopg2": None}
+    try:
+        import sys
+        info["python"] = sys.version
+    except Exception:
+        pass
+    try:
+        import psycopg  # type: ignore
+        info["psycopg"] = getattr(psycopg, "__version__", "unknown")
+    except Exception as e:
+        info["psycopg"] = {"error": repr(e)}
+    try:
+        import psycopg2  # type: ignore
+        info["psycopg2"] = getattr(psycopg2, "__version__", "unknown")
+    except Exception as e:
+        info["psycopg2"] = {"error": repr(e)}
+    return info
+
+def _connect():
+    url = _get_db_url()
+    if not url:
+        raise RuntimeError("NEON_DATABASE_URL not set")
+
+    psycopg_err = None
+    psycopg2_err = None
+
+    try:
+        import psycopg  # type: ignore
+        return psycopg.connect(url)
+    except Exception as e:
+        psycopg_err = repr(e)
+
+    try:
+        import psycopg2  # type: ignore
+        return psycopg2.connect(url)
+    except Exception as e:
+        psycopg2_err = repr(e)
+
+    raise RuntimeError(
+        "Postgresドライバをimport/接続できませんでした。\n"
+        f"psycopg error: {psycopg_err}\n"
+        f"psycopg2 error: {psycopg2_err}"
+    )
+
+def ensure_schema() -> None:
+    """DBスキーマを安全に作成/拡張（後方互換）"""
+    conn = _connect()
+    with conn.cursor() as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ohlc_daily (
+            symbol TEXT NOT NULL,
+            trade_date DATE NOT NULL,
+            open DOUBLE PRECISION,
+            high DOUBLE PRECISION,
+            low DOUBLE PRECISION,
+            close DOUBLE PRECISION,
+            adj_close DOUBLE PRECISION,
+            volume BIGINT,
+            PRIMARY KEY(symbol, trade_date)
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS kv_meta (
+            k TEXT PRIMARY KEY,
+            v TEXT
+        );
+        """)
+        # 銘柄マスタ（JPX公式一覧から自動取得する想定）
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS universe_symbols (
+            symbol TEXT PRIMARY KEY,
+            name TEXT,
+            market TEXT,
+            sector33_code TEXT,
+            sector33_name TEXT,
+            sector17_code TEXT,
+            sector17_name TEXT,
+            scale_code TEXT,
+            scale_name TEXT,
+            updated_utc TIMESTAMP DEFAULT NOW()
+        );
+        """)
+        # 既存DBの後方互換（古いテーブルに列を追加）
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS name TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS market TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector33_code TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector33_name TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector17_code TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector17_name TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS scale_code TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS scale_name TEXT;")
+        cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS updated_utc TIMESTAMP DEFAULT NOW();")
+        # 財務/イベント（簡易）キャッシュ
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS fundamentals_cache (
+            symbol TEXT PRIMARY KEY,
+            asof_date DATE,
+            payload_json TEXT,
+            updated_utc TIMESTAMP DEFAULT NOW()
+        );
+        """)
+        # --- universe_symbols columns migration (idempotent) ---
+        try:
+            cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS name TEXT;")
+            cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS market TEXT;")
+            cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector33_code TEXT;")
+            cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS sector33_name TEXT;")
+            cur.execute("ALTER TABLE universe_symbols ADD COLUMN IF NOT EXISTS lot_size INTEGER DEFAULT 100;")
+        except Exception:
+            pass
+
+    conn.commit()
+    conn.close()
+
+
+_universe_col_cache: Dict[str, bool] = {}
+
+def _has_universe_col(col: str) -> bool:
+    if col in _universe_col_cache:
+        return _universe_col_cache[col]
+    try:
+        conn = _connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_name='universe_symbols' AND column_name=%s
+                        LIMIT 1;""",
+                    (col,),
+                )
+                ok = cur.fetchone() is not None
+        finally:
+            conn.close()
+    except Exception:
+        ok = False
+    _universe_col_cache[col] = ok
+    return ok
+
+
+
+def _set_meta(conn, k: str, v: str):
+    with conn.cursor() as cur:
+        cur.execute("""
+        INSERT INTO kv_meta(k,v) VALUES(%s,%s)
+        ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v;
+        """, (k, v))
+
+def _get_meta(conn, k: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT v FROM kv_meta WHERE k=%s;", (k,))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+def universe_count() -> int:
+    ensure_schema()
+    conn = _connect()
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM universe_symbols;")
+        n = int(cur.fetchone()[0] or 0)
+    conn.close()
+    return n
+
+
+def universe_upsert(symbols: List[str], meta: Optional[Dict[str, Dict[str, Any]]] = None) -> int:
+    """Upsert universe symbols with optional metadata."""
+    ensure_schema()
+    meta = meta or {}
+
+    norm: List[str] = []
+    for s in symbols:
+        s = str(s).strip()
+        if not s:
+            continue
+        s2 = s.replace(" ", "").upper()
+        if re.fullmatch(r"\d{4}", s2):
+            s2 = s2 + ".T"
+        norm.append(s2)
+
+    seen = set()
+    uniq: List[str] = []
+    for s in norm:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
+
+    if not uniq:
+        return 0
+
+    conn = _connect()
+    with conn.cursor() as cur:
+        for sym in uniq:
+            # meta は '1301' / '1301.T' どちらのキーでも来うるので吸収する
+            base = sym[:-2] if sym.endswith(".T") else sym
+            m = meta.get(sym) or meta.get(base) or meta.get(base + ".T") or {}
+            cur.execute(
+                """INSERT INTO universe_symbols(symbol, name, market, sector33_code, sector33_name, lot_size, updated_utc)
+                   VALUES(%s,%s,%s,%s,%s,%s,NOW())
+                   ON CONFLICT(symbol) DO UPDATE SET
+                     name=COALESCE(EXCLUDED.name, universe_symbols.name),
+                     market=COALESCE(EXCLUDED.market, universe_symbols.market),
+                     sector33_code=COALESCE(EXCLUDED.sector33_code, universe_symbols.sector33_code),
+                     sector33_name=COALESCE(EXCLUDED.sector33_name, universe_symbols.sector33_name),
+                     lot_size=COALESCE(EXCLUDED.lot_size, universe_symbols.lot_size),
+                     updated_utc=NOW();""",
+                (sym, m.get("name"), m.get("market"), m.get("sector33_code"), m.get("sector33_name"), int(m.get("lot_size") or 100)),
+            )
+    conn.commit()
+    conn.close()
+    return len(uniq)
+
+def universe_upsert_rows(rows: List[Dict[str, Any]]) -> int:
+    """新: symbol + メタ（市場/33業種/銘柄名など）を upsert"""
+    ensure_schema()
+    # normalize + unique by symbol (preserve order)
+    seen = set()
+    norm_rows: List[Dict[str, Any]] = []
+    for r in rows:
+        sym = str(r.get("symbol","")).strip().replace(" ", "").upper()
+        if not sym:
+            continue
+        if re.fullmatch(r"\d{4}", sym):
+            sym = sym + ".T"
+        if sym in seen:
+            continue
+        seen.add(sym)
+        rr = dict(r)
+        rr["symbol"] = sym
+        norm_rows.append(rr)
+
+    if not norm_rows:
+        return 0
+
+    conn = _connect()
+    with conn.cursor() as cur:
+        for r in norm_rows:
+            cur.execute(
+                """
+                INSERT INTO universe_symbols(symbol, name, market, sector33_code, sector33_name, sector17_code, sector17_name, scale_code, scale_name, updated_utc)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW())
+                ON CONFLICT(symbol) DO UPDATE SET
+                    name=COALESCE(EXCLUDED.name, universe_symbols.name),
+                    market=COALESCE(EXCLUDED.market, universe_symbols.market),
+                    sector33_code=COALESCE(EXCLUDED.sector33_code, universe_symbols.sector33_code),
+                    sector33_name=COALESCE(EXCLUDED.sector33_name, universe_symbols.sector33_name),
+                    sector17_code=COALESCE(EXCLUDED.sector17_code, universe_symbols.sector17_code),
+                    sector17_name=COALESCE(EXCLUDED.sector17_name, universe_symbols.sector17_name),
+                    scale_code=COALESCE(EXCLUDED.scale_code, universe_symbols.scale_code),
+                    scale_name=COALESCE(EXCLUDED.scale_name, universe_symbols.scale_name),
+                    updated_utc=NOW();
+                """,
+                (
+                    r.get("symbol"),
+                    r.get("name"),
+                    r.get("market"),
+                    r.get("sector33_code"),
+                    r.get("sector33_name"),
+                    r.get("sector17_code"),
+                    r.get("sector17_name"),
+                    r.get("scale_code"),
+                    r.get("scale_name"),
+                ),
+            )
+    conn.commit()
+    conn.close()
+    return len(norm_rows)
+
+def universe_load_symbols(limit: Optional[int] = None) -> List[str]:
+    ensure_schema()
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            if limit is None:
+                cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol;")
+            else:
+                cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol LIMIT %s;", (int(limit),))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return [r[0] for r in rows if r and r[0]]
+
+    ensure_schema()
+    conn = _connect()
+    with conn.cursor() as cur:
+        if limit:
+            cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol LIMIT %s;", (int(limit),))
+        else:
+            cur.execute("SELECT symbol FROM universe_symbols ORDER BY symbol;")
+        rows = cur.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def universe_register_from_inputs(uploaded_csv_file, pasted_text: str):
+    symbols: List[str] = []
+    if uploaded_csv_file is not None:
+        try:
+            df = pd.read_csv(uploaded_csv_file)
+            cols = [c.lower() for c in df.columns]
+            pick = None
+            for c in ["ticker", "symbol", "code"]:
+                if c in cols:
+                    pick = df.columns[cols.index(c)]
+                    break
+            if pick is None:
+                return 0, "CSVに ticker / symbol / code 列が見つかりません。"
+            symbols += [str(x).strip() for x in df[pick].dropna().tolist()]
+        except Exception as e:
+            return 0, f"CSV読込に失敗: {e}"
+
+    if pasted_text and pasted_text.strip():
+        for line in pasted_text.splitlines():
+            line = line.strip()
+            if not line:
                 continue
-            out.append({
-                "title": title,
-                "country": ctry,
-                "impact": impact,
-                "timestamp": float(dt_obj.astimezone(timezone.utc).timestamp()),
-            })
-        return out if out else None
-    except Exception:
-        return None
-def _pair_to_ccys(pair: str) -> Tuple[str, str]:
-    s = (pair or "").upper().replace(" ", "")
-    s = s.replace("_", "/")
-    if "/" in s:
-        a, b = s.split("/", 1)
-        return (a[:3], b[:3])
-    # fallback: "USDJPY"
-    if len(s) >= 6:
-        return (s[:3], s[3:6])
-    return ("", "")
+            parts = [p.strip() for p in re.split(r"[\s,]+", line) if p.strip()]
+            symbols += parts
 
+    if not symbols:
+        return 0, "入力が空です。CSVをアップロードするか、銘柄を貼り付けてください。"
 
-def _pip_size(pair: str) -> float:
-    s = (pair or "").upper()
-    # Heuristic: JPY pairs use 0.01, others 0.0001
-    return 0.01 if "JPY" in s else 0.0001
-
-def _round_to_pip(x: float, pair: str) -> float:
     try:
-        p = _pip_size(pair)
-        return float(round(float(x) / p) * p)
-    except Exception:
-        return float(x)
+        n = universe_upsert(symbols)
+        return n, "ok"
+    except Exception as e:
+        return 0, f"DB登録に失敗: {e}"
 
-def _fetch_ff_calendar(url: str, timeout: int = 12, ttl_sec: int = 1800) -> Tuple[Optional[List[dict]], str]:
-    """Fetch weekly economic calendar (JSON preferred) with robust caching + XML/file fallback.
 
-    Streamlit Cloud reruns the script frequently. Also, the free FF weekly export can occasionally
-    return 429/5xx or time out. We therefore:
-      1) use in-memory TTL cache
-      2) try JSON fetch
-      3) on failure, try XML export (same host)
-      4) on failure, fall back to a local file cache (<=24h)
-    """
-    now = time.time()
-
-    # 1) in-memory cache
-    if (_EVENT_CACHE.get("data") is not None) and (_EVENT_CACHE.get("url") == url) and (now - float(_EVENT_CACHE.get("ts", 0.0)) < float(ttl_sec)):
-        return _EVENT_CACHE["data"], "cache"
-
-    def _urlopen_bytes(req: Request) -> bytes:
-        # Default SSL context; on TLS issues fall back to unverified context
-        try:
-            ctx = ssl.create_default_context()
-        except Exception:
-            ctx = None
-        try:
-            try:
-                with urlopen(req, timeout=timeout, context=ctx) as resp:
-                    return resp.read()
-            except TypeError:
-                with urlopen(req, timeout=timeout) as resp:
-                    return resp.read()
-        except Exception:
-            # last resort (some environments)
-            try:
-                uctx = ssl._create_unverified_context()
-                with urlopen(req, timeout=timeout, context=uctx) as resp:
-                    return resp.read()
-            except Exception:
-                raise
-
-    # 2) JSON fetch
+def universe_load_meta() -> pd.DataFrame:
+    """universe_symbols からメタ（市場/33業種など）を読み込む。無ければ空DF。"""
+    ensure_schema()
+    conn = _connect()
     try:
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0 (fx-analyzer; event-guard)", "Accept": "application/json,text/plain,*/*"})
-        raw = _urlopen_bytes(req)
-        data = json.loads(raw.decode("utf-8", errors="replace"))
-        if not isinstance(data, list):
-            raise ValueError("calendar json is not a list")
-        _EVENT_CACHE.update({"ts": now, "url": url, "data": data, "err": None})
-        _write_event_file_cache(url, data)
-        return data, "ok"
-    except Exception as e_json:
-        # 3) XML fallback
+        with conn.cursor() as cur:
+            cur.execute("SELECT symbol, name, market, sector33_code, sector33_name, sector17_code, sector17_name, scale_code, scale_name FROM universe_symbols;")
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return pd.DataFrame(columns=["symbol","name","market","sector33_code","sector33_name","sector17_code","sector17_name","scale_code","scale_name"])
+    return pd.DataFrame(rows, columns=["symbol","name","market","sector33_code","sector33_name","sector17_code","sector17_name","scale_code","scale_name"])
+
+def universe_autofetch_from_jpx() -> Tuple[int, str]:
+    """JPX公式サイトの『東証上場銘柄一覧（Excel）』を取得し、銘柄マスタ（universe_symbols）に登録する。
+
+    - 4桁コードは自動で .T を付与
+    - 可能なら 33業種/市場区分/規模 なども保存（Stage0のセクター判定に使用）
+    """
+    ensure_schema()
+
+    url_candidates = [
+        "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls",
+    ]
+
+    last_err = None
+    content = None
+    for url in url_candidates:
         try:
-            xml_url = _derive_xml_url(url)
-            data_xml = _fetch_ff_calendar_xml(xml_url, timeout=timeout)
-            if isinstance(data_xml, list) and data_xml:
-                _EVENT_CACHE.update({"ts": now, "url": url, "data": data_xml, "err": f"json_fail={type(e_json).__name__}"})
-                _write_event_file_cache(url, data_xml)
-                return data_xml, "ok"
-        except Exception:
-            pass
-
-        # 4) file cache fallback
-        cached = _read_event_file_cache(max_age_sec=24 * 3600)
-        if isinstance(cached, list) and cached:
-            _EVENT_CACHE.update({"ts": now, "url": url, "data": cached, "err": f"json_fail={type(e_json).__name__}: {e_json}"})
-            return cached, "cache"
-
-        _EVENT_CACHE.update({"ts": now, "url": url, "data": None, "err": f"{type(e_json).__name__}: {e_json}"})
-        return None, "fail"
-
-def _parse_event_dt(item: dict) -> Optional[datetime]:
-    """
-    Try multiple schemas:
-    - timestamp (epoch seconds)
-    - datetime / date+time string
-    """
-    try:
-        ts = item.get("timestamp", None)
-        if isinstance(ts, (int, float)) and math.isfinite(float(ts)) and float(ts) > 0:
-            # Many feeds use seconds; if it's too big, assume ms.
-            tsv = float(ts)
-            if tsv > 3e12:
-                tsv = tsv / 1000.0
-            return datetime.fromtimestamp(tsv, tz=timezone.utc)
-    except Exception:
-        pass
-
-    # Common FF export fields: "date" + "time" (strings)
-    dt_str = None
-    for k in ("datetime", "date_time", "dt", "dateTime"):
-        v = item.get(k)
-        if isinstance(v, str) and v.strip():
-            dt_str = v.strip()
+            import requests  # type: ignore
+            r = requests.get(url, timeout=45)
+            r.raise_for_status()
+            content = r.content
             break
+        except Exception as e:
+            last_err = e
 
-    if dt_str is None:
-        date_s = item.get("date", None)
-        time_s = item.get("time", None)
-        if isinstance(date_s, str) and date_s.strip():
-            if isinstance(time_s, str) and time_s.strip():
-                dt_str = f"{date_s.strip()} {time_s.strip()}"
-            else:
-                dt_str = date_s.strip()
+    if content is None:
+        return 0, f"JPX一覧のダウンロードに失敗しました: {last_err}"
 
-    if not dt_str:
+    try:
+        import io
+        bio = io.BytesIO(content)
+        df = pd.read_excel(bio)
+    except Exception as e:
+        return 0, f"Excel読込に失敗しました（環境依存）: {e}"
+
+    # 列名の推定（JPXの data_j.xls 前提）
+    col_code = None
+    col_name = None
+    col_market = None
+    col_s33_code = None
+    col_s33_name = None
+    col_s17_code = None
+    col_s17_name = None
+    col_scale_code = None
+    col_scale_name = None
+
+    def _norm_col(x: Any) -> str:
+        return str(x).strip().replace("（", "(").replace("）", ")")
+
+    # まずは“完全一致”に近いものを拾う
+    for c in df.columns:
+        cs = _norm_col(c)
+        if cs in ["コード", "銘柄コード", "Code"]:
+            col_code = c
+        elif cs in ["銘柄名", "会社名", "名称", "銘柄名(日本語)"]:
+            col_name = c
+        elif cs in ["市場・商品区分", "市場区分", "市場", "市場・商品区分(日本語)"]:
+            col_market = c
+        elif cs in ["33業種コード", "33業種コード(東証)", "33業種コード（東証）"]:
+            col_s33_code = c
+        elif cs in ["33業種区分", "33業種名", "33業種区分(日本語)", "33業種区分（日本語）"]:
+            col_s33_name = c
+        elif cs in ["17業種コード", "17業種コード(東証)", "17業種コード（東証）"]:
+            col_s17_code = c
+        elif cs in ["17業種区分", "17業種名", "17業種区分(日本語)", "17業種区分（日本語）"]:
+            col_s17_name = c
+        elif cs in ["規模コード", "規模"]:
+            col_scale_code = c
+        elif cs in ["規模区分", "規模区分(日本語)", "規模区分（日本語）"]:
+            col_scale_name = c
+
+    # 次に“部分一致”で補完（JPXの列名が微妙に変わることがあるため）
+    def _find_by_contains(must: List[str], must_not: List[str] = []) -> Optional[Any]:
+        for c in df.columns:
+            cs = _norm_col(c)
+            ok = all(k in cs for k in must) and all(k not in cs for k in must_not)
+            if ok:
+                return c
         return None
 
-    # Parse with pandas (robust) then assume UTC if no tz
-    try:
-        dt = pd.to_datetime(dt_str, utc=True, errors="coerce")
-        if pd.isna(dt):
-            return None
-        return dt.to_pydatetime()
-    except Exception:
-        return None
-
-
-def _compute_event_risk(
-    pair: str,
-    *,
-    now_tz: str = "Asia/Tokyo",
-    horizon_hours: int = 72,
-    past_lookback_hours: int = 24,
-    hours_scale: float = 24.0,
-    norm: float = 3.0,
-    impacts: Optional[List[str]] = None,
-    high_window_minutes: int = 60,
-    url: str = _FF_CAL_URL_DEFAULT,
-) -> Dict[str, Any]:
-    """
-    Swing-oriented economic calendar risk model.
-
-    Returns:
-      {
-        "ok": bool,
-        "status": "ok|cache|fail",
-        "err": str|None,
-        "score": float,                  # upcoming-only risk score (heuristic)
-        "factor": float (0..1),          # normalized risk factor (upcoming-only)
-        "window_high": bool,             # high-impact within ±high_window_minutes
-        "next_high_hours": float|None,   # hours until next High impact (>=0)
-        "last_high_hours": float|None,   # hours since last High impact (>=0)
-        "next_any_hours": float|None,    # hours until next (any impact)
-        "last_any_hours": float|None,    # hours since last (any impact)
-        "impact_ccys": { "USD": {"upcoming": n, "recent": n}, ... },
-        "upcoming": [ {dt_utc, currency, impact, title, hours} ... ] (<=10),
-        "recent":   [ {dt_utc, currency, impact, title, hours} ... ] (<=10),  # hours is negative (in the past)
-      }
-    """
-    impacts = impacts or ["High", "Medium"]
-    a, b = _pair_to_ccys(pair)
-    ccys = {a, b}
-
-    data, status = _fetch_ff_calendar(url)
-    if not data:
-        return {
-            "ok": False,
-            "status": status,
-            "err": _EVENT_CACHE.get("err"),
-            "score": 0.0,
-            "factor": 0.0,
-            "window_high": False,
-            "next_high_hours": None,
-            "last_high_hours": None,
-            "next_any_hours": None,
-            "last_any_hours": None,
-            "impact_ccys": {},
-            "upcoming": [],
-            "recent": [],
-        }
-
-    tz = ZoneInfo(now_tz)
-    now_local = datetime.now(tz=tz)
-    now_utc = now_local.astimezone(timezone.utc)
-
-    # weights by impact
-    w = {"High": 1.0, "Medium": 0.6, "Low": 0.3, "Holiday": 0.8, "Non-Economic": 0.2}
-
-    events = []
-    for it in data:
-        if not isinstance(it, dict):
-            continue
-        cur = str(it.get("currency") or it.get("ccy") or it.get("cur") or "").upper().strip()
-        if not cur:
-            ctry = str(it.get("country") or "").upper().strip()
-            if len(ctry) == 3:
-                cur = ctry
-        if cur and (cur not in ccys):
-            continue
-
-        impact = str(it.get("impact") or "").strip()
-        if impacts and (impact not in impacts) and not (impact == "Holiday" and "Holiday" in impacts):
-            continue
-
-        dt = _parse_event_dt(it)
-        if dt is None:
-            continue
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt_utc = dt.astimezone(timezone.utc)
-
-        hrs = (dt_utc - now_utc).total_seconds() / 3600.0
-        if hrs < -float(max(1, int(past_lookback_hours))):
-            continue
-        if hrs > float(horizon_hours):
-            continue
-
-        title = str(it.get("title") or it.get("event") or it.get("name") or "").strip()
-        events.append({
-            "dt_utc": dt_utc,
-            "hours": float(hrs),
-            "currency": cur,
-            "impact": impact,
-            "title": title,
-        })
-
-    events.sort(key=lambda x: x["hours"])
-
-    # next/last helpers
-    next_high = None
-    last_high = None
-    next_any = None
-    last_any = None
-    window_high = False
-
-    # score: upcoming-only
-    score = 0.0
-
-    impact_ccys: Dict[str, Dict[str, int]] = {}
-    def _inc(cur: str, k: str) -> None:
-        if not cur:
-            return
-        if cur not in impact_ccys:
-            impact_ccys[cur] = {"upcoming": 0, "recent": 0}
-        impact_ccys[cur][k] = int(impact_ccys[cur].get(k, 0)) + 1
-
-    for ev in events:
-        impact = ev["impact"]
-        hrs = float(ev["hours"])
-
-        # window check for High impact (±minutes)
-        if impact == "High":
-            if abs(hrs) * 60.0 <= float(high_window_minutes):
-                window_high = True
-
-        if hrs >= 0:
-            # upcoming
-            if next_any is None:
-                next_any = hrs
-            if impact == "High" and next_high is None:
-                next_high = hrs
-            _inc(str(ev.get("currency") or ""), "upcoming")
-
-            denom = 1.0 + (max(0.0, hrs) / max(1e-6, float(hours_scale)))
-            score += float(w.get(impact, 0.4)) / denom
-        else:
-            # recent
-            if last_any is None:
-                last_any = abs(hrs)
-            if impact == "High" and last_high is None:
-                last_high = abs(hrs)
-            _inc(str(ev.get("currency") or ""), "recent")
-
-    # normalize to factor 0..1 (heuristic)
-    factor = _clamp(score / max(1e-6, float(norm)), 0.0, 1.0)
-
-    # trim lists for UI
-    upcoming_ui = []
-    recent_ui = []
-    for ev in events:
-        rec = {
-            "dt_utc": ev["dt_utc"].isoformat(),
-            "hours": float(ev["hours"]),
-            "currency": ev["currency"],
-            "impact": ev["impact"],
-            "title": ev["title"],
-        }
-        if float(ev["hours"]) >= 0 and len(upcoming_ui) < 10:
-            upcoming_ui.append(rec)
-        if float(ev["hours"]) < 0 and len(recent_ui) < 10:
-            recent_ui.append(rec)
-
-    return {
-        "ok": True,
-        "status": status,
-        "err": None,
-        "score": float(score),
-        "factor": float(factor),
-        "window_high": bool(window_high),
-        "next_high_hours": (float(next_high) if next_high is not None else None),
-        "last_high_hours": (float(last_high) if last_high is not None else None),
-        "next_any_hours": (float(next_any) if next_any is not None else None),
-        "last_any_hours": (float(last_any) if last_any is not None else None),
-        "impact_ccys": impact_ccys,
-        "upcoming": upcoming_ui,
-        "recent": recent_ui,
-    }
-
-def _compute_weekend_risk(now_tz: str = "Asia/Tokyo") -> float:
-    """
-    Simple weekend gap risk proxy:
-    - Fri evening (>=18:00 local) => 1.0
-    - Sat/Sun => 1.0
-    else 0.0
-    """
-    try:
-        tz = ZoneInfo(now_tz)
-        now = datetime.now(tz=tz)
-        wd = now.weekday()  # Mon=0..Sun=6
-        if wd >= 5:
-            return 1.0
-        if wd == 4 and now.hour >= 18:
-            return 1.0
-        return 0.0
-    except Exception:
-        return 0.0
-
-# ---------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------
-
-def _safe_float(x, default=0.0) -> float:
-    try:
-        if x is None:
-            return default
-        v = float(x)
-        if math.isnan(v) or math.isinf(v):
-            return default
-        return v
-    except Exception:
-        return default
-
-
-
-def _compute_unrealized_R(side: str, entry: float, sl: float, price: float) -> float:
-    """Unrealized PnL in R units (R = initial stop distance). Positive is profit."""
-    try:
-        side = str(side or "").upper()
-        entry = float(entry)
-        sl = float(sl)
-        price = float(price)
-        risk = abs(entry - sl)
-        if risk <= 1e-9:
-            return 0.0
-        if side == "SELL":
-            return (entry - price) / risk
-        return (price - entry) / risk
-    except Exception:
-        return 0.0
-
-
-def _hold_manage_reco(
-    pair: str,
-    df: pd.DataFrame,
-    ctx_in: Dict[str, Any],
-    plan_like: Dict[str, Any],
-    ev_meta: Dict[str, Any],
-    weekend_risk: float,
-    weekcross_risk: float,
-) -> Dict[str, Any]:
-    """Position-holding management rules for swing (event/weekend approach).
-    Returns recommendation dict; empty dict if no position info.
-    """
-    try:
-        pos = ctx_in.get("position") or ctx_in.get("pos") or {}
-        if not isinstance(pos, dict):
-            pos = {}
-        pos_open = bool(ctx_in.get("position_open", False) or pos.get("open") or pos.get("is_open") or (len(pos) > 0))
-        if not pos_open:
-            return {}
-        # Get position params (fallback to plan)
-        side = str(pos.get("side") or pos.get("pos_side") or plan_like.get("side") or "").upper()
-        if side not in ("BUY", "SELL"):
-            side = str(plan_like.get("side") or "BUY").upper()
-        entry = float(pos.get("entry") or pos.get("entry_price") or pos.get("pos_entry") or plan_like.get("entry") or plan_like.get("entry_price") or 0.0)
-        sl = float(pos.get("sl") or pos.get("stop_loss") or pos.get("pos_sl") or plan_like.get("sl") or plan_like.get("stop_loss") or 0.0)
-        tp = float(pos.get("tp") or pos.get("take_profit") or pos.get("pos_tp") or plan_like.get("tp") or plan_like.get("take_profit") or 0.0)
-
-        # Current price (user can override; else latest close)
-        price = None
-        for k in ("current_price", "price", "last_price", "mark_price"):
-            if k in pos and pos.get(k) is not None:
-                price = pos.get(k)
+    if col_s33_code is None:
+        col_s33_code = _find_by_contains(["33", "業種", "コード"])
+    if col_s33_name is None:
+        col_s33_name = _find_by_contains(["33", "業種"], must_not=["コード"])
+    if col_market is None:
+        col_market = _find_by_contains(["市場"])
+    if col_name is None:
+        col_name = _find_by_contains(["銘柄", "名"]) or _find_by_contains(["名称"])
+    if col_scale_code is None:
+        col_scale_code = _find_by_contains(["規模", "コード"])
+    if col_scale_name is None:
+        col_scale_name = _find_by_contains(["規模"], must_not=["コード"])
+# fallback: 4桁比率でコード列推定
+    if col_code is None:
+        for c in df.columns:
+            ser = df[c].dropna().astype(str).str.replace(r"\D", "", regex=True)
+            if len(ser) == 0:
+                continue
+            ratio = ser.str.fullmatch(r"\d{4}").mean()
+            if ratio > 0.6:
+                col_code = c
                 break
-        if price is None:
-            price = ctx_in.get("pos_current_price", None)
-        if price is None:
-            try:
-                price = float(df["Close"].astype(float).iloc[-1]) if isinstance(df, pd.DataFrame) and (not df.empty) else float(entry)
-            except Exception:
-                price = float(entry)
-        price = float(price)
 
-        unrealized_R = pos.get("unrealized_R", None)
-        if unrealized_R is None:
-            unrealized_R = _compute_unrealized_R(side, entry, sl, price)
-        else:
-            unrealized_R = float(unrealized_R)
+    if col_code is None:
+        return 0, "銘柄コード列を特定できませんでした。手動CSVでの登録をお使いください。"
 
-        dd_R = float(pos.get("dd_R") or pos.get("max_dd_R") or pos.get("drawdown_R") or 0.0)
+    def _norm_code(x: Any) -> Optional[str]:
+        s = "" if x is None else str(x)
+        s = re.sub(r"\D", "", s)
+        if re.fullmatch(r"\d{4}", s):
+            return s + ".T"
+        return None
 
-        nh = ev_meta.get("next_high_hours", None)
+    rows: List[Dict[str, Any]] = []
+    for _, r in df.iterrows():
+        sym = _norm_code(r.get(col_code))
+        if not sym:
+            continue
+        row = {"symbol": sym}
+        if col_name is not None:
+            v = r.get(col_name)
+            if pd.notna(v):
+                row["name"] = str(v).strip()
+        if col_market is not None:
+            v = r.get(col_market)
+            if pd.notna(v):
+                row["market"] = str(v).strip()
+        if col_s33_code is not None:
+            v = r.get(col_s33_code)
+            if pd.notna(v):
+                row["sector33_code"] = str(v).strip()
+        if col_s33_name is not None:
+            v = r.get(col_s33_name)
+            if pd.notna(v):
+                row["sector33_name"] = str(v).strip()
+        if col_s17_code is not None:
+            v = r.get(col_s17_code)
+            if pd.notna(v):
+                row["sector17_code"] = str(v).strip()
+        if col_s17_name is not None:
+            v = r.get(col_s17_name)
+            if pd.notna(v):
+                row["sector17_name"] = str(v).strip()
+        if col_scale_code is not None:
+            v = r.get(col_scale_code)
+            if pd.notna(v):
+                row["scale_code"] = str(v).strip()
+        if col_scale_name is not None:
+            v = r.get(col_scale_name)
+            if pd.notna(v):
+                row["scale_name"] = str(v).strip()
+        rows.append(row)
+
+    if not rows:
+        return 0, "銘柄コードが抽出できませんでした。"
+
+    n = universe_upsert_rows(rows)
+    update_sector33_from_jpx()
+    return n, "ok"
+
+
+
+
+
+def update_sector33_from_jpx() -> Tuple[int, str]:
+    """
+    Download JPX listed issues master (Excel) and update universe_symbols.sector33_*.
+    Returns (updated_rows, status_str).
+    """
+    ensure_schema()
+
+    # JPX official file (frequently updated). We keep robust fallbacks.
+    urls = [
+        "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls",
+        "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls?download=1",
+        "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html",
+    ]
+
+    # try direct excel first
+    df = None
+    last_err = ""
+    for u in urls[:2]:
         try:
-            nh_f = (float(nh) if nh is not None else None)
-        except Exception:
-            nh_f = None
-
-        event_factor = float(ev_meta.get("factor", 0.0) or 0.0)
-        window_high = bool(ev_meta.get("window_high", False))
-
-        # ---- Mandatory swing holding rules (not optional) ----
-        # Base thresholds (hours)
-        no_add_h = float(ctx_in.get("hold_no_add_hours", 48.0) or 48.0)
-        reduce_h = float(ctx_in.get("hold_reduce_hours", 18.0) or 18.0)
-        be_h = float(ctx_in.get("hold_breakeven_hours", 12.0) or 12.0)
-        partial_h = float(ctx_in.get("hold_partial_tp_hours", 18.0) or 18.0)
-
-        # Guardrails
-        no_add_h = max(6.0, min(168.0, no_add_h))
-        reduce_h = max(3.0, min(72.0, reduce_h))
-        be_h = max(1.0, min(48.0, be_h))
-        partial_h = max(1.0, min(72.0, partial_h))
-
-        notes: List[str] = []
-        actions: List[str] = []
-
-        no_add = False
-        if (nh_f is not None) and (nh_f <= no_add_h):
-            no_add = True
-            notes.append(f"高インパクト指標が{nh_f:.1f}時間以内 → 追加建て禁止（スイングでも実行リスク回避）")
-        if float(weekend_risk or 0.0) > 0.0:
-            no_add = True
-            notes.append("週末ギャップリスク → 追加建て禁止")
-        if float(weekcross_risk or 0.0) > 0.0:
-            no_add = True
-            notes.append("週跨ぎ（木金）リスク → 追加建て禁止")
-
-        # Size shrink recommendation (0.2..1.0)
-        reduce_mult = 1.0
-        if (nh_f is not None) and (nh_f <= reduce_h):
-            # base shrink by event factor
-            reduce_mult = min(reduce_mult, float(_clamp(1.0 - 0.60 * event_factor, 0.20, 1.00)))
-            if unrealized_R >= 0.20:
-                reduce_mult = min(reduce_mult, 0.50)
-                actions.append("REDUCE_SIZE")
-                notes.append("イベント接近＆含み益あり → 建玉の一部縮退（例：半分）を推奨")
-            else:
-                reduce_mult = min(reduce_mult, 0.70)
-                actions.append("REDUCE_SIZE")
-                notes.append("イベント接近 → 建玉縮退を推奨（リスク低減）")
-
-        if float(weekend_risk or 0.0) > 0.0:
-            reduce_mult = min(reduce_mult, 0.60)
-            if "REDUCE_SIZE" not in actions:
-                actions.append("REDUCE_SIZE")
-            notes.append("週末前 → 建玉縮退を推奨（ギャップ対策）")
-
-        # Partial take profit (0..1)
-        partial_tp = 0.0
-        if (nh_f is not None) and (nh_f <= partial_h) and (unrealized_R >= 0.60):
-            partial_tp = max(partial_tp, 0.50)
-            actions.append("PARTIAL_TP")
-            notes.append("含み益0.6R以上＆イベント近接 → 半分利確を推奨")
-        if window_high and (unrealized_R >= 0.30):
-            partial_tp = max(partial_tp, 0.50)
-            if "PARTIAL_TP" not in actions:
-                actions.append("PARTIAL_TP")
-            notes.append("高インパクト窓内 → 半分利確を推奨（スリッページ/乱高下対策）")
-
-        # Move SL to breakeven / tighten
-        move_be = False
-        new_sl = None
-        if (nh_f is not None) and (nh_f <= be_h) and (unrealized_R >= 0.15):
-            move_be = True
-            new_sl = float(entry)
-            actions.append("MOVE_SL_TO_BE")
-            notes.append("イベント接近 → ストップを建値（BE）へ移動を推奨（勝ちを負けにしない）")
-        if float(weekend_risk or 0.0) > 0.0 and (unrealized_R >= 0.15):
-            move_be = True
-            if new_sl is None:
-                new_sl = float(entry)
-            if "MOVE_SL_TO_BE" not in actions:
-                actions.append("MOVE_SL_TO_BE")
-            notes.append("週末前 → 建値/浅い利確で防御を推奨")
-
-        # Round new SL to pip
-        try:
-            if new_sl is not None:
-                new_sl = _round_to_pip(float(new_sl), pair)
-        except Exception:
-            pass
-
-        # Compose
-        out = {
-            "version": "swing_hold_v1",
-            "pair": str(pair),
-            "side": side,
-            "entry": float(entry),
-            "sl": float(sl),
-            "tp": float(tp),
-            "current_price": float(price),
-            "unrealized_R": float(unrealized_R),
-            "dd_R": float(dd_R),
-            "event_next_high_hours": nh_f,
-            "event_window_high": bool(window_high),
-            "event_risk_factor": float(event_factor),
-            "weekend_risk": float(weekend_risk or 0.0),
-            "weekcross_risk": float(weekcross_risk or 0.0),
-            "no_add": bool(no_add),
-            "reduce_size_mult": float(_clamp(reduce_mult, 0.20, 1.00)),
-            "partial_tp_ratio": float(_clamp(partial_tp, 0.0, 1.0)),
-            "move_sl_to_be": bool(move_be),
-            "new_sl_reco": (float(new_sl) if new_sl is not None else None),
-            "actions": list(dict.fromkeys(actions)),  # unique preserve order
-            "notes": notes,
-        }
-        return out
-    except Exception:
-        return {}
-def _clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-def _ema(s: pd.Series, span: int) -> pd.Series:
-    return s.ewm(span=span, adjust=False).mean()
-
-def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    high = df["High"].astype(float)
-    low = df["Low"].astype(float)
-    close = df["Close"].astype(float)
-    prev_close = close.shift(1)
-    tr = pd.concat([(high - low).abs(),
-                    (high - prev_close).abs(),
-                    (low - prev_close).abs()], axis=1).max(axis=1)
-    return tr.rolling(n, min_periods=max(3, n//2)).mean()
-
-def _adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    # Simple Wilder ADX
-    high = df["High"].astype(float)
-    low = df["Low"].astype(float)
-    close = df["Close"].astype(float)
-
-    up_move = high.diff()
-    down_move = -low.diff()
-
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    tr = pd.concat([(high - low).abs(),
-                    (high - close.shift(1)).abs(),
-                    (low - close.shift(1)).abs()], axis=1).max(axis=1)
-
-    atr = tr.ewm(alpha=1/n, adjust=False).mean()
-    plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=1/n, adjust=False).mean() / atr.replace(0, np.nan))
-    minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=1/n, adjust=False).mean() / atr.replace(0, np.nan))
-    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0.0)
-    adx = dx.ewm(alpha=1/n, adjust=False).mean()
-    return adx.fillna(0.0)
-
-def _slope_norm(s: pd.Series, lookback: int = 10) -> float:
-    # Normalized slope over lookback (last - first) / (std * sqrt(n))
-    if len(s) < lookback + 1:
-        return 0.0
-    y = s.iloc[-lookback:].astype(float).values
-    if np.all(np.isfinite(y)) is False:
-        return 0.0
-    dy = y[-1] - y[0]
-    sd = float(np.std(y))
-    if sd <= 1e-9:
-        return 0.0
-    return float(dy / (sd * math.sqrt(lookback)))
-
-def _hh_hl_ok(df: pd.DataFrame, n: int = 20) -> bool:
-    # crude HH/HL: compare last 2 swing highs and lows via rolling window peaks/valleys
-    if len(df) < n + 5:
-        return False
-    close = df["Close"].astype(float)
-    # detect local maxima/minima with a small window
-    w = 3
-    highs = (close.shift(w) < close) & (close.shift(-w) < close)
-    lows = (close.shift(w) > close) & (close.shift(-w) > close)
-    hi_idx = close[highs].tail(4).index
-    lo_idx = close[lows].tail(4).index
-    if len(hi_idx) < 2 or len(lo_idx) < 2:
-        return False
-    h1, h2 = close.loc[hi_idx[-2]], close.loc[hi_idx[-1]]
-    l1, l2 = close.loc[lo_idx[-2]], close.loc[lo_idx[-1]]
-    return (h2 > h1) and (l2 > l1)
-
-def _breakout_strength(df: pd.DataFrame, n: int = 20) -> Tuple[bool, float]:
-    # breakout if last close exceeds prior n-day high by >= 0.2*ATR
-    if len(df) < n + 5:
-        return False, 0.0
-    close = df["Close"].astype(float)
-    hi = df["High"].astype(float).rolling(n).max()
-    atr = _atr(df, 14)
-    last = close.iloc[-1]
-    prev_hi = hi.iloc[-2]  # prior window high
-    a = float(atr.iloc[-1]) if len(atr) else 0.0
-    if not np.isfinite(prev_hi) or not np.isfinite(last) or a <= 0:
-        return False, 0.0
-    excess = last - prev_hi
-    ok = excess > 0.2 * a
-    strength = _clamp(excess / (1.5 * a), 0.0, 1.0) if a > 0 else 0.0
-    return bool(ok), float(strength)
-
-def _continuation_prob(df: pd.DataFrame, horizon: int = 5) -> Tuple[float, float]:
-    """
-    Simple continuation probability model (not ML-heavy):
-    - Uses trend slope, adx, and breakout strength to estimate p(continue up) / p(continue down).
-    """
-    if len(df) < 60:
-        return 0.5, 0.5
-    close = df["Close"].astype(float)
-    ema20 = _ema(close, 20)
-    ema50 = _ema(close, 50)
-    slope = _slope_norm(ema20, 12)
-    adx = float(_adx(df, 14).iloc[-1])  # 0..100
-    breakout_ok, bstr = _breakout_strength(df, 20)
-
-    # Map to 0..1 features
-    f_adx = _clamp((adx - 15.0) / 25.0, 0.0, 1.0)
-    f_slope = _clamp((slope + 2.0) / 4.0, 0.0, 1.0)  # slope ~[-2,2] -> [0,1]
-    f_trend = 0.55 * f_slope + 0.35 * f_adx + 0.10 * bstr
-    # direction bias
-    bias = 1.0 if ema20.iloc[-1] >= ema50.iloc[-1] else 0.0
-    # base probabilities
-    p_up = 0.35 + 0.55 * f_trend
-    p_dn = 0.35 + 0.55 * (1.0 - f_trend)
-
-    # apply direction bias and breakout
-    if bias > 0.5:
-        p_up += 0.05 + 0.10 * bstr
-        p_dn -= 0.05
-    else:
-        p_dn += 0.05 + 0.10 * bstr
-        p_up -= 0.05
-
-    if breakout_ok:
-        if bias > 0.5:
-            p_up += 0.06
-            p_dn -= 0.03
-        else:
-            p_dn += 0.06
-            p_up -= 0.03
-
-    p_up = _clamp(p_up, 0.05, 0.95)
-    p_dn = _clamp(p_dn, 0.05, 0.95)
-    return float(p_up), float(p_dn)
-
-def _phase_label(df: pd.DataFrame) -> Tuple[str, float, float]:
-    """
-    Returns (phase_label, trend_strength 0..1, momentum_score -1..+1)
-    """
-    if len(df) < 60:
-        return "UNKNOWN", 0.0, 0.0
-    close = df["Close"].astype(float)
-    ema20 = _ema(close, 20)
-    ema50 = _ema(close, 50)
-    ema200 = _ema(close, 200) if len(close) >= 210 else _ema(close, 100)
-
-    slope20 = _slope_norm(ema20, 12)  # roughly -? .. +?
-    adx = float(_adx(df, 14).iloc[-1])
-    breakout_ok, bstr = _breakout_strength(df, 20)
-    hhhl = _hh_hl_ok(df, 30)
-
-    # strength from ADX and breakout strength and slope magnitude
-    s_adx = _clamp((adx - 12.0) / 28.0, 0.0, 1.0)
-    s_slope = _clamp(abs(slope20) / 2.0, 0.0, 1.0)
-    strength = _clamp(0.55 * s_adx + 0.30 * s_slope + 0.15 * bstr, 0.0, 1.0)
-
-    # momentum: signed slope + small ema alignment
-    align = 1.0 if ema20.iloc[-1] > ema50.iloc[-1] else -1.0
-    mom = _clamp((slope20 / 2.0) + 0.20 * align, -1.0, 1.0)
-
-    # classify
-    if breakout_ok and strength >= 0.35:
-        phase = "BREAKOUT_UP" if mom > 0 else "BREAKOUT_DOWN"
-    else:
-        if strength < 0.25:
-            phase = "RANGE"
-        else:
-            phase = "UP_TREND" if mom > 0 else "DOWN_TREND"
-
-    # refine by HH/HL
-    if phase == "UP_TREND" and not hhhl and strength < 0.40:
-        phase = "TRANSITION_UP"
-    if phase == "DOWN_TREND" and strength < 0.40:
-        phase = "TRANSITION_DOWN"
-
-    return phase, float(strength), float(mom)
-
-# ---------------------------------------------------------------------
-# Core: strategy output
-# ---------------------------------------------------------------------
-
-@dataclass
-class StrategyPlan:
-    decision: str
-    direction: str
-    entry: float
-    sl: float
-    tp: float
-    ev_raw: float
-    ev_adj: float
-    dynamic_threshold: float
-    confidence: float
-    why: str
-    veto: List[str]
-    ctx: Dict[str, Any]
-
-def compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
-    """Backward compatible helper. main.py may call this."""
-    if df is None or len(df) < 5:
-        return {}
-    close = df["Close"].astype(float)
-    atr = _atr(df, 14)
-    adx = _adx(df, 14)
-    return {
-        "ema20": float(_ema(close, 20).iloc[-1]),
-        "ema50": float(_ema(close, 50).iloc[-1]),
-        "atr14": float(atr.iloc[-1]) if len(atr) else 0.0,
-        "adx14": float(adx.iloc[-1]) if len(adx) else 0.0,
-    }
-
-
-def get_ai_order_strategy(
-    price_df: pd.DataFrame = None,
-    pair: str = "",
-    budget_yen: int = 0,
-    context_data: Optional[Dict[str, Any]] = None,
-    ext_features: Optional[Dict[str, Any]] = None,
-    prefer_long_only: bool = False,
-    api_key: str = "",
-    **kwargs,
-) -> Dict[str, Any]:
-    """
-    main.py 互換の“完成版”エントリー判定（ctx依存を排除し、内部で必要な特徴量を計算します）。
-
-    完成要件（要点）:
-      - 統合スコア（rank_score）で最終ランキングできる
-      - 価格構造（HH/HL, ブレイク, トレンド強度, クローズ構造）を最優先
-      - 通貨強弱は補助（単独で方向決定しない）
-      - マクロは弱いバイアス（NO連発の主因にしない）
-      - イベントは「直前の実行リスク」＋「直後の捕獲」を必須化
-        * 直前: 成行禁止/縮退/閾値引上げ（ただし見送り地獄にしない）
-        * 直後: 0-1h様子見、1-24hブレイク専用ゲートで積極再評価
-      - veto乱立を抑え、主因が説明できる
-      - NameError / SyntaxError ゼロ（phase_label等の未定義を根絶）
-      - RLは出口専用（本関数は入口のみ）
-
-    互換性:
-      - main.py が期待する key を返します（expected_R_ev / p_win_ev / veto_reasons / state_probs / ev_contribs 等）
-      - 旧key（entry/sl/tp, ev_raw/ev_adj, veto）も残します
-      - 追加key: rank_score / final_score / p_eff / event_mode / event_last_high_hours 等
-    """
-
-    # --- safety init (NameError防止) ---
-    phase = "UNKNOWN"
-    phase_label = "UNKNOWN"
-
-    # -----------------------------------------------------------------
-    # 1) 引数の吸収（互換）
-    # -----------------------------------------------------------------
-    if not pair:
-        pair = (kwargs.get("pair_label") or kwargs.get("symbol") or kwargs.get("pair") or "") or ""
-
-    if ext_features is None:
-        ext_features = kwargs.get("ext") or kwargs.get("external_features") or kwargs.get("ext_meta") or None
-
-    if context_data is None:
-        context_data = kwargs.get("ctx") or kwargs.get("context") or kwargs.get("_ctx") or None
-
-    ctx_in = context_data or {}
-    ext = ext_features or {}
-
-    df = price_df
-    if df is None:
-        df = kwargs.get("df") or kwargs.get("price_history") or kwargs.get("price_data")
-
-    if df is None and isinstance(ctx_in, dict):
-        df = ctx_in.get("_df") or ctx_in.get("df") or ctx_in.get("price_df") or ctx_in.get("price_history")
-
-    if df is not None and not isinstance(df, pd.DataFrame):
-        try:
-            df = pd.DataFrame(df)
-        except Exception:
+            df = pd.read_excel(u)
+            if df is not None and len(df) > 1000:
+                break
+        except Exception as e:
+            last_err = str(e)
             df = None
 
-    # OHLC列名の正規化
-    if isinstance(df, pd.DataFrame) and len(df.columns) > 0:
-        cols = {c.lower(): c for c in df.columns}
-        rename = {}
-        for need in ["open", "high", "low", "close", "volume"]:
-            if need in cols and cols[need] != need.capitalize():
-                rename[cols[need]] = need.capitalize()
-        if rename:
-            df = df.rename(columns=rename)
-        if "Close" not in df.columns and "Adj Close" in df.columns:
-            df["Close"] = df["Adj Close"]
-
-    need_cols = {"High", "Low", "Close"}
-    if df is None or (not isinstance(df, pd.DataFrame)) or len(df) < 60 or (not need_cols.issubset(set(df.columns))):
-        debug_cols = []
+    # if failed, try to scrape the page for xls link
+    if df is None:
         try:
-            debug_cols = list(df.columns) if isinstance(df, pd.DataFrame) else []
-        except Exception:
-            debug_cols = []
-        thr = float(_clamp(_safe_float((ctx_in or {}).get("min_expected_R", 0.10), 0.10), 0.03, 0.30))
-        return {
-            "decision": "NO_TRADE",
-            "direction": "LONG",
-            "side": "BUY",
-            "order_type": "—",
-            "entry_type": "—",
-            "entry": 0.0,
-            "entry_price": 0.0,
-            "sl": 0.0, "stop_loss": 0.0,
-            "tp": 0.0, "take_profit": 0.0,
-            "trail_sl": 0.0,
-            "extend_factor": 1.0,
-            "ev_raw": 0.0, "ev_adj": 0.0,
-            "expected_R_ev_raw": 0.0,
-            "expected_R_ev_adj": 0.0,
-            "expected_R_ev": 0.0,
-            "rank_score": 0.0,
-            "final_score": 0.0,
-            "dynamic_threshold": thr,
-            "gate_mode": "NO_DATA",
-            "confidence": 0.0,
-            "p_win": 0.0,
-            "p_eff": 0.0,
-            "p_win_ev": 0.0,
-            "why": "データ不足",
-            "veto": ["データ不足（最低60本必要 / High・Low・Close必須）"],
-            "veto_reasons": ["データ不足（最低60本必要 / High・Low・Close必須）"],
-            "event_mode": "NO_DATA",
-            "event_next_high_hours": None,
-            "event_last_high_hours": None,
-            "state_probs": {"trend_up": 0.0, "trend_down": 0.0, "range": 0.0, "risk_off": 0.0},
-            "ev_contribs": {"trend_up": 0.0, "trend_down": 0.0, "range": 0.0, "risk_off": 0.0},
-            "_ctx": {"pair": pair, "len": int(len(df)) if isinstance(df, pd.DataFrame) else 0, "cols": debug_cols},
-        }
-
-    df = df.copy()
-    close = df["Close"].astype(float)
-    last = float(close.iloc[-1])
-
-    # -----------------------------------------------------------------
-    # 2) 内部特徴量（ctx依存排除）
-    # -----------------------------------------------------------------
-    phase, strength, mom = _phase_label(df)
-    horizon = int(_safe_float(ctx_in.get("horizon_days", 5), 5))
-    p_up, p_dn = _continuation_prob(df, horizon=max(3, horizon))
-
-    breakout_ok, breakout_strength = _breakout_strength(df, 20)
-    hhhl_ok = _hh_hl_ok(df, 30)
-
-    # 表示用ラベル（NameError根絶）
-    if str(phase) == "RANGE":
-        phase_label = "RANGE"
-    elif str(phase) in ("UP_TREND", "BREAKOUT_UP", "TRANSITION_UP"):
-        phase_label = "UP_TREND"
-    elif str(phase) in ("DOWN_TREND", "BREAKOUT_DOWN", "TRANSITION_DOWN"):
-        phase_label = "DOWN_TREND"
-    else:
-        phase_label = str(phase or "UNKNOWN")
-
-    # -----------------------------------------------------------------
-    # 3) 方向選択（通貨強弱“単独”は不可。価格構造主導）
-    # -----------------------------------------------------------------
-    direction = "LONG" if mom >= 0 else "SHORT"
-    if prefer_long_only:
-        direction = "LONG"
-    if phase_label == "UP_TREND" and float(strength) >= 0.28:
-        direction = "LONG"
-    if phase_label == "DOWN_TREND" and float(strength) >= 0.28:
-        direction = "SHORT"
-
-    # RANGEは“端”なら逆張り優先（ただし厳格条件）
-    lookback = 20
-    recent_low = float(df["Low"].astype(float).tail(lookback).min())
-    recent_high = float(df["High"].astype(float).tail(lookback).max())
-    span = float(max(1e-9, recent_high - recent_low))
-    range_pos = float(_clamp((last - recent_low) / span, 0.0, 1.0))
-    if phase_label == "RANGE":
-        if range_pos <= 0.30:
-            direction = "LONG"
-        elif range_pos >= 0.70:
-            direction = "SHORT"
-
-    side = "BUY" if direction == "LONG" else "SELL"
-
-    # -----------------------------------------------------------------
-    # 4) リスクモデル（SL/TP）: ATRベース
-    # -----------------------------------------------------------------
-    atr14 = float(_atr(df, 14).iloc[-1])
-    atr14 = max(atr14, 1e-6)
-
-    if direction == "LONG":
-        sl = min(last - 1.2 * atr14, recent_low - 0.15 * atr14)
-        tp = last + (2.2 * atr14 if phase_label in ("UP_TREND",) else 1.6 * atr14)
-    else:
-        sl = max(last + 1.2 * atr14, recent_high + 0.15 * atr14)
-        tp = last - (2.2 * atr14 if phase_label in ("DOWN_TREND",) else 1.6 * atr14)
-
-    entry = last
-    risk = abs(entry - sl)
-    reward = abs(tp - entry)
-    if risk <= 1e-9:
-        risk = atr14
-    rr = reward / risk
-
-    # -----------------------------------------------------------------
-    # 5) 勝率 proxy（モデル）→ confidenceで縮退（p_eff）
-    # -----------------------------------------------------------------
-    cont_best = max(float(p_up), float(p_dn))
-    if direction == "LONG":
-        p_win_model = 0.46 + 0.42 * _clamp((float(p_up) - 0.5) * 2.0, -1.0, 1.0) + 0.10 * (float(strength) - 0.5)
-    else:
-        p_win_model = 0.46 + 0.42 * _clamp((float(p_dn) - 0.5) * 2.0, -1.0, 1.0) + 0.10 * (float(strength) - 0.5)
-    p_win_model = float(_clamp(p_win_model, 0.20, 0.80))
-
-    # 信頼度（0..1）
-    structure_flag = 1.0 if (breakout_ok or hhhl_ok) else 0.0
-    confidence = float(_clamp(
-        0.30
-        + 0.40 * float(strength)
-        + 0.18 * (float(cont_best) - 0.5)
-        + 0.08 * _clamp(float(rr - 1.0), -1.0, 2.0)
-        + 0.04 * float(structure_flag),
-        0.0, 1.0
-    ))
-
-    # p_eff: confidenceが低いほど0.5に寄せる（整合崩れ対策）
-    conf_k = float(_clamp(confidence / 0.75, 0.0, 1.0))
-    p_eff = float(_clamp(0.5 + (p_win_model - 0.5) * conf_k, 0.20, 0.80))
-
-    # EV (R): EV = p*RR - (1-p)*1
-    ev_raw = float(p_eff * float(rr) - (1.0 - p_eff) * 1.0)
-
-    # -----------------------------------------------------------------
-    # 6) 外部リスク（macro）: 弱いバイアスとして統合（NO連発の主因にしない）
-    # -----------------------------------------------------------------
-    gr = _safe_float(ext.get("global_risk_index", ext.get("global_risk", ext.get("risk_off", 0.35))), 0.35)
-    war = _safe_float(ext.get("war_probability", ext.get("war", 0.0)), 0.0)
-    macro_risk = _safe_float(ext.get("macro_risk_score", None), float("nan"))
-    if not (isinstance(macro_risk, (int, float)) and math.isfinite(float(macro_risk))):
-        macro_risk = _clamp(0.70 * gr + 0.30 * war, 0.0, 1.0)
-    else:
-        macro_risk = _clamp(float(macro_risk), 0.0, 1.0)
-
-    # 表示用（ev_adj）は弱いペナルティに留める
-    risk_penalty = 0.10 + 0.50 * float(macro_risk)   # 0.10..0.60
-    ev_adj = float(ev_raw - 0.18 * float(risk_penalty))
-
-    # -----------------------------------------------------------------
-    # 6.5) 経済指標/イベント（直前の実行リスク + 直後の捕獲）
-    # -----------------------------------------------------------------
-    event_guard_enable = bool(ctx_in.get('event_guard_enable', True))
-    event_block_window = bool(ctx_in.get('event_block_high_impact_window', True))
-    event_horizon_hours = int(_safe_float(ctx_in.get("event_horizon_hours", 168), 168))
-    event_past_lookback_hours = int(_safe_float(ctx_in.get("event_past_lookback_hours", 24), 24))
-    event_window_minutes = int(_safe_float(ctx_in.get("event_window_minutes", 60), 60))
-    event_impacts = ctx_in.get("event_impacts", None)
-    if not isinstance(event_impacts, list) or not event_impacts:
-        event_impacts = ["High", "Medium"]
-    event_calendar_url = str(ctx_in.get("event_calendar_url", _FF_CAL_URL_DEFAULT) or _FF_CAL_URL_DEFAULT)
-
-    ev_meta = {"ok": False, "status": "off", "err": None, "score": 0.0, "factor": 0.0,
-               "window_high": False, "next_high_hours": None, "last_high_hours": None,
-               "next_any_hours": None, "last_any_hours": None, "upcoming": [], "recent": [], "impact_ccys": {}}
-    if event_guard_enable:
-        try:
-            ev_meta = _compute_event_risk(
-                pair,
-                now_tz=str(ctx_in.get("event_timezone", "Asia/Tokyo") or "Asia/Tokyo"),
-                horizon_hours=event_horizon_hours,
-                past_lookback_hours=event_past_lookback_hours,
-                hours_scale=float(ctx_in.get("event_hours_scale", 24.0) or 24.0),
-                norm=float(ctx_in.get("event_norm", 3.0) or 3.0),
-                impacts=[str(x) for x in event_impacts],
-                high_window_minutes=event_window_minutes,
-                url=event_calendar_url,
-            )
+            import pandas as _pd
+            import requests
+            import re as _re
+            html = requests.get(urls[2], timeout=20).text
+            m = _re.search(r'href="([^"]+data_j\.xls[^"]*)"', html)
+            if m:
+                link = m.group(1)
+                if link.startswith("/"):
+                    link = "https://www.jpx.co.jp" + link
+                df = _pd.read_excel(link)
         except Exception as e:
-            ev_meta = {"ok": False, "status": "fail", "err": f"{type(e).__name__}: {e}", "score": 0.0, "factor": 0.0,
-                       "window_high": False, "next_high_hours": None, "last_high_hours": None,
-                       "next_any_hours": None, "last_any_hours": None, "upcoming": [], "recent": [], "impact_ccys": {}}
+            last_err = str(e)
+            df = None
 
-    weekend_risk = float(_compute_weekend_risk(now_tz=str(ctx_in.get("event_timezone", "Asia/Tokyo") or "Asia/Tokyo")))
+    if df is None or df.empty:
+        return 0, f"jpx_master_download_failed: {last_err}"
 
-    # Thu/Fri are special for swing entries (weekend gap approaches + event clusters).
+    # normalize columns（JPXの列名は微妙に変わることがあるので“部分一致”も使う）
+    def _norm_col(x: Any) -> str:
+        return str(x).strip().replace("（", "(").replace("）", ")")
+
+    cols = {_norm_col(c): c for c in df.columns}
+
+    # required: code
+    code_col = None
+    for k in ["コード", "銘柄コード", "Code"]:
+        if k in cols:
+            code_col = cols[k]
+            break
+    if code_col is None:
+        # fallback: 4桁比率で推定
+        for c in df.columns:
+            ser = df[c].dropna().astype(str).str.replace(r"\D", "", regex=True)
+            if len(ser) == 0:
+                continue
+            if (ser.str.fullmatch(r"\d{4}").mean() or 0.0) > 0.6:
+                code_col = c
+                break
+    if code_col is None:
+        code_col = df.columns[0]
+
+    def _find_by_contains(must: List[str], must_not: List[str] = []) -> Optional[Any]:
+        for c in df.columns:
+            cs = _norm_col(c)
+            ok = all(k in cs for k in must) and all(k not in cs for k in must_not)
+            if ok:
+                return c
+        return None
+
+    sec_code_col = None
+    sec_name_col = None
+    market_col = None
+    name_col = None
+
+    # exact-ish
+    for c in df.columns:
+        s = _norm_col(c)
+        if s in ["33業種コード", "33業種コード(東証)", "33業種コード（東証）"]:
+            sec_code_col = c
+        elif s in ["33業種区分", "33業種名", "33業種区分(日本語)", "33業種区分（日本語）"]:
+            sec_name_col = c
+        elif s in ["市場・商品区分", "市場区分", "市場"]:
+            market_col = c
+        elif s in ["銘柄名", "名称", "会社名"]:
+            name_col = c
+
+    # contains fallback
+    if sec_code_col is None:
+        sec_code_col = _find_by_contains(["33", "業種", "コード"])
+    if sec_name_col is None:
+        sec_name_col = _find_by_contains(["33", "業種"], must_not=["コード"])
+    if market_col is None:
+        market_col = _find_by_contains(["市場"])
+    if name_col is None:
+        name_col = _find_by_contains(["銘柄", "名"]) or _find_by_contains(["名称"])
+# if sector columns not found, we can't update
+    if sec_code_col is None and sec_name_col is None:
+        return 0, "jpx_master_has_no_sector33_columns"
+
+    tmp_cols = [code_col]
+    for c in [name_col, market_col, sec_code_col, sec_name_col]:
+        if c is not None and c not in tmp_cols:
+            tmp_cols.append(c)
+    tmp = df[tmp_cols].copy()
+    tmp[code_col] = tmp[code_col].astype(str).str.replace(r"\D", "", regex=True).str.zfill(4)
+    tmp = tmp[tmp[code_col].str.fullmatch(r"\d{4}")].copy()
+    tmp["symbol"] = tmp[code_col] + ".T"
+
+    # build update rows
+    rows = []
+    for _, r in tmp.iterrows():
+        sym = r["symbol"]
+        sec_code = str(r[sec_code_col]).strip() if sec_code_col is not None and pd.notna(r.get(sec_code_col)) else None
+        sec_name = str(r[sec_name_col]).strip() if sec_name_col is not None and pd.notna(r.get(sec_name_col)) else None
+        name = str(r[name_col]).strip() if name_col is not None and pd.notna(r.get(name_col)) else None
+        market = str(r[market_col]).strip() if market_col is not None and pd.notna(r.get(market_col)) else None
+        rows.append((sym, name, market, sec_code, sec_name))
+
+    conn = _connect()
+    updated = 0
     try:
-        _tz = ZoneInfo(str(ctx_in.get("event_timezone", "Asia/Tokyo") or "Asia/Tokyo"))
-        _now_local = datetime.now(tz=_tz)
-        _wd = int(_now_local.weekday())  # Mon=0..Sun=6
-        weekcross_risk = 1.0 if _wd in (3, 4) else 0.0  # Thu/Fri
-        weekcross_weekday = _wd
-    except Exception:
-        weekcross_risk = 0.0
-        weekcross_weekday = None
+        with conn.cursor() as cur:
+            # update in chunks; only overwrite when null/empty
+            chunk = 2000
+            for i in range(0, len(rows), chunk):
+                part = rows[i:i+chunk]
+                cur.executemany(
+                    """UPDATE universe_symbols
+                       SET
+                         name = COALESCE(universe_symbols.name, %s),
+                         market = COALESCE(universe_symbols.market, %s),
+                         sector33_code = CASE
+                           WHEN universe_symbols.sector33_code IS NULL OR universe_symbols.sector33_code='' THEN %s
+                           ELSE universe_symbols.sector33_code END,
+                         sector33_name = CASE
+                           WHEN universe_symbols.sector33_name IS NULL OR universe_symbols.sector33_name='' THEN %s
+                           ELSE universe_symbols.sector33_name END,
+                         updated_utc = NOW()
+                       WHERE symbol = %s;""",
+                    [(name, market, sec_code, sec_name, sym) for (sym, name, market, sec_code, sec_name) in part],
+                )
+                updated += cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
 
-    # event mode classification (swing)
+    return updated, "ok"
+
+def get_db_status() -> Dict[str, Any]:
     try:
-        next_high = ev_meta.get("next_high_hours", None)
-        last_high = ev_meta.get("last_high_hours", None)
-        pre_h = float(ctx_in.get("event_preblock_hours", 24.0) or 24.0)
-        pre_h = float(_clamp(pre_h, 6.0, 72.0))
-    except Exception:
-        next_high = None
-        last_high = None
-        pre_h = 24.0
+        ensure_schema()
+        conn = _connect()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM universe_symbols;")
+            uni = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(DISTINCT symbol) FROM ohlc_daily;")
+            symbols_count = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT COUNT(*) FROM ohlc_daily;")
+            rows_count = int(cur.fetchone()[0] or 0)
+            cur.execute("SELECT MAX(trade_date) FROM ohlc_daily;")
+            latest_trade_date = cur.fetchone()[0]
+            last_update_utc = _get_meta(conn, "last_update_utc")
+        conn.close()
 
-    event_mode = "NORMAL"
-    if bool(ev_meta.get("window_high", False)) and event_block_window:
-        event_mode = "EVENT_WINDOW"
-    elif (last_high is not None) and (float(last_high) <= 1.0):
-        event_mode = "POST_WAIT"          # 0-1h: wait
-    elif (last_high is not None) and (float(last_high) <= 24.0):
-        event_mode = "POST_BREAKOUT"      # 1-24h: breakout-only gate
-    elif (next_high is not None) and (float(next_high) <= float(pre_h)):
-        event_mode = "PRE_EVENT"          # upcoming high-impact is close
-    else:
-        event_mode = "NORMAL"
+        hours_since = None
+        if last_update_utc:
+            try:
+                dt = datetime.fromisoformat(last_update_utc.replace("Z","+00:00"))
+                hours_since = (datetime.now(timezone.utc) - dt).total_seconds()/3600.0
+            except Exception:
+                hours_since = None
 
-    # -----------------------------------------------------------------
-    # 7) 動的閾値（フェーズ/構造優先 + リスク時に軽く上げる）
-    # -----------------------------------------------------------------
-    base_thr = _safe_float(ctx_in.get("dynamic_threshold_base", None), float("nan"))
-    if not (isinstance(base_thr, (int, float)) and math.isfinite(float(base_thr))):
-        base_thr = _safe_float(ctx_in.get("min_expected_R", 0.08), 0.08)
-    base_thr = float(_clamp(float(base_thr), 0.03, 0.25))
-
-    thr_mult = 1.0
-    if phase_label in ("UP_TREND", "DOWN_TREND"):
-        thr_mult -= 0.16 * float(strength)
-    if str(phase).startswith("BREAKOUT"):
-        thr_mult -= 0.22 * max(float(strength), float(breakout_strength))
-    if phase_label == "RANGE":
-        thr_mult += 0.10
-
-    dynamic_threshold = float(_clamp(base_thr * thr_mult, 0.02, 0.30))
-
-    # macro bias is weak
-    dynamic_threshold = float(_clamp(dynamic_threshold + 0.03 * float(macro_risk), 0.02, 0.30))
-
-    # upcoming event / weekend / weekcross: threshold add (but do not cause perpetual NO)
-    try:
-        event_thr_add = float(ctx_in.get("event_threshold_add", 0.18) or 0.18)
-        event_thr_add = float(_clamp(event_thr_add, 0.10, 0.30))
-        weekend_thr_add = float(ctx_in.get("weekend_threshold_add", 0.03) or 0.03)
-        weekend_thr_add = float(_clamp(weekend_thr_add, 0.0, 0.20))
-        weekcross_thr_add = float(ctx_in.get("weekcross_threshold_add", 0.03) or 0.03)
-        weekcross_thr_add = float(_clamp(weekcross_thr_add, 0.0, 0.20))
-
-        ef = float(ev_meta.get("factor", 0.0) or 0.0)
-        # POST_BREAKOUTでは“捕獲”を優先し、閾値上乗せを弱める
-        if event_mode == "POST_BREAKOUT":
-            ef *= 0.40
-        dynamic_threshold = float(_clamp(
-            dynamic_threshold
-            + event_thr_add * ef
-            + weekend_thr_add * float(weekend_risk or 0.0)
-            + weekcross_thr_add * float(weekcross_risk or 0.0),
-            0.02, 0.30
-        ))
-    except Exception:
-        pass
-
-    # -----------------------------------------------------------------
-    # 8) モメンタム/通貨強弱（補助のみ、上限あり）
-    # -----------------------------------------------------------------
-    mom_bonus = 0.0
-    if direction == "LONG" and mom > 0:
-        mom_bonus = 0.06 * _clamp(float(strength), 0.0, 1.0) * _clamp(float(p_up), 0.0, 1.0)
-    if direction == "SHORT" and mom < 0:
-        mom_bonus = 0.06 * _clamp(float(strength), 0.0, 1.0) * _clamp(float(p_dn), 0.0, 1.0)
-    mom_bonus = float(_clamp(mom_bonus, 0.0, 0.06))
-
-    ccy_strength_proxy = 0.0
-    try:
-        c = df["Close"].astype(float)
-        r20 = (c.iloc[-1] / c.iloc[-21] - 1.0) if len(c) >= 21 else 0.0
-        r60 = (c.iloc[-1] / c.iloc[-61] - 1.0) if len(c) >= 61 else 0.0
-        vol20 = float(c.pct_change().rolling(20).std().iloc[-1]) if len(c) >= 21 else 0.0
-        vol60 = float(c.pct_change().rolling(60).std().iloc[-1]) if len(c) >= 61 else 0.0
-        z20 = (r20 / (vol20 + 1e-9)) if vol20 > 0 else 0.0
-        z60 = (r60 / (vol60 + 1e-9)) if vol60 > 0 else 0.0
-        ccy_strength_proxy = float(_clamp(0.5 * z20 + 0.5 * z60, -1.0, 1.0))
-    except Exception:
-        ccy_strength_proxy = 0.0
-
-    ccy_bonus = 0.0
-    if direction == "LONG" and ccy_strength_proxy > 0:
-        ccy_bonus = 0.04 * _clamp(abs(ccy_strength_proxy), 0.0, 1.0)
-    elif direction == "SHORT" and ccy_strength_proxy < 0:
-        ccy_bonus = 0.04 * _clamp(abs(ccy_strength_proxy), 0.0, 1.0)
-    ccy_bonus = float(_clamp(ccy_bonus, 0.0, 0.04))
-
-    ev_gate = float(ev_raw + mom_bonus + ccy_bonus)
-
-    # -----------------------------------------------------------------
-    # 9) 構造ゲート（最優先）
-    # -----------------------------------------------------------------
-    breakout_pass = bool(
-        (breakout_ok or hhhl_ok)
-        and (float(cont_best) >= 0.57)
-        and (max(float(strength), float(breakout_strength)) >= 0.35)
-        and (float(macro_risk) <= 0.90)
-    )
-
-    # RANGE 端の逆張り（厳格）
-    range_edge_setup = False
-    try:
-        # イベント直前はレンジ逆張りを避ける（事故回避）。直後捕獲はブレイク専用。
-        in_pre = (event_mode == "PRE_EVENT")
-        if phase_label == "RANGE" and (not in_pre) and (event_mode not in ("EVENT_WINDOW", "POST_WAIT")):
-            near_edge = (range_pos <= 0.25) if direction == "LONG" else (range_pos >= 0.75)
-            range_edge_setup = bool(
-                near_edge
-                and (float(rr) >= 1.40)
-                and (float(confidence) >= 0.45)
-                and (float(cont_best) >= 0.54)
-                and (float(macro_risk) <= 0.85)
-                and (ev_gate >= float(dynamic_threshold) - 0.02)
-            )
-    except Exception:
-        range_edge_setup = False
-
-    # 全体の構造妥当性
-    structure_ok = True
-    if phase_label == "RANGE":
-        structure_ok = bool(breakout_pass or range_edge_setup)
-    else:
-        if (float(strength) < 0.18) and not (breakout_ok or hhhl_ok):
-            structure_ok = False
-
-    # POST_BREAKOUTはブレイク根拠必須（取り逃がし防止と事故回避を両立）
-    if event_mode == "POST_BREAKOUT":
-        structure_ok = bool(breakout_ok or hhhl_ok)
-
-    # -----------------------------------------------------------------
-    # 10) veto/decision（veto乱立を抑える）
-    # -----------------------------------------------------------------
-    veto: List[str] = []
-    def _veto(msg: str) -> None:
-        s = str(msg or "").strip()
-        if not s:
-            return
-        if s not in veto:
-            veto.append(s)
-
-    why = ""
-    gate_mode = "raw+mom"
-
-    # mandatory event window block
-    if event_guard_enable and event_block_window and event_mode == "EVENT_WINDOW":
-        gate_mode = "event_block"
-        why = f"高インパクト指標の前後（±{event_window_minutes}分）のため見送り"
-        _veto(why)
-        decision = "NO_TRADE"
-    elif event_guard_enable and event_mode == "POST_WAIT":
-        gate_mode = "post_wait"
-        why = "高インパクト直後0〜1hは様子見（スプレッド/再反転の不確実性）"
-        _veto(why)
-        decision = "NO_TRADE"
-    elif not structure_ok:
-        gate_mode = "structure_veto"
-        if phase_label == "RANGE":
-            why = "レンジ優勢で構造根拠が不足（ブレイク or 端の逆張り条件が未達）"
-        else:
-            why = "価格構造の根拠が弱い（トレンド強度/HHHL/ブレイクが不足）"
-        _veto(why)
-        decision = "NO_TRADE"
-    else:
-        # EV gate (post-breakout has its own rescue)
-        if ev_gate >= float(dynamic_threshold):
-            decision = "TRADE"
-            why = f"EV通過: {ev_gate:+.3f} ≥ 動的閾値 {float(dynamic_threshold):.3f}"
-        elif event_mode == "POST_BREAKOUT" and (ev_gate >= float(dynamic_threshold) - 0.08) and float(confidence) >= 0.42:
-            decision = "TRADE"
-            gate_mode = "post_breakout_rescue"
-            why = f"イベント後捕獲（1〜24hブレイク専用）: EV {ev_gate:+.3f} / 閾値 {float(dynamic_threshold):.3f}（救済）"
-        elif breakout_pass and (ev_gate >= float(dynamic_threshold) - 0.04):
-            decision = "TRADE"
-            gate_mode = "breakout_rescue"
-            why = f"BREAKOUT通過: EV {ev_gate:+.3f} / 閾値 {float(dynamic_threshold):.3f}（救済）"
-        else:
-            decision = "NO_TRADE"
-            _veto(f"EV不足: {ev_gate:+.3f} < 動的閾値 {float(dynamic_threshold):.3f}")
-
-    # -----------------------------------------------------------------
-    # 11) 状態確率 / EV内訳（UI用）
-    # -----------------------------------------------------------------
-    s_up = max(0.0, float(p_up) * (0.55 + 0.75 * float(strength)) + max(0.0, float(mom)) * 0.10)
-    s_dn = max(0.0, float(p_dn) * (0.55 + 0.75 * float(strength)) + max(0.0, -float(mom)) * 0.10)
-    s_range = max(0.0, (1.0 - float(strength)) * 0.95 + 0.05)
-    s_risk = max(0.0, float(macro_risk) * 1.15 + (1.0 - float(cont_best)) * 0.10)
-
-    tot = s_up + s_dn + s_range + s_risk
-    if tot <= 1e-12:
-        state_probs = {"trend_up": 0.25, "trend_down": 0.25, "range": 0.25, "risk_off": 0.25}
-    else:
-        state_probs = {
-            "trend_up": float(s_up / tot),
-            "trend_down": float(s_dn / tot),
-            "range": float(s_range / tot),
-            "risk_off": float(s_risk / tot),
+        return {
+            "ok": True,
+            "universe_count": uni,
+            "symbols_count": symbols_count,
+            "rows_count": rows_count,
+            "latest_trade_date": str(latest_trade_date) if latest_trade_date else None,
+            "last_update_utc": last_update_utc,
+            "hours_since_update": hours_since,
         }
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
 
-    if direction == "LONG":
-        r_up = max(0.2, float(rr) * 0.85)
-        r_dn = -1.0
+# --- DB update ---
+def _fetch_from_yf(symbols: List[str], start: str) -> Dict[str, pd.DataFrame]:
+    data = yf.download(
+        tickers=" ".join(symbols),
+        start=start,
+        group_by="ticker",
+        threads=True,
+        auto_adjust=False,
+        progress=False,
+    )
+    out: Dict[str, pd.DataFrame] = {}
+    if isinstance(data.columns, pd.MultiIndex):
+        for sym in symbols:
+            if sym in data.columns.get_level_values(0):
+                df = data[sym].copy()
+                df.dropna(how="all", inplace=True)
+                out[sym] = df
     else:
-        r_dn = max(0.2, float(rr) * 0.85)
-        r_up = -1.0
-    r_range = (0.12 * float(rr) - 0.35)
-    r_riskoff = -0.75
-    ev_contribs = {
-        "trend_up": float(state_probs["trend_up"] * r_up),
-        "trend_down": float(state_probs["trend_down"] * r_dn),
-        "range": float(state_probs["range"] * r_range),
-        "risk_off": float(state_probs["risk_off"] * r_riskoff),
-    }
+        if len(symbols) == 1:
+            df = data.copy()
+            df.dropna(how="all", inplace=True)
+            out[symbols[0]] = df
+    return out
 
-    # -----------------------------------------------------------------
-    # 12) 統合スコア（単一ランキング指標）
-    #   - 価格構造を最優先（structure_weight大）
-    #   - EVは次点
-    #   - イベント影響（通貨別）はペナルティとして統合 → 非影響通貨ペアが相対的に上位化
-    # -----------------------------------------------------------------
-    structure_score = (
-        0.60 * float(strength)
-        + (0.25 * float(breakout_strength) if bool(breakout_ok) else 0.0)
-        + (0.15 if bool(hhhl_ok) else 0.0)
-        + 0.10 * float(_clamp(abs(float(mom)), 0.0, 1.0))
-    )
-    if phase_label == "RANGE":
-        structure_score *= 0.85
-    structure_scaled = float(_clamp(structure_score, 0.0, 1.2) / 1.2)
+def update_db_incremental(days_back: int = 14, keep_days: int = 400, chunk_size: int = 200) -> Dict[str, Any]:
+    ensure_schema()
+    universe = universe_load_symbols()
+    if not universe:
+        return {"upserted_rows": 0, "failed_symbols": 0, "message": "銘柄マスタが0件です。先に『銘柄マスタ登録』を行ってください。"}
 
-    ev_scaled = float(_clamp((ev_gate + 0.15) / 1.35, 0.0, 1.0))
+    start_dt = (datetime.now(timezone.utc) - timedelta(days=days_back + 5)).date()
+    start = str(start_dt)
 
-    ef_up = float(ev_meta.get("factor", 0.0) or 0.0)
-    event_pen = 0.20 * ef_up
-    if event_mode == "PRE_EVENT":
-        event_pen = 0.28 * ef_up
-    if event_mode == "POST_BREAKOUT":
-        event_pen = 0.10 * ef_up
+    upserted = 0
+    failed = 0
+    sample_fail: List[str] = []
 
-    event_pen += 0.08 * float(weekend_risk or 0.0) + 0.08 * float(weekcross_risk or 0.0)
-    macro_pen = 0.08 * float(macro_risk)
-
-    rank_score = float(
-        2.00 * structure_scaled
-        + 1.40 * ev_scaled
-        + 0.40 * float(confidence)
-        - float(event_pen)
-        - float(macro_pen)
-    )
-    final_score = rank_score
-
-    # -----------------------------------------------------------------
-    # 13) ctx（デバッグ/可視化用）
-    # -----------------------------------------------------------------
-    ctx_out = {
-        "pair": pair,
-        "phase_label": phase_label,
-        "trend_strength": float(strength),
-        "momentum_score": float(mom),
-        "range_pos": float(range_pos),
-        "range_edge_setup": bool(range_edge_setup),
-        "ccy_strength_proxy": float(ccy_strength_proxy),
-        "ccy_bonus": float(ccy_bonus),
-        "cont_p_up": float(p_up),
-        "cont_p_dn": float(p_dn),
-        "hh_hl_ok": bool(hhhl_ok),
-        "breakout_ok": bool(breakout_ok),
-        "breakout_strength": float(breakout_strength),
-        "breakout_pass": bool(breakout_pass),
-        "rr": float(rr),
-        "p_win_model": float(p_win_model),
-        "p_eff": float(p_eff),
-        "macro_risk_score": float(macro_risk),
-        "event_mode": str(event_mode),
-        "event_risk_score": float(ev_meta.get("score", 0.0) or 0.0),
-        "event_risk_factor": float(ev_meta.get("factor", 0.0) or 0.0),
-        "event_window_high": bool(ev_meta.get("window_high", False)),
-        "event_next_high_hours": (float(ev_meta.get("next_high_hours")) if ev_meta.get("next_high_hours") is not None else None),
-        "event_last_high_hours": (float(ev_meta.get("last_high_hours")) if ev_meta.get("last_high_hours") is not None else None),
-        "event_feed_status": str(ev_meta.get("status", "") or ""),
-        "event_feed_error": str(ev_meta.get("err", "") or ""),
-        "event_upcoming": (ev_meta.get("upcoming", []) or []),
-        "event_recent": (ev_meta.get("recent", []) or []),
-        "event_impact_ccys": (ev_meta.get("impact_ccys", {}) or {}),
-        "weekend_risk": float(weekend_risk),
-        "weekcross_risk": float(weekcross_risk or 0.0),
-        "weekcross_weekday": (int(weekcross_weekday) if weekcross_weekday is not None else None),
-        "mom_bonus": float(mom_bonus),
-        "dynamic_threshold": float(dynamic_threshold),
-        "dynamic_threshold_base": float(base_thr),
-        "dynamic_threshold_mult": float(thr_mult),
-        "ev_gate": float(ev_gate),
-        "structure_scaled": float(structure_scaled),
-        "ev_scaled": float(ev_scaled),
-        "rank_score": float(rank_score),
-        "event_penalty": float(event_pen),
-        "macro_penalty": float(macro_pen),
-        "len": int(len(df)),
-    }
-
-    # -----------------------------------------------------------------
-    # 14) 注文方式の提案（直前:成行禁止 / 直後:ブレイク専用）
-    # -----------------------------------------------------------------
-    order_type = "MARKET"
-    entry_type = "MARKET_NOW"
-    exec_guard_notes: List[str] = []
-
-    # setup-based suggestion (even for NO_TRADE; UI上は参考として表示可能)
-    setup_kind = "TREND"
-    if phase_label == "RANGE" and bool(range_edge_setup):
-        setup_kind = "RANGE_EDGE"
-    elif bool(breakout_pass) or str(phase).startswith("BREAKOUT") or (event_mode == "POST_BREAKOUT"):
-        setup_kind = "BREAKOUT"
-
+    conn = _connect()
     try:
-        pip = _pip_size(pair)
-        atr_for_entry = max(float(atr14), float(pip) * 10.0)
-    except Exception:
-        pip = 0.01
-        atr_for_entry = float(atr14)
+        for i in range(0, len(universe), chunk_size):
+            chunk = universe[i:i+chunk_size]
+            try:
+                fetched = _fetch_from_yf(chunk, start=start)
+            except Exception:
+                fetched = {}
+            if not fetched:
+                failed += len(chunk)
+                if len(sample_fail) < 50:
+                    sample_fail.extend(chunk[: min(10, len(chunk))])
+                # Cloud対策：過剰リクエスト抑制
+                time.sleep(RATE_LIMIT_SLEEP_SEC)
+                continue
 
-    # Base reco by setup
-    if setup_kind == "RANGE_EDGE":
-        if direction == "LONG":
-            new_entry = entry - 0.25 * atr_for_entry
+            rows = []
+            for sym, df in fetched.items():
+                if df is None or df.empty:
+                    failed += 1
+                    if len(sample_fail) < 50:
+                        sample_fail.append(sym)
+                    continue
+                df = df.reset_index()
+                for _, r in df.iterrows():
+                    d = r.get("Date")
+                    if pd.isna(d):
+                        continue
+                    rows.append((
+                        sym,
+                        pd.to_datetime(d).date(),
+                        float(r["Open"]) if pd.notna(r.get("Open")) else None,
+                        float(r["High"]) if pd.notna(r.get("High")) else None,
+                        float(r["Low"]) if pd.notna(r.get("Low")) else None,
+                        float(r["Close"]) if pd.notna(r.get("Close")) else None,
+                        float(r.get("Adj Close")) if pd.notna(r.get("Adj Close")) else None,
+                        int(r.get("Volume")) if pd.notna(r.get("Volume")) else None,
+                    ))
+            if rows:
+                with conn.cursor() as cur:
+                    cur.executemany("""
+                    INSERT INTO ohlc_daily(symbol, trade_date, open, high, low, close, adj_close, volume)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT(symbol, trade_date) DO UPDATE SET
+                        open=EXCLUDED.open,
+                        high=EXCLUDED.high,
+                        low=EXCLUDED.low,
+                        close=EXCLUDED.close,
+                        adj_close=EXCLUDED.adj_close,
+                        volume=EXCLUDED.volume;
+                    """, rows)
+                upserted += len(rows)
+                conn.commit()
+
+            # Cloud対策：過剰リクエスト抑制
+            time.sleep(RATE_LIMIT_SLEEP_SEC)
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).date()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM ohlc_daily WHERE trade_date < %s;", (cutoff,))
+        _set_meta(conn, "last_update_utc", datetime.now(timezone.utc).isoformat().replace("+00:00","Z"))
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"upserted_rows": upserted, "failed_symbols": failed, "sample_failures": sample_fail[:20], "start": start, "keep_days": keep_days, "chunk_size": chunk_size}
+
+# --- Indicators & scan (unchanged core) ---
+def _atr14(df: pd.DataFrame) -> pd.Series:
+    h = df["High"].astype(float)
+    l = df["Low"].astype(float)
+    c = df["Close"].astype(float)
+    tr = pd.concat([(h-l), (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    return tr.rolling(14).mean()
+
+def evaluate_swing_fixed(df: pd.DataFrame, max_hold_days: int = 10, tp_atr: float = 1.5, sl_atr: float = 1.0, min_bars: int = 60, atr_pct: float | None = None) -> Dict[str, Any]:
+    d = df.copy()
+    d["ATR14"] = _atr14(d)
+    d = d.dropna()
+    # 履歴が短い場合でも「暫定評価」で落とさない（Cloudで最初は履歴が薄くなりがち）
+    if len(d) < int(min_bars):
+        tf = _trend_features(df)
+        ap = float(atr_pct) if atr_pct is not None and np.isfinite(atr_pct) else np.nan
+        # 暫定スコア：トレンド(20/60日)を加点、ボラ(ATR%)を軽く減点
+        score = 0.55*(tf.get("ret_60", np.nan) if np.isfinite(tf.get("ret_60", np.nan)) else 0.0) + 0.35*(tf.get("ret_20", np.nan) if np.isfinite(tf.get("ret_20", np.nan)) else 0.0)
+        if np.isfinite(ap):
+            score -= 0.02*(ap)
+        return {"ok": True, "trials": 0, "tp_hit_rate": float("nan"), "ev_r": float("nan"), "avg_tp_days": float(max_hold_days), "avg_dd_r": float("nan"), "swing_score": float(score), "note": "履歴不足のため暫定評価"}
+
+    wins = 0
+    losses = 0
+    hit_days = []
+    dd_r = []
+
+    H = int(max_hold_days)
+    for i in range(0, len(d)-H-1):
+        entry = float(d["Close"].iloc[i])
+        atr = float(d["ATR14"].iloc[i])
+        if not np.isfinite(atr) or atr <= 0:
+            continue
+        tp = entry + tp_atr*atr
+        sl = entry - sl_atr*atr
+        fut = d.iloc[i+1:i+1+H]
+        mae = (float(fut["Low"].min()) - entry) / atr
+        dd_r.append(mae)
+
+        outcome = None
+        for j in range(len(fut)):
+            if float(fut["High"].iloc[j]) >= tp:
+                outcome = ("win", j+1); break
+            if float(fut["Low"].iloc[j]) <= sl:
+                outcome = ("loss", None); break
+        if outcome is None:
+            outcome = ("loss", None)
+
+        if outcome[0] == "win":
+            wins += 1
+            hit_days.append(outcome[1])
         else:
-            new_entry = entry + 0.25 * atr_for_entry
-        order_type = "LIMIT"
-        entry_type = "LIMIT_PULLBACK"
-        exec_guard_notes.append("レンジ端のため、押し目/戻りの指値を推奨")
-        try:
-            new_entry = _round_to_pip(float(new_entry), pair)
-            delta = float(new_entry) - float(entry)
-            entry = float(new_entry)
-            sl = _round_to_pip(float(sl) + delta, pair)
-            tp = _round_to_pip(float(tp) + delta, pair)
-        except Exception:
-            pass
+            losses += 1
 
-    elif setup_kind == "BREAKOUT":
-        if direction == "LONG":
-            new_entry = entry + 0.10 * atr_for_entry
-            entry_type = "STOP_BREAKOUT"
-        else:
-            new_entry = entry - 0.10 * atr_for_entry
-            entry_type = "STOP_BREAKDOWN"
-        order_type = "STOP"
-        exec_guard_notes.append("ブレイク捕獲のため、逆指値（STOP）を推奨")
-        try:
-            new_entry = _round_to_pip(float(new_entry), pair)
-            delta = float(new_entry) - float(entry)
-            entry = float(new_entry)
-            sl = _round_to_pip(float(sl) + delta, pair)
-            tp = _round_to_pip(float(tp) + delta, pair)
-        except Exception:
-            pass
+    n = wins + losses
+    if n == 0:
+        return {"ok": False}
+    p_win = wins / n
+    ev_r = p_win*tp_atr - (1-p_win)*sl_atr
+    avg_tp_days = float(np.mean(hit_days)) if hit_days else float(H)
+    avg_dd_r = float(abs(np.mean(dd_r))) if dd_r else 0.0
+    score = 0.45*ev_r + 0.25*p_win + 0.15*(1.0/max(avg_tp_days,1.0)) - 0.15*avg_dd_r
 
-    # High-impact is close enough → ban MARKET entry (直前:成行禁止)
-    event_market_ban_active = False
-    event_market_ban_hours = float(ctx_in.get("event_market_ban_hours", 12.0) or 12.0)
-    if float(weekcross_risk or 0.0) > 0.0:
-        event_market_ban_hours = max(event_market_ban_hours, float(ctx_in.get("weekcross_market_ban_hours", 18.0) or 18.0))
+    return {"ok": True, "trials": int(n), "tp_hit_rate": float(p_win), "ev_r": float(ev_r), "avg_tp_days": float(avg_tp_days), "avg_dd_r": float(avg_dd_r), "swing_score": float(score)}
+
+def _trend_features(df: pd.DataFrame) -> Dict[str, float]:
+    c = df["Close"].astype(float)
+    ma20 = c.rolling(20).mean()
+    ma60 = c.rolling(60).mean()
+    ret_20 = (c.iloc[-1]/c.iloc[-21]-1.0) if len(c) > 21 else np.nan
+    ret_60 = (c.iloc[-1]/c.iloc[-61]-1.0) if len(c) > 61 else np.nan
+    slope20 = (ma20.iloc[-1]-ma20.iloc[-6])/(abs(ma20.iloc[-6])+1e-12) if len(ma20) > 6 else np.nan
+    return {"ret_20": float(ret_20) if np.isfinite(ret_20) else np.nan, "ret_60": float(ret_60) if np.isfinite(ret_60) else np.nan, "slope20": float(slope20) if np.isfinite(slope20) else np.nan}
+
+def _pick_strategy(features: Dict[str, float], atr_pct: float) -> str:
+    r20 = features.get("ret_20", np.nan)
+    s20 = features.get("slope20", np.nan)
+    if np.isfinite(r20) and r20 > 0.08 and np.isfinite(s20) and s20 > 0:
+        return "順張り（ブレイク/上昇トレンド）"
+    if np.isfinite(r20) and r20 < -0.06:
+        return "逆張り（リバウンド狙い）"
+    if np.isfinite(atr_pct) and atr_pct < 1.5:
+        return "レンジ（小動き）"
+    return "押し目買い（回復狙い）"
+
+def _read_latest_dates(conn) -> Tuple[Optional[str], Optional[str]]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT MAX(trade_date) FROM ohlc_daily;")
+        latest = cur.fetchone()[0]
+        if not latest:
+            return None, None
+        cur.execute("SELECT MAX(trade_date) FROM ohlc_daily WHERE trade_date < %s;", (latest,))
+        prev = cur.fetchone()[0]
+    return str(latest), str(prev) if prev else None
+
+def fetch_last_n_days(symbols: List[str], n_days: int = 80) -> pd.DataFrame:
+    if not symbols:
+        return pd.DataFrame()
+    ensure_schema()
+    conn = _connect()
     try:
-        nh = ev_meta.get("next_high_hours", None)
-        if (nh is not None) and (float(nh) <= float(event_market_ban_hours)):
-            event_market_ban_active = True
+        latest, _ = _read_latest_dates(conn)
+        if not latest:
+            return pd.DataFrame()
+        cutoff = (datetime.fromisoformat(latest).date() - timedelta(days=int(n_days*2))).isoformat()
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT symbol, trade_date, open, high, low, close, volume
+            FROM ohlc_daily
+            WHERE symbol = ANY(%s) AND trade_date >= %s
+            ORDER BY symbol, trade_date;
+            """, (symbols, cutoff))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows, columns=["Symbol","Date","Open","High","Low","Close","Volume"])
+    df["Date"] = pd.to_datetime(df["Date"])
+    return df
+
+def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    """Stage0: DBにある最新2営業日のスナップショット+20日平均出来高だけで全件を軽量スクリーニング。
+    33業種（JPX公式一覧）をDBに持てている場合は、セクター強度ランキングも出す。
+    """
+    ensure_schema()
+    universe = universe_load_symbols()
+    t0 = time.time()
+    conn = _connect()
+    try:
+        latest, prev = _read_latest_dates(conn)
+        if not latest or not prev:
+            return pd.DataFrame(), pd.DataFrame(), {"ok": False, "reason": "db_has_no_latest_prev"}
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH last2 AS (
+                    SELECT symbol, trade_date, close, volume
+                    FROM ohlc_daily
+                    WHERE trade_date IN (%s, %s)
+                ),
+                piv AS (
+                    SELECT symbol,
+                           MAX(CASE WHEN trade_date=%s THEN close END) AS close_latest,
+                           MAX(CASE WHEN trade_date=%s THEN close END) AS close_prev
+                    FROM last2
+                    GROUP BY symbol
+                )
+                SELECT symbol, close_latest, close_prev
+                FROM piv;
+                """,
+                (latest, prev, latest, prev),
+            )
+            snap = cur.fetchall()
+
+            cutoff20 = (datetime.fromisoformat(latest).date() - timedelta(days=40)).isoformat()
+            cur.execute(
+                """
+                SELECT symbol, AVG(volume)::float AS avg_vol20
+                FROM ohlc_daily
+                WHERE symbol = ANY(%s) AND trade_date >= %s
+                GROUP BY symbol;
+                """,
+                (universe, cutoff20),
+            )
+            vol20 = cur.fetchall()
+    finally:
+        conn.close()
+
+    snap_df = pd.DataFrame(snap, columns=["symbol", "close_latest", "close_prev"])
+    vol20_df = pd.DataFrame(vol20, columns=["symbol", "avg_vol20"])
+    df = snap_df.merge(vol20_df, on="symbol", how="left")
+    conn_u = _connect()
+    try:
+        with conn_u.cursor() as cur_u:
+            # lot_size列が無いDBでも落ちないように吸収
+            try:
+                if _has_universe_col("lot_size"):
+                    cur_u.execute(
+                        "SELECT symbol, name, sector33_name, sector33_code, COALESCE(lot_size,100) "
+                        "FROM universe_symbols WHERE symbol = ANY(%s);",
+                        (universe,),
+                    )
+                else:
+                    cur_u.execute(
+                        "SELECT symbol, name, sector33_name, sector33_code, 100 "
+                        "FROM universe_symbols WHERE symbol = ANY(%s);",
+                        (universe,),
+                    )
+            except Exception:
+                cur_u.execute(
+                    "SELECT symbol, name, sector33_name, sector33_code, 100 "
+                    "FROM universe_symbols WHERE symbol = ANY(%s);",
+                    (universe,),
+                )
+            urows = cur_u.fetchall()
+    finally:
+        conn_u.close()
+    if urows:
+        # urows の列数はDBスキーマ/SELECTにより変わる可能性があるため動的に吸収
+        first_len = len(urows[0])
+        if first_len == 5:
+            # Build universe meta DataFrame safely
+            if urows:
+                first_len = len(urows[0])
+                if first_len == 5:
+                    u_df = pd.DataFrame(urows, columns=['symbol','name','sector33_name','sector33_code','lot_size'])
+                elif first_len == 4:
+                    u_df = pd.DataFrame(urows, columns=['symbol','sector33_name','sector33_code','lot_size'])
+                    u_df['name'] = ''
+                else:
+                    u_df = pd.DataFrame(urows)
+            else:
+                u_df = pd.DataFrame(columns=['symbol','name','sector33_name','sector33_code','lot_size'])
+    u_df['symbol'] = u_df['symbol'].astype(str).map(_norm_symbol)
+    u_df['_key'] = u_df['symbol'].astype(str).map(_sym_key)
+    ukeys = set([_sym_key(x) for x in universe])
+    u_df = u_df[u_df['_key'].isin(ukeys)].copy()
+    u_df['_sym_norm'] = u_df['symbol'].astype(str).map(_norm_symbol)
+    df["_key"] = df["symbol"].astype(str).map(_sym_key)
+    df = df.merge(u_df.drop(columns=["symbol","_sym_norm"], errors="ignore"), left_on="_key", right_on="_key", how="left")
+    df["sector33_name"] = df.get("sector33_name").apply(_normalize_sector_value)
+    df["name"] = df.get("name").fillna("")
+    df["pct_change_1d"] = (df["close_latest"] / (df["close_prev"] + 1e-12) - 1.0) * 100.0
+
+    df = df[pd.notna(df["close_latest"])]
+    df = df[df["close_latest"] >= float(min_price)]
+    df = df[pd.notna(df["avg_vol20"])]
+    df = df[df["avg_vol20"] >= float(min_avg_volume)]
+
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame(), {"ok": True, "latest_trade_date": latest, "elapsed_sec": time.time() - t0, "stage0_candidates": 0}
+
+    # Stage0 基本スコア（OHLCを追加取得しない軽量スコア）
+    df["stage0_score"] = 0.7 * df["pct_change_1d"].fillna(0.0) + 0.3 * np.log10(df["avg_vol20"].fillna(1.0))
+
+    # 33業種メタ（あれば）
+    meta_df = universe_load_meta()
+    if not meta_df.empty and "sector33_name" in meta_df.columns:
+        df = df.merge(
+            meta_df[["symbol","sector33_name"]],
+            on="symbol",
+            how="left",
+            suffixes=("","_meta"),
+        )
+        if "sector33_name_meta" in df.columns:
+            df["sector33_name"] = df["sector33_name"].fillna(df["sector33_name_meta"])
+            df.drop(columns=["sector33_name_meta"], inplace=True)
+    if "sector33_name" not in df.columns:
+        df["sector33_name"] = "不明"
+    else:
+        df["sector33_name"] = df["sector33_name"].fillna("不明")
+
+    sec = (
+        df.groupby("sector33_name", dropna=False)["stage0_score"]
+        .median()
+        .sort_values(ascending=False)
+        .reset_index()
+    )
+    sec.columns = ["セクター（33業種）", "強度（中央値）"]
+    sec.insert(0, "順位", range(1, len(sec) + 1))
+
+    # セクター比率を維持しつつ上位抽出
+    keep = int(keep)
+    df2 = df.sort_values(["sector33_name", "stage0_score"], ascending=[True, False]).copy()
+    counts = df2["sector33_name"].value_counts()
+    total = int(counts.sum()) if len(counts) else 0
+    min_per = 3
+    alloc: Dict[str, int] = {}
+    if total > 0:
+        for sn, cnt in counts.items():
+            alloc[sn] = max(min_per, int(round(keep * (cnt / total))))
+
+        def _sum_alloc() -> int:
+            return int(sum(alloc.values()))
+
+        while _sum_alloc() > keep:
+            k_max = max(alloc, key=lambda k: alloc[k])
+            if alloc[k_max] > min_per:
+                alloc[k_max] -= 1
+            else:
+                break
+        while _sum_alloc() < keep:
+            k_max = max(alloc, key=lambda k: counts.get(k, 0))
+            alloc[k_max] += 1
+
+    picks = []
+    for sn, k in alloc.items():
+        picks.append(df2[df2["sector33_name"] == sn].head(int(k)))
+    picked = pd.concat(picks, ignore_index=True) if picks else df2.head(keep)
+
+    picked = picked.sort_values("stage0_score", ascending=False)
+    picked_syms = set(picked["symbol"].tolist())
+    if len(picked) < keep:
+        rest = df2[~df2["symbol"].isin(picked_syms)].sort_values("stage0_score", ascending=False)
+        picked = pd.concat([picked, rest.head(keep - len(picked))], ignore_index=True)
+
+    picked = picked.sort_values("stage0_score", ascending=False).head(keep).copy()
+
+    out = picked.rename(
+        columns={
+            "symbol": "銘柄",
+            "close_latest": "現在値（終値）",
+            "pct_change_1d": "前日比（%）",
+            "avg_vol20": "平均出来高20日",
+        }
+    )[["銘柄", "現在値（終値）", "前日比（%）", "平均出来高20日", "stage0_score", "name", "sector33_name"]]
+    out = out.rename(columns={"name":"銘柄名","sector33_name":"セクター"})
+    out["stage0_score"] = out["stage0_score"].astype(float).round(4)
+
+    meta = {"ok": True, "latest_trade_date": latest, "elapsed_sec": time.time() - t0, "stage0_candidates": int(len(out))}
+    return out, sec, meta
+
+def stage1_select(stage0_df: pd.DataFrame, keep: int, atr_pct_min: float, atr_pct_max: float) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    t0 = time.time()
+    # stage0 からセクター/銘柄名を引き継ぐ（無ければ空）
+    sec_map = {}
+    name_map = {}
+    try:
+        if "セクター" in stage0_df.columns:
+            sec_map = stage0_df.set_index("銘柄")["セクター"].to_dict()
+        elif "sector33_name" in stage0_df.columns:
+            sec_map = stage0_df.set_index("銘柄")["sector33_name"].fillna("不明").to_dict()
+        if "銘柄名" in stage0_df.columns:
+            name_map = stage0_df.set_index("銘柄")["銘柄名"].fillna("").to_dict()
+        elif "name" in stage0_df.columns:
+            name_map = stage0_df.set_index("銘柄")["name"].fillna("").to_dict()
     except Exception:
         pass
 
-    if decision == "TRADE" and bool(event_market_ban_active) and order_type == "MARKET":
-        # If we still ended up MARKET, convert to pending
-        try:
-            nh = float(ev_meta.get("next_high_hours") or 0.0)
-        except Exception:
-            nh = None
-        if phase_label == "RANGE" and (not breakout_pass):
-            # pullback limit
-            if direction == "LONG":
-                new_entry = entry - 0.25 * atr_for_entry
-            else:
-                new_entry = entry + 0.25 * atr_for_entry
-            order_type = "LIMIT"
-            entry_type = "LIMIT_PULLBACK"
-            msg = f"高インパクト指標まで{nh:.1f}hのため成行禁止 → 押し目/戻りの指値を提案"
-        else:
-            # breakout stop
-            if direction == "LONG":
-                new_entry = entry + 0.10 * atr_for_entry
-                entry_type = "STOP_BREAKOUT"
-            else:
-                new_entry = entry - 0.10 * atr_for_entry
-                entry_type = "STOP_BREAKDOWN"
-            order_type = "STOP"
-            msg = f"高インパクト指標まで{nh:.1f}hのため成行禁止 → ブレイク逆指値を提案"
+    syms = stage0_df["銘柄"].astype(str).tolist()
+    hist = fetch_last_n_days(syms, n_days=80)
+    if hist.empty:
+        return pd.DataFrame(), {"ok": False}
+    rows = []
+    for sym, g in hist.groupby("Symbol"):
+        g = g.sort_values("Date")
+        if len(g) < 60:
+            continue
+        atr = _atr14(g)
+        atr_last = float(atr.iloc[-1]) if len(atr) else np.nan
+        close_last = float(g["Close"].iloc[-1])
+        atr_pct = (atr_last/(close_last+1e-12))*100.0 if np.isfinite(atr_last) else np.nan
+        if np.isfinite(atr_pct) and (atr_pct < float(atr_pct_min) or atr_pct > float(atr_pct_max)):
+            continue
+        feats = _trend_features(g)
+        score = 0.40*(feats.get("ret_20",0.0) if np.isfinite(feats.get("ret_20",np.nan)) else 0.0) + 0.20*(feats.get("ret_60",0.0) if np.isfinite(feats.get("ret_60",np.nan)) else 0.0) + 0.20*(feats.get("slope20",0.0) if np.isfinite(feats.get("slope20",np.nan)) else 0.0) + 0.20*(atr_pct/10.0 if np.isfinite(atr_pct) else 0.0)
+        rows.append({"銘柄": sym, "ATR%": atr_pct, "20日騰落": feats.get("ret_20",np.nan), "60日騰落": feats.get("ret_60",np.nan), "MA20傾き": feats.get("slope20",np.nan), "stage1_score": score, "現在値（終値）": close_last})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(), {"ok": False}
+    df = df.sort_values("stage1_score", ascending=False).head(int(keep)).copy()
+    df["ATR%"] = df["ATR%"].round(3)
+    df["20日騰落"] = (df["20日騰落"]*100.0).round(2)
+    df["60日騰落"] = (df["60日騰落"]*100.0).round(2)
+    df["MA20傾き"] = (df["MA20傾き"]*100.0).round(3)
+    df["stage1_score"] = df["stage1_score"].round(4)
+    df["現在値（終値）"] = df["現在値（終値）"].round(2)
+    return df, {"ok": True, "elapsed_sec": time.time()-t0, "stage1_candidates": int(len(df))}
 
-        try:
-            new_entry = _round_to_pip(float(new_entry), pair)
-            delta = float(new_entry) - float(entry)
-            entry = float(new_entry)
-            sl = _round_to_pip(float(sl) + delta, pair)
-            tp = _round_to_pip(float(tp) + delta, pair)
-        except Exception:
-            pass
+def _fundamentals_get_cached(symbol: str) -> Optional[Dict[str, Any]]:
+    """yfinanceの info/calendar を使った簡易財務/イベント。RateLimit時はNone。"""
+    ensure_schema()
+    symbol = str(symbol).strip().upper()
+    if not symbol:
+        return None
 
-        exec_guard_notes.append(msg)
-        if why:
-            why = why + " / " + msg
-        else:
-            why = msg
-
-    # lot shrink factors (UI/logging)
+    today = datetime.now(JST).date()
+    conn = _connect()
     try:
-        ef = float(ctx_out.get("event_risk_factor", 0.0) or 0.0)
-        ctx_out["event_market_ban_active"] = bool(event_market_ban_active)
-        ctx_out["event_market_ban_hours"] = float(event_market_ban_hours)
-        ctx_out["exec_guard_notes"] = list(exec_guard_notes)
-        ctx_out["order_type_reco"] = str(order_type)
-        ctx_out["entry_type_reco"] = str(entry_type)
-        ctx_out["lot_shrink_event_factor"] = float(_clamp(1.0 - 0.60 * ef, 0.20, 1.00))
-        ctx_out["lot_shrink_weekcross_factor"] = (0.75 if float(weekcross_risk or 0.0) > 0.0 else 1.0)
-        ctx_out["lot_shrink_weekend_factor"] = (0.60 if float(weekend_risk or 0.0) > 0.0 else 1.0)
+        with conn.cursor() as cur:
+            cur.execute("SELECT asof_date, payload_json FROM fundamentals_cache WHERE symbol=%s;", (symbol,))
+            row = cur.fetchone()
+        if row and row[0] == today and row[1]:
+            try:
+                return json.loads(row[1])
+            except Exception:
+                pass
+    finally:
+        conn.close()
+
+    # fetch
+    try:
+        import yfinance as yf  # type: ignore
+        tk = yf.Ticker(symbol)
+        info = {}
+        try:
+            info = tk.info or {}
+        except Exception:
+            info = {}
+        cal = {}
+        try:
+            cal = getattr(tk, "calendar", None)
+            if hasattr(cal, "to_dict"):
+                cal = cal.to_dict()
+            if isinstance(cal, pd.DataFrame):
+                cal = cal.to_dict()
+        except Exception:
+            cal = {}
+
+        payload = {
+            "symbol": symbol,
+            "asof": str(today),
+            "info": info,
+            "calendar": cal,
+        }
+    except Exception:
+        return None
+
+    # cache
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO fundamentals_cache(symbol, asof_date, payload_json, updated_utc)
+                VALUES(%s,%s,%s,NOW())
+                ON CONFLICT(symbol) DO UPDATE SET asof_date=EXCLUDED.asof_date, payload_json=EXCLUDED.payload_json, updated_utc=NOW();
+                """,
+                (symbol, today, json.dumps(payload, ensure_ascii=False, default=_json_safe)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return payload
+
+def _buffett_score(payload: Dict[str, Any]) -> Tuple[Optional[float], str]:
+    """超簡易の“バフェット風”評価（データが無ければNone）。"""
+    info = payload.get("info") or {}
+    try:
+        roe = info.get("returnOnEquity")
+        pm = info.get("profitMargins")
+        de = info.get("debtToEquity")
+        fcf = info.get("freeCashflow")
+        mc = info.get("marketCap")
+        score = 0.0
+        used = 0
+        if isinstance(roe, (int,float)) and roe == roe:
+            score += max(-1.0, min(1.0, float(roe))) * 1.5
+            used += 1
+        if isinstance(pm, (int,float)) and pm == pm:
+            score += max(-1.0, min(1.0, float(pm))) * 1.0
+            used += 1
+        if isinstance(de, (int,float)) and de == de:
+            # 低いほど良い
+            score += max(-1.0, min(1.0, (1.0 - float(de)/200.0))) * 1.0
+            used += 1
+        if isinstance(fcf, (int,float)) and isinstance(mc, (int,float)) and mc and mc == mc and fcf == fcf:
+            # FCF利回りっぽい
+            yld = float(fcf)/float(mc)
+            score += max(-1.0, min(1.0, yld*10.0)) * 1.0
+            used += 1
+        if used == 0:
+            return None, "財務データ不足"
+        return round(score, 3), f"指標使用={used}"
+    except Exception:
+        return None, "計算失敗"
+
+def _event_alert(payload: Dict[str, Any], days_earn: int = 10, days_exdiv: int = 7) -> str:
+    """決算/権利落ちなど、取得できる範囲での注意喚起。"""
+    info = payload.get("info") or {}
+    today = datetime.now(JST).date()
+    notes = []
+    # earningsDate
+    ed = info.get("earningsDate") or info.get("earningsTimestamp")
+    try:
+        if isinstance(ed, (list, tuple)) and ed:
+            ed = ed[0]
+        if isinstance(ed, (int,float)):
+            d = datetime.fromtimestamp(ed, tz=timezone.utc).astimezone(JST).date()
+            if 0 <= (d - today).days <= days_earn:
+                notes.append(f"決算接近({d})")
+        elif isinstance(ed, str):
+            d = pd.to_datetime(ed, errors="coerce")
+            if pd.notna(d):
+                d = d.tz_localize("UTC") if getattr(d, "tzinfo", None) is None else d
+                d = d.tz_convert(JST).date()
+                if 0 <= (d - today).days <= days_earn:
+                    notes.append(f"決算接近({d})")
+    except Exception:
+        pass
+    # exDividendDate
+    exd = info.get("exDividendDate")
+    try:
+        if isinstance(exd, (int,float)):
+            d = datetime.fromtimestamp(exd, tz=timezone.utc).astimezone(JST).date()
+            if 0 <= (d - today).days <= days_exdiv:
+                notes.append(f"権利落ち接近({d})")
+    except Exception:
+        pass
+    return " / ".join(notes) if notes else "-"
+
+
+# =========================
+# COMPLETE AI HELPERS
+# =========================
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+def detect_trend_ai_01(g: pd.DataFrame) -> float:
+    """AIトレンド検出: 0..1"""
+    try:
+        c = g["Close"].astype(float)
+        if len(c) < 70:
+            return 0.5
+        ema20 = _ema(c, 20)
+        ema60 = _ema(c, 60)
+        dir_up = 1.0 if float(ema20.iloc[-1]) >= float(ema60.iloc[-1]) else -1.0
+        r20 = (float(c.iloc[-1]) / float(c.iloc[-21]) - 1.0) if len(c) > 21 else 0.0
+        slope = (float(ema20.iloc[-1]) - float(ema20.iloc[-6])) / (abs(float(ema20.iloc[-6])) + 1e-12)
+        x = 0.0
+        x += 0.55 * (1.0 / (1.0 + np.exp(-10.0 * r20)) - 0.5) * 2.0
+        x += 0.25 * np.tanh(8.0 * slope)
+        x += 0.20 * (1.0 if dir_up > 0 else -1.0)
+        return float(max(0.0, min(1.0, (x + 1.0) / 2.0)))
+    except Exception:
+        return 0.5
+
+def walk_forward_oos(g: pd.DataFrame, hold_days: int = 10, tp_atr: float = 1.5, sl_atr: float = 1.0,
+                     train_days: int = 120, test_days: int = 40, step_days: int = 40):
+    """WalkForward OOS: (winrate, rr). 失敗時は (nan,nan)"""
+    try:
+        d = g.copy().dropna(subset=["Close","High","Low"])
+        d["ATR14"] = _atr14(d)
+        d = d.dropna()
+        if len(d) < (train_days + test_days + 40):
+            return float("nan"), float("nan")
+        wins = 0
+        losses = 0
+        start = 0
+        while start + train_days + test_days < len(d):
+            train = d.iloc[start:start+train_days]
+            test = d.iloc[start+train_days:start+train_days+test_days]
+            ema20 = _ema(train["Close"].astype(float), 20)
+            ema60 = _ema(train["Close"].astype(float), 60)
+            direction_long = bool(float(ema20.iloc[-1]) >= float(ema60.iloc[-1]))
+            H = int(hold_days)
+            for i in range(0, len(test)-H-1):
+                entry = float(test["Close"].iloc[i])
+                atr = float(test["ATR14"].iloc[i])
+                if not np.isfinite(atr) or atr <= 0:
+                    continue
+                fut = test.iloc[i+1:i+1+H]
+                if direction_long:
+                    tp = entry + tp_atr*atr
+                    sl = entry - sl_atr*atr
+                    hit = None
+                    for j in range(len(fut)):
+                        if float(fut["High"].iloc[j]) >= tp:
+                            hit = "win"; break
+                        if float(fut["Low"].iloc[j]) <= sl:
+                            hit = "loss"; break
+                else:
+                    tp = entry - tp_atr*atr
+                    sl = entry + sl_atr*atr
+                    hit = None
+                    for j in range(len(fut)):
+                        if float(fut["Low"].iloc[j]) <= tp:
+                            hit = "win"; break
+                        if float(fut["High"].iloc[j]) >= sl:
+                            hit = "loss"; break
+                if hit == "win":
+                    wins += 1
+                else:
+                    losses += 1
+            start += step_days
+        n = wins + losses
+        if n <= 0:
+            return float("nan"), float("nan")
+        return float(wins/n), float(tp_atr/max(sl_atr,1e-9))
+    except Exception:
+        return float("nan"), float("nan")
+
+def montecarlo_dd5(p_win: float, rr: float, trades: int = 60, paths: int = 400, seed: int = 7) -> float:
+    """MonteCarlo DD（R単位）5%点。負の値。"""
+    try:
+        if not np.isfinite(p_win) or not np.isfinite(rr) or trades < 10:
+            return float("nan")
+        p = float(max(0.01, min(0.99, p_win)))
+        b = float(max(0.2, rr))
+        rng = np.random.default_rng(seed)
+        dds = []
+        for _ in range(int(paths)):
+            wins = rng.random(int(trades)) < p
+            r = np.where(wins, b, -1.0).astype(float)
+            eq = np.cumsum(r)
+            peak = np.maximum.accumulate(eq)
+            dd = eq - peak
+            dds.append(float(np.min(dd)))
+        return float(np.quantile(np.array(dds, dtype=float), 0.05))
+    except Exception:
+        return float("nan")
+
+def kelly_fraction(p_win: float, rr: float) -> float:
+    """Kelly最適化（保守クリップ0..0.25）"""
+    try:
+        if not np.isfinite(p_win) or not np.isfinite(rr) or rr <= 0:
+            return 0.0
+        p = float(p_win); q = 1.0 - p; b = float(rr)
+        f = (b*p - q) / b
+        return float(max(0.0, min(0.25, f)))
+    except Exception:
+        return 0.0
+
+def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_bars: int = 60, include_fundamentals: bool = True, fundamentals_top_n: int = 20) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    t0 = time.time()
+    syms = stage1_df["銘柄"].astype(str).tolist()
+    hist = fetch_last_n_days(syms, n_days=int(stage2_days))
+    if hist.empty:
+        return pd.DataFrame(), pd.DataFrame(), {"ok": False}
+
+    rows, guides = [], []
+    errors, sample_fail = 0, []
+    diag = {"hist_symbols": int(len(syms)), "hist_days": int(stage2_days), "ok_eval": 0, "fallback_eval": 0, "skipped_no_atr": 0}
+
+    for sym, g in hist.groupby("Symbol"):
+        try:
+            g = g.sort_values("Date")
+            atr_pct = float(stage1_df.loc[stage1_df["銘柄"]==sym, "ATR%"].iloc[0]) if len(stage1_df.loc[stage1_df["銘柄"]==sym]) else np.nan
+            res = evaluate_swing_fixed(g, min_bars=int(min_bars), atr_pct=atr_pct)
+            if not res.get("ok"):
+                continue
+            if res.get("trials", 0) == 0:
+                diag["fallback_eval"] += 1
+            else:
+                diag["ok_eval"] += 1
+            close_last = float(g["Close"].iloc[-1])
+            atr_series = _atr14(g)
+            atr_last = float(atr_series.dropna().iloc[-1]) if len(atr_series.dropna()) else float("nan")
+            tp = close_last + 1.5*atr_last
+            sl = close_last - 1.0*atr_last
+            atr_pct = float(stage1_df.loc[stage1_df["銘柄"]==sym, "ATR%"].iloc[0]) if len(stage1_df.loc[stage1_df["銘柄"]==sym]) else np.nan
+            strat = _pick_strategy(_trend_features(g), atr_pct)
+
+            rows.append({"銘柄": sym, "推奨方式": strat, "現在値（終値）": round(close_last,2), "TP目安": round(tp,2), "SL目安": round(sl,2),
+                         "TP到達率": res["tp_hit_rate"], "期待値EV(R)": res["ev_r"], "平均利確日数": res["avg_tp_days"],
+                         "平均逆行(R)": res["avg_dd_r"], "検証回数": res.get("trials",0), "利確スコア": res.get("swing_score", float("nan")), "備考": res.get("note","")})
+            guides.append({"銘柄": sym, "推奨方式": strat, "Entry目安": round(close_last,2), "SL目安": round(sl,2), "TP目安": round(tp,2), "最大保有": "10営業日"})
+        except Exception:
+            errors += 1
+            if len(sample_fail) < 20:
+                sample_fail.append(sym)
+
+    df = pd.DataFrame(rows)
+    guide = pd.DataFrame(guides)
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame(), {"ok": False, "reason": "no_pass", "diag": diag, "errors": errors, "sample_failures": sample_fail}
+
+    df["TP到達率"] = df["TP到達率"].clip(0,1)
+    df["期待値EV(R)"] = df["期待値EV(R)"].clip(-5,5)
+    df["平均逆行(R)"] = df["平均逆行(R)"].clip(0,10)
+    df["平均利確日数"] = df["平均利確日数"].clip(1,10)
+
+    df["総合スコア"] = 0.55*df["利確スコア"] + 0.20*df["TP到達率"] + 0.15*df["期待値EV(R)"] - 0.10*df["平均逆行(R)"]
+    df = df.sort_values("総合スコア", ascending=False).head(int(keep)).copy()
+    # --- COMPLETE AI: WalkForward / MonteCarlo / Kelly (budgeted) ---
+    try:
+        # Streamlit Cloud対策：重い計算は上位N件だけ＆時間予算で打ち切り
+        top_n = int(os.environ.get("AI_EXTRA_TOP_N", "8"))
+        time_budget_s = float(os.environ.get("AI_EXTRA_BUDGET_S", "18"))
+        _t_ai0 = time.time()
+
+        n_all = int(len(df))
+        n_do = max(0, min(n_all, top_n))
+
+        wf_wr_list = [float("nan")] * n_all
+        wf_rr_list = [float("nan")] * n_all
+        mc_list    = [float("nan")] * n_all
+        k_list     = [float("nan")] * n_all
+
+        syms = df["銘柄"].astype(str).tolist()
+        for i_sym, sym2 in enumerate(syms[:n_do]):
+            if (time.time() - _t_ai0) > time_budget_s:
+                break
+            g2 = hist[hist["Symbol"] == sym2].sort_values("Date")
+            wr, rr = walk_forward_oos(
+                g2,
+                hold_days=10,
+                tp_atr=1.5,
+                sl_atr=1.0,
+                train_days=120,
+                test_days=40,
+                step_days=40,
+            )
+            wf_wr_list[i_sym] = wr
+            wf_rr_list[i_sym] = rr
+            mc_list[i_sym] = montecarlo_dd5(wr, rr, trades=60, paths=250, seed=7)  # paths軽量化
+            k_list[i_sym] = kelly_fraction(wr, rr)
+
+        df["WF勝率（OOS）"] = wf_wr_list
+        df["WF損益比RR（OOS）"] = wf_rr_list
+        df["MC DD 5%（推定）"] = mc_list
+        df["Kelly最適化（f）"] = k_list
+
+        # ボラ調整（ATR%があれば）
+        if "ATR%" in stage1_df.columns:
+            atr_map = stage1_df.set_index("銘柄")["ATR%"].to_dict()
+            atrs = df["銘柄"].map(lambda s: float(atr_map.get(s, float("nan"))))
+        else:
+            atrs = float("nan")
+        vol_adj = pd.to_numeric(atrs, errors="coerce")
+        vol_adj = (3.0 / vol_adj).where(np.isfinite(vol_adj) & (vol_adj > 0), 1.0).clip(0.35, 1.65)
+
+        # AI総合スコア（置換：欠損は中立値）
+        ret3m = pd.to_numeric(df.get("3ヶ月リターン", np.nan), errors="coerce").fillna(0.0)
+        trend = pd.to_numeric(df.get("AIトレンド", np.nan), errors="coerce").fillna(0.5)
+        wf = pd.to_numeric(df.get("WF勝率（OOS）", np.nan), errors="coerce").fillna(0.5)
+        rr = pd.to_numeric(df.get("WF損益比RR（OOS）", np.nan), errors="coerce").fillna(1.5)
+        dd5 = pd.to_numeric(df.get("MC DD 5%（推定）", np.nan), errors="coerce").fillna(-5.0)
+        dd_score = 1.0/(1.0+np.exp(-(dd5+3.0)))
+        kelly = pd.to_numeric(df.get("Kelly最適化（f）", np.nan), errors="coerce").fillna(0.0)
+
+        base = (
+            0.28 * np.tanh(4.0*ret3m) +
+            0.22 * (trend-0.5)*2.0 +
+            0.22 * (wf-0.5)*2.0 +
+            0.10 * np.tanh(rr-1.0) +
+            0.12 * (dd_score-0.5)*2.0 +
+            0.06 * (kelly/0.25)
+        )
+        df["総合スコア"] = (base * vol_adj).astype(float)
+        df = df.sort_values("総合スコア", ascending=False).copy()
     except Exception:
         pass
 
-    # -----------------------------------------------------------------
-    # 15) 保有中のイベント接近対応（縮退/一部利確/建値移動/追加禁止）
-    # -----------------------------------------------------------------
-    hold_manage = _hold_manage_reco(
-        pair=str(pair),
-        df=df,
-        ctx_in=ctx_in,
-        plan_like={"side": side, "entry": entry, "sl": sl, "tp": tp},
-        ev_meta=(ev_meta or {}),
-        weekend_risk=float(weekend_risk or 0.0),
-        weekcross_risk=float(weekcross_risk or 0.0),
-    )
-    if isinstance(hold_manage, dict) and hold_manage:
-        try:
-            ctx_out["hold_manage"] = hold_manage
-        except Exception:
-            pass
+        # --- 財務/イベント（簡易）を上位Nだけ付与（RateLimit時はスキップ） ---
+    if include_fundamentals and fundamentals_top_n and len(df):
+        topn = int(min(len(df), max(0, fundamentals_top_n)))
+        scores = []
+        alerts = []
+        memos = []
+        for i, sym in enumerate(df["銘柄"].tolist()):
+            if i >= topn:
+                scores.append(None); alerts.append("-"); memos.append("未取得（上位のみ）"); 
+                continue
+            payload = _fundamentals_get_cached(sym)
+            if payload is None:
+                scores.append(None); alerts.append("-"); memos.append("取得失敗（RateLimit等）")
+                continue
+            sc, memo = _buffett_score(payload)
+            scores.append(sc)
+            alerts.append(_event_alert(payload))
+            memos.append(memo)
+        df["バフェット簡易スコア"] = scores
+        df["イベント注意"] = alerts
+        df["財務メモ"] = memos
+    else:
+        df["バフェット簡易スコア"] = None
+        df["イベント注意"] = "-"
+        df["財務メモ"] = "OFF"
 
-    # Trail SL: エントリーから0.5R戻し（見せ方用）
-    trail_sl = sl
-    try:
-        dist_sl = abs(entry - sl)
-        if dist_sl > 0:
-            trail_sl = entry - 0.5 * dist_sl if direction == "LONG" else (entry + 0.5 * dist_sl)
-    except Exception:
-        trail_sl = sl
+    
+    for c in ["利確スコア","TP到達率","期待値EV(R)","平均利確日数","平均逆行(R)","総合スコア"]:
+        if c in df.columns:
+            df[c] = df[c].astype(float).round(4)
+    df["TP到達率"] = (df["TP到達率"]*100.0).round(2)
 
-    # 返却（main互換キー）
-    plan = {
-        "decision": str(decision),
-        "direction": str(direction),
-        "side": str(side),
+    # 表示用: セクター/銘柄名（無い場合は空）
+    if "セクター" not in df.columns:
+        if "sector33_name" in df.columns:
+            df["セクター"] = df["sector33_name"].fillna("不明")
+        else:
+            df["セクター"] = "不明"
+    if "銘柄名" not in df.columns:
+        if "name" in df.columns:
+            df["銘柄名"] = df["name"].fillna("")
+        else:
+            df["銘柄名"] = ""
 
-        "order_type": str(order_type),
-        "entry_type": str(entry_type),
+    cols = ["銘柄","銘柄名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式","Kelly最適化（f）","AIトレンド","現在値（終値）","TP目安","SL目安","TP到達率","期待値EV(R)","平均利確日数","平均逆行(R)","検証回数","利確スコア","バフェット簡易スコア","イベント注意","財務メモ"]
+    # --- column safety: ensure optional AI columns exist (avoid KeyError) ---
+    for _c in ["3ヶ月リターン","AIトレンド","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","Kelly最適化（f）"]:
+        if _c not in df.columns:
+            df[_c] = np.nan
 
-        "entry": float(entry),
-        "entry_price": float(entry),
-        "sl": float(sl),
-        "stop_loss": float(sl),
-        "tp": float(tp),
-        "take_profit": float(tp),
+    # keep column order; missing columns become NaN
+    df = df.reindex(columns=cols)
 
-        "trail_sl": float(trail_sl),
-        "extend_factor": 1.0,
 
-        "ev_raw": float(ev_raw),
-        "ev_adj": float(ev_adj),
+    meta = {"ok": True, "elapsed_sec": time.time()-t0, "errors": errors, "sample_failures": sample_fail, "stage2_selected": int(len(df)), "diag": diag}
+    return df, guide, meta
 
-        "expected_R_ev_raw": float(ev_raw),
-        "expected_R_ev_adj": float(ev_adj),
-        "expected_R_ev": float(ev_gate),
 
-        "rank_score": float(rank_score),
-        "final_score": float(final_score),
-
-        "dynamic_threshold": float(dynamic_threshold),
-        "gate_mode": str(gate_mode),
-
-        "confidence": float(confidence),
-        "p_win": float(p_eff),       # UIには縮退後を提示（整合性を優先）
-        "p_eff": float(p_eff),
-        "p_win_ev": float(p_eff),
-
-        "event_mode": str(event_mode),
-        "event_next_high_hours": (float(next_high) if next_high is not None else None),
-        "event_last_high_hours": (float(last_high) if last_high is not None else None),
-
-        "why": str(why),
-        "veto": list(veto),
-        "veto_reasons": list(veto),
-
-        "state_probs": state_probs,
-        "ev_contribs": ev_contribs,
-
-        "hold_manage": (hold_manage if isinstance(hold_manage, dict) else {}),
-        "_ctx": ctx_out,
+def run_scan_3stage(
+    stage0_keep: int = 1200,
+    stage1_keep: int = 300,
+    stage2_keep: int = 60,
+    min_price: float = 300.0,
+    min_avg_volume: float = 30000.0,
+    atr_pct_min: float = 1.0,
+    atr_pct_max: float = 8.0,
+    # Stage2 profit-eval config
+    stage2_days: int = 180,
+    stage2_min_bars: int = 60,
+    include_fundamentals: bool = True,
+    fundamentals_top_n: int = 20,
+    # Stage3 capital optimization
+    capital_total: float = 300000.0,
+    max_positions: int = 1,
+    capital_mode: str = "growth",
+    **_ignored: Any,
+) -> Dict[str, Any]:
+    """
+    4000銘柄網羅の3段階スキャン + 資金効率最適化(Stage3)。
+    main.py 側から未知の引数が渡っても落ちないよう **_ignored を受ける。
+    """
+    ensure_schema()
+    t0 = time.time()
+    diag: Dict[str, Any] = {
+        "ok": True,
+        "stage": "start",
+        "mode": "stable",
+        "errors": [],
+        "sample_failures": [],
     }
-    return plan
 
-# End of file
+    # Stage0
+    s0, sec, m0 = stage0_select(min_price=min_price, min_avg_volume=min_avg_volume, keep=int(stage0_keep))
+    diag["stage0"] = m0
+    if s0.empty:
+        diag["stage"] = "done"
+        diag["mode"] = "degraded"
+        diag["errors"].append("Stage0 empty: DB更新不足 or フィルタが厳しすぎます")
+        diag["elapsed_sec"] = time.time() - t0
+        return {"selected": pd.DataFrame(), "guide": pd.DataFrame(), "sector_strength": sec, "diag": diag}
+
+    # Stage1
+    s1, m1 = stage1_select(s0, keep=int(stage1_keep), atr_pct_min=float(atr_pct_min), atr_pct_max=float(atr_pct_max))
+    diag["stage1"] = m1
+    if s1.empty:
+        diag["stage"] = "done"
+        diag["mode"] = "degraded"
+        diag["errors"].append("Stage1 empty: ATR%条件/履歴不足")
+        diag["elapsed_sec"] = time.time() - t0
+        return {"selected": pd.DataFrame(), "guide": pd.DataFrame(), "sector_strength": sec, "diag": diag}
+
+    # Stage2
+    sel, guide, m2 = stage2_rank(
+        s1,
+        keep=int(stage2_keep),
+        stage2_days=int(stage2_days),
+        min_bars=int(stage2_min_bars),
+        include_fundamentals=bool(include_fundamentals),
+        fundamentals_top_n=int(fundamentals_top_n),
+    )
+    diag["stage2"] = m2
+    if sel.empty:
+        diag["mode"] = "degraded"
+        diag["errors"].append("Stage2 empty: 利確評価失敗")
+        diag["stage"] = "done"
+        diag["elapsed_sec"] = time.time() - t0
+        return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
+
+
+    # Stage3: capital efficiency + execution sizing (v16.1 integrated)
+    try:
+        lot_mode = _ignored.get("lot_mode", "S株（1株）")
+        force_lot = 1 if "S株" in str(lot_mode) else 100
+
+        # merge guide (Entry/SL/TP/最大保有) into selected
+        try:
+            if isinstance(guide, pd.DataFrame) and not guide.empty:
+                _g = guide.copy()
+                keep_cols = [c for c in ["銘柄","Entry目安","SL目安","TP目安","最大保有"] if c in _g.columns]
+                _g = _g[keep_cols].drop_duplicates(subset=["銘柄"])
+                sel = sel.merge(_g, on="銘柄", how="left", suffixes=("","_guide"))
+                for c in ["Entry目安","SL目安","TP目安","最大保有"]:
+                    cg = f"{c}_guide"
+                    if cg in sel.columns:
+                        if c not in sel.columns:
+                            sel[c] = sel[cg]
+                        else:
+                            sel[c] = sel[c].where(pd.notna(sel[c]), sel[cg])
+                        sel.drop(columns=[cg], inplace=True)
+        except Exception as _e_merge:
+            diag["errors"].append(f"Stage3 guide merge warning: {type(_e_merge).__name__}: {_e_merge}")
+
+        # company/sector from universe meta
+        try:
+            meta_df = universe_load_meta()
+            if isinstance(meta_df, pd.DataFrame) and not meta_df.empty:
+                cols = [c for c in ["symbol","name","sector33_name"] if c in meta_df.columns]
+                m = meta_df[cols].copy()
+                m = m.rename(columns={"symbol":"銘柄","name":"企業名","sector33_name":"セクター"})
+                m = m.drop_duplicates(subset=["銘柄"])
+                sel = sel.merge(m, on="銘柄", how="left", suffixes=("","_meta"))
+                if "企業名_meta" in sel.columns:
+                    if "企業名" not in sel.columns:
+                        sel["企業名"] = sel["企業名_meta"]
+                    else:
+                        sel["企業名"] = sel["企業名"].where(sel["企業名"].astype(str).str.strip()!="", sel["企業名_meta"])
+                    sel.drop(columns=["企業名_meta"], inplace=True)
+                if "セクター_meta" in sel.columns:
+                    if "セクター" not in sel.columns:
+                        sel["セクター"] = sel["セクター_meta"]
+                    else:
+                        sel["セクター"] = sel["セクター"].where(sel["セクター"].astype(str).str.strip()!="", sel["セクター_meta"])
+                    sel.drop(columns=["セクター_meta"], inplace=True)
+        except Exception as _e_meta:
+            diag["errors"].append(f"Stage3 meta warning: {type(_e_meta).__name__}: {_e_meta}")
+
+        conn_l = _connect()
+        try:
+            with conn_l.cursor() as cur:
+                cur.execute(
+                    "SELECT symbol, COALESCE(lot_size,100) FROM universe_symbols WHERE symbol = ANY(%s);",
+                    (sel["銘柄"].astype(str).tolist(),),
+                )
+                lot_rows = cur.fetchall()
+        finally:
+            conn_l.close()
+        lot_map = {r[0]: int(r[1] or 100) for r in lot_rows} if lot_rows else {}
+
+        risk_budget = float(capital_total) * 0.01
+
+        shares_list = []
+        invest_list = []
+        loss_list = []
+        reason_list = []
+        rr_list = []
+        status_list = []
+
+        for _, r in sel.iterrows():
+            sym = str(r["銘柄"])
+            entry = float(r.get("Entry目安", r.get("現在値（終値）", 0)) or 0)
+            sl = float(r.get("SL目安", 0) or 0)
+            tp = float(r.get("TP目安", 0) or 0)
+            current = float(r.get("現在値（終値）", 0) or 0)
+
+            lot = force_lot
+            if "S株" not in str(lot_mode):
+                lot = int(lot_map.get(sym, 100) or 100)
+
+            risk_per_share = max(entry - sl, 0.0)
+            shares = 0
+            invest = 0.0
+            loss = 0.0
+            reason = ""
+
+            if entry <= 0 or sl <= 0 or tp <= 0:
+                reason = "エントリー未計算"
+            elif risk_per_share <= 0:
+                reason = "損切幅不正"
+            else:
+                shares_risk = int(risk_budget // risk_per_share)
+                shares = (shares_risk // max(lot,1)) * max(lot,1)
+                invest = shares * entry
+                loss = shares * risk_per_share
+                if shares <= 0:
+                    reason = "資金不足または単元未満"
+
+            rr = ((tp - entry) / risk_per_share) if risk_per_share > 0 else 0.0
+            status = "未判定"
+            if current > 0 and entry > 0:
+                status = "ブレイク済" if current >= entry else "未ブレイク"
+
+            shares_list.append(int(shares))
+            invest_list.append(float(invest))
+            loss_list.append(float(loss))
+            reason_list.append(reason)
+            rr_list.append(float(rr))
+            status_list.append(status)
+
+        sel["推奨株数"] = shares_list
+        sel["推奨投資額(円)"] = np.round(invest_list, 0)
+        sel["想定損失(円)"] = np.round(loss_list, 0)
+        sel["発注不可理由"] = reason_list
+        sel["RR"] = np.round(rr_list, 3)
+        sel["Entry状態"] = status_list
+
+        def _z(x: np.ndarray) -> np.ndarray:
+            x = np.asarray(x, dtype=float)
+            if x.size == 0:
+                return x
+            mn = np.nanmin(x)
+            mx = np.nanmax(x)
+            if not np.isfinite(mn) or not np.isfinite(mx) or (mx - mn) < 1e-9:
+                return np.zeros_like(x)
+            return (x - mn) / (mx - mn)
+
+        if "資金効率(利確/投入)" not in sel.columns:
+            entry_arr = pd.to_numeric(sel.get("Entry目安", 0), errors="coerce").fillna(0).values
+            tp_arr = pd.to_numeric(sel.get("TP目安", 0), errors="coerce").fillna(0).values
+            invest_arr = pd.to_numeric(sel.get("推奨投資額(円)", 0), errors="coerce").fillna(0).values
+            prof_arr = np.maximum(tp_arr - entry_arr, 0) * pd.to_numeric(sel.get("推奨株数", 0), errors="coerce").fillna(0).values
+            sel["想定利確額(円)"] = np.round(prof_arr, 0)
+            sel["資金効率(利確/投入)"] = np.where(invest_arr > 0, (prof_arr / np.maximum(invest_arr,1))*100.0, 0.0)
+
+        eff_n = _z(pd.to_numeric(sel["資金効率(利確/投入)"], errors="coerce").fillna(0).values)
+        daily_n = _z(pd.to_numeric(sel.get("想定日次利確(円/日)", 0), errors="coerce").fillna(0).values)
+        ev_n = _z(pd.to_numeric(sel.get("期待値EV(R)", 0), errors="coerce").fillna(0).values)
+        wr_n = _z(pd.to_numeric(sel.get("TP到達率", 0), errors="coerce").fillna(0).values)
+        dd_n = 1.0 - _z(pd.to_numeric(sel.get("平均逆行(R)", 0), errors="coerce").fillna(0).values)
+
+        sel["資金最適スコア"] = np.round(
+            0.35 * eff_n + 0.20 * daily_n + 0.20 * ev_n + 0.15 * wr_n + 0.10 * dd_n,
+            6,
+        )
+        sel = sel.sort_values(["資金最適スコア","総合スコア"], ascending=False).reset_index(drop=True)
+        sel.insert(0, "順位", range(1, len(sel) + 1))
+    except Exception as e:
+        diag["mode"] = "degraded"
+        diag["errors"].append(f"Stage3 warning: 資金最適化/発注計画で例外: {type(e).__name__}: {e}")
+
+    for c in ["企業名","セクター","発注不可理由","Entry状態"]:
+        if c not in sel.columns:
+            sel[c] = ""
+        sel[c] = sel[c].fillna("").replace("", "不明" if c in ["企業名","セクター"] else "")
+    for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","推奨投資額(円)","想定損失(円)","総合スコア"]:
+        if c not in sel.columns:
+            sel[c] = 0.0
+        sel[c] = pd.to_numeric(sel[c], errors="coerce").fillna(0.0)
+    if "推奨株数" not in sel.columns:
+        sel["推奨株数"] = 0
+    sel["推奨株数"] = pd.to_numeric(sel["推奨株数"], errors="coerce").fillna(0).astype(int)
+    if "最大保有" not in sel.columns:
+        sel["最大保有"] = "10営業日"
+    sel["最大保有"] = sel["最大保有"].fillna("10営業日").astype(str)
+
+    # v17.3 final selected enrichment
+    try:
+        sel = _enrich_selected_with_meta(sel)
+        sel = _apply_ai_order_sizing(sel, capital_total=float(capital_total), max_positions=int(max_positions))
+        # normalize string cols shown in UI
+        for c in ["銘柄","企業名","セクター","推奨方式","Entry状態","発注不可理由","発注単位"]:
+            if c not in sel.columns:
+                sel[c] = ""
+            sel[c] = sel[c].apply(lambda x: _normalize_sector_value(x) if c == "セクター" else _normalize_text_value(x, "不明" if c in ["企業名","セクター"] else ""))
+        if "最大保有" not in sel.columns:
+            sel["最大保有"] = "10営業日"
+        sel["最大保有"] = sel["最大保有"].fillna("10営業日").astype(str)
+        # align guide with selected, so symbols match
+        gcols = [c for c in ["銘柄","企業名","セクター","推奨方式","発注単位","Entry目安","SL目安","TP目安","最大保有","Entry状態"] if c in sel.columns]
+        guide = sel[gcols].copy() if len(gcols) else guide
+    except Exception as e:
+        diag["mode"] = "degraded"
+        diag["errors"].append(f"v17.3 final enrich warning: {type(e).__name__}: {e}")
+
+    diag["stage"] = "done"
+    diag["elapsed_sec"] = time.time() - t0
+    return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
+
+def save_last_diag(diag: Dict[str, Any]) -> None:
+    try:
+        with open(LAST_DIAG_PATH, "w", encoding="utf-8") as f:
+            json.dump(diag, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def load_last_diag() -> Optional[Dict[str, Any]]:
+    try:
+        if os.path.exists(LAST_DIAG_PATH):
+            with open(LAST_DIAG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        return None
+    return None
+
+
+# --- v17.3 helpers ---
+def _normalize_text_value(x, default=""):
+    if x is None:
+        return default
+    s = str(x).strip()
+    if s.lower() in ["none", "nan", "nat"]:
+        return default
+    return s
+
+def _normalize_sector_value(x):
+    return _normalize_text_value(x, default="不明") or "不明"
+
+def _ensure_series(df: pd.DataFrame, col: str, default):
+    if col not in df.columns:
+        df[col] = default
+    s = df[col]
+    if not isinstance(s, pd.Series):
+        df[col] = pd.Series([default] * len(df), index=df.index)
+        s = df[col]
+    return s
+
+def _enrich_selected_with_meta(sel: pd.DataFrame) -> pd.DataFrame:
+    if sel is None or sel.empty:
+        return sel
+    out = sel.copy()
+    # normalize candidate keys
+    sym_col = "銘柄" if "銘柄" in out.columns else ("symbol" if "symbol" in out.columns else None)
+    if sym_col is not None:
+        out["_key"] = out[sym_col].astype(str).map(_sym_key)
+    else:
+        out["_key"] = ""
+    try:
+        meta_df = universe_load_meta()
+    except Exception:
+        meta_df = pd.DataFrame()
+    if isinstance(meta_df, pd.DataFrame) and len(meta_df):
+        m = meta_df.copy()
+        if "symbol" in m.columns:
+            m["_key"] = m["symbol"].astype(str).map(_sym_key)
+        else:
+            m["_key"] = ""
+        keep = [c for c in ["_key","name","sector33_name"] if c in m.columns]
+        m = m[keep].drop_duplicates("_key")
+        out = out.merge(m, on="_key", how="left", suffixes=("", "_meta"))
+        # fill company
+        if "企業名" not in out.columns:
+            out["企業名"] = ""
+        if "name" in out.columns:
+            out["企業名"] = out["企業名"].where(out["企業名"].astype(str).str.strip() != "", out["name"].fillna("").astype(str))
+        if "name_meta" in out.columns:
+            out["企業名"] = out["企業名"].where(out["企業名"].astype(str).str.strip() != "", out["name_meta"].fillna("").astype(str))
+        # fill sector
+        if "セクター" not in out.columns:
+            out["セクター"] = ""
+        if "sector33_name" in out.columns:
+            out["セクター"] = out["セクター"].where(out["セクター"].astype(str).str.strip() != "", out["sector33_name"].fillna("").astype(str))
+        if "sector33_name_meta" in out.columns:
+            out["セクター"] = out["セクター"].where(out["セクター"].astype(str).str.strip() != "", out["sector33_name_meta"].fillna("").astype(str))
+    # final normalization
+    out["企業名"] = out.get("企業名", "").apply(lambda x: _normalize_text_value(x, "不明"))
+    out["セクター"] = out.get("セクター", "").apply(_normalize_sector_value)
+    return out
+
+def _apply_ai_order_sizing(sel: pd.DataFrame, capital_total: float, max_positions: int) -> pd.DataFrame:
+    if sel is None or sel.empty:
+        return sel
+    out = sel.copy()
+    # ensure numeric cols exist
+    for c in ["Entry目安","SL目安","TP目安","RR"]:
+        _ensure_series(out, c, 0.0)
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+    # Auto decide order unit: prefer 単元株 if affordable & positive size, else S株
+    budget_per_pos = float(capital_total) / max(int(max_positions), 1)
+    risk_budget = float(capital_total) * 0.01
+    unit_list, shares_list, invest_list, loss_list, reason_list = [], [], [], [], []
+    exp_profit_list = []
+    for _, r in out.iterrows():
+        entry = float(r.get("Entry目安", 0.0) or 0.0)
+        sl = float(r.get("SL目安", 0.0) or 0.0)
+        tp = float(r.get("TP目安", 0.0) or 0.0)
+        risk = max(entry - sl, 0.0)
+        reward = max(tp - entry, 0.0)
+        if entry <= 0 or risk <= 0:
+            unit_list.append("未計算")
+            shares_list.append(0)
+            invest_list.append(0.0)
+            loss_list.append(0.0)
+            exp_profit_list.append(0.0)
+            reason_list.append("エントリー未計算")
+            continue
+
+        # evaluate 100-share and 1-share plans
+        def calc_for_lot(lot):
+            s = int(risk_budget / risk)
+            s = (s // lot) * lot
+            # cap by budget per position
+            if entry > 0:
+                s = min(s, int(budget_per_pos // entry))
+                s = (s // lot) * lot
+            invest = float(s * entry)
+            loss = float(s * risk)
+            profit = float(s * reward)
+            return s, invest, loss, profit
+
+        s100, inv100, los100, prof100 = calc_for_lot(100)
+        s1, inv1, los1, prof1 = calc_for_lot(1)
+
+        # choose larger expected profit among feasible plans
+        if s100 > 0 and prof100 >= prof1:
+            unit = "単元株"
+            s, inv, los, prof = s100, inv100, los100, prof100
+        elif s1 > 0:
+            unit = "S株"
+            s, inv, los, prof = s1, inv1, los1, prof1
+        else:
+            unit = "S株"
+            s, inv, los, prof = 0, 0.0, 0.0, 0.0
+
+        unit_list.append(unit)
+        shares_list.append(int(s))
+        invest_list.append(float(inv))
+        loss_list.append(float(los))
+        exp_profit_list.append(float(prof))
+        reason_list.append("" if s > 0 else "資金不足または単元未満")
+
+    out["発注単位"] = unit_list
+    out["推奨株数"] = shares_list
+    out["推奨投資額(円)"] = invest_list
+    out["想定損失(円)"] = loss_list
+    out["期待利益(円)"] = exp_profit_list
+    out["発注不可理由"] = reason_list
+    # keep candidates with zero shares; sort by expected profit then score
+    score_col = "総合スコア" if "総合スコア" in out.columns else None
+    if score_col:
+        out[score_col] = pd.to_numeric(out[score_col], errors="coerce").fillna(0.0)
+        out = out.sort_values(["期待利益(円)", score_col], ascending=False).reset_index(drop=True)
+    else:
+        out = out.sort_values(["期待利益(円)"], ascending=False).reset_index(drop=True)
+    return out
