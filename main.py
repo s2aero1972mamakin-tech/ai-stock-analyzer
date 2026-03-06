@@ -87,12 +87,6 @@ if "NEON_DATABASE_URL" in st.secrets and not os.environ.get("NEON_DATABASE_URL")
     os.environ["NEON_DATABASE_URL"] = st.secrets["NEON_DATABASE_URL"]
 
 st.sidebar.header("💰 資金設定")
-
-st.sidebar.caption("※ 元資金30万円想定。S株(1株)や単元(100株)など最小単位を選べます。")
-lot_mode = st.sidebar.selectbox("注文単位", ["S株（1株）","単元（100株）","銘柄マスタ優先"], index=0, key="lot_mode")
-risk_pct_per_pos = st.sidebar.slider("1ポジション許容損失（%）", 0.2, 2.0, 1.0, 0.1, key="risk_pct_per_pos") / 100.0
-max_alloc_pct_per_pos = st.sidebar.slider("1ポジション最大投入（%）", 10.0, 80.0, 35.0, 1.0, key="max_alloc_pct_per_pos") / 100.0
-
 capital_total = st.sidebar.number_input("運用資金（円）", min_value=50000.0, value=300000.0, step=10000.0)
 max_positions = st.sidebar.selectbox("同時保有数（最大）", [1,2,3], index=0, key="max_positions")
 mobile_mode = st.sidebar.toggle("📱スマホ表示（カード）", value=True)
@@ -260,10 +254,7 @@ if run_scan:
         with st.spinner("スキャン中...（DB読み込み→段階絞り込み→利確スコア）"):
             out = logic.run_scan_3stage(
                 capital_total=capital_total,
-                max_positions=int(max_positions),
-                lot_mode=str(lot_mode),
-                risk_pct_per_pos=float(risk_pct_per_pos),
-                max_alloc_pct_per_pos=float(max_alloc_pct_per_pos),
+                max_positions=int(max_positions, lot_mode=lot_mode),
 
                 stage0_keep=stage0_keep,
                 stage1_keep=stage1_keep,
@@ -343,29 +334,6 @@ if run_scan:
                     df[v] = None
             show_cols = ["順位","銘柄","企業名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式","Kelly最適化（f）","AIトレンド"]
             df = df[show_cols]
-            # ================================
-            # v14: メイン表示「エントリー必須情報」
-            # ================================
-            entry_cols = [
-                "順位","銘柄","企業名","セクター",
-                "現在値（終値）","Entry目安","SL目安","TP目安","RR","最大保有",
-                "推奨株数(株)","推奨投資額(円)","想定損失(円)",
-                "総合スコア","推奨方式","イベント注意","Entry状態"
-            ]
-            for c in entry_cols:
-                if c not in df.columns:
-                    df[c] = None
-            for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","推奨投資額(円)","想定損失(円)","総合スコア"]:
-                try:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-                except Exception:
-                    pass
-            try:
-                df["推奨株数(株)"] = pd.to_numeric(df["推奨株数(株)"], errors="coerce").fillna(0).astype(int)
-            except Exception:
-                pass
-            df_entry = df[entry_cols].copy()
-
             try:
                 for c in ["3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","Kelly最適化（f）","AIトレンド"]:
                     df[c] = pd.to_numeric(df[c], errors="coerce").round(4)
@@ -376,7 +344,7 @@ if run_scan:
             if mobile_cards:
                 render_cards_selected(df.head(show_top_n))
                 with st.expander("表で見る（PC向け）", expanded=False):
-                    st.dataframe(df_entry if 'df_entry' in locals() else df, width="stretch")
+                    st.dataframe(df, width="stretch")
             else:
                 st.dataframe(df, width="stretch")
 
