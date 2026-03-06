@@ -1,6 +1,6 @@
 
-# --- v17.1 sector normalization ---
-def _normalize_sector(x):
+# v17.2 sector normalization
+def _normalize_sector_value(x):
     if x is None:
         return "不明"
     s = str(x).strip()
@@ -1145,7 +1145,7 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
     u_df['_sym_norm'] = u_df['symbol'].astype(str).map(_norm_symbol)
     df["_key"] = df["symbol"].astype(str).map(_sym_key)
     df = df.merge(u_df.drop(columns=["symbol","_sym_norm"], errors="ignore"), left_on="_key", right_on="_key", how="left")
-    df["sector33_name"] = df.get("sector33_name").apply(_normalize_sector)
+    df["sector33_name"] = df.get("sector33_name").replace("", None)..apply(_normalize_sector_value)
     df["name"] = df.get("name").fillna("")
     df["pct_change_1d"] = (df["close_latest"] / (df["close_prev"] + 1e-12) - 1.0) * 100.0
 
@@ -1175,7 +1175,7 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
     if "sector33_name" not in df.columns:
         df["sector33_name"] = "不明"
     else:
-        df["sector33_name"] = df["sector33_name"].fillna("不明")
+        df["sector33_name"] = df["sector33_name"]..apply(_normalize_sector_value)
 
     sec = (
         df.groupby("sector33_name", dropna=False)["stage0_score"]
@@ -1246,7 +1246,7 @@ def stage1_select(stage0_df: pd.DataFrame, keep: int, atr_pct_min: float, atr_pc
         if "セクター" in stage0_df.columns:
             sec_map = stage0_df.set_index("銘柄")["セクター"].to_dict()
         elif "sector33_name" in stage0_df.columns:
-            sec_map = stage0_df.set_index("銘柄")["sector33_name"].fillna("不明").to_dict()
+            sec_map = stage0_df.set_index("銘柄")["sector33_name"]..apply(_normalize_sector_value).to_dict()
         if "銘柄名" in stage0_df.columns:
             name_map = stage0_df.set_index("銘柄")["銘柄名"].fillna("").to_dict()
         elif "name" in stage0_df.columns:
@@ -1684,7 +1684,7 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_
     # 表示用: セクター/銘柄名（無い場合は空）
     if "セクター" not in df.columns:
         if "sector33_name" in df.columns:
-            df["セクター"] = df["sector33_name"].fillna("不明")
+            df["セクター"] = df["sector33_name"]..apply(_normalize_sector_value)
         else:
             df["セクター"] = "不明"
     if "銘柄名" not in df.columns:
@@ -1962,3 +1962,13 @@ def load_last_diag() -> Optional[Dict[str, Any]]:
     except Exception:
         return None
     return None
+
+# v17.2 final sector safety
+def _fix_sector_column(df):
+    if df is None:
+        return df
+    if "セクター" in df.columns:
+        df["セクター"] = df["セクター"].apply(_normalize_sector_value)
+    if "sector33_name" in df.columns:
+        df["sector33_name"] = df["sector33_name"].apply(_normalize_sector_value)
+    return df
