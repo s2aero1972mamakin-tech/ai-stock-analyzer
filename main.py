@@ -193,7 +193,6 @@ stage2_days = st.sidebar.slider("Stage2 利確評価に使う履歴日数", 60, 
 stage2_min_bars = st.sidebar.slider("Stage2 最低バー数（短期は暫定評価）", 40, 140, 60, 5)
 
 
-mobile_cards = st.sidebar.checkbox("📱 スマホ表示（カード）", value=True)
 include_fund = st.sidebar.checkbox("🧾 財務/イベント簡易チェック（RateLimit時は自動スキップ）", value=True)
 fund_top_n = st.sidebar.slider("財務/イベント取得数（上位Nのみ）", 0, 60, 20, 5)
 
@@ -325,6 +324,12 @@ if run_scan:
                     df[v] = None
             show_cols = ["順位","銘柄","企業名","セクター","現在値（終値）","Entry目安","SL目安","TP目安","RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由"]
             df = df[show_cols]
+
+# v17.1 column clean
+for c in df.columns:
+    if df[c].dtype == object:
+        df[c] = df[c].astype(str).replace(["None","none","nan"],"").str.strip()
+
             try:
                 for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","推奨投資額(円)","想定損失(円)","総合スコア"]:
                     df[c] = pd.to_numeric(df[c], errors="coerce").round(4)
