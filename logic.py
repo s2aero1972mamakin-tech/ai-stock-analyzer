@@ -1135,7 +1135,7 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
     u_df['_sym_norm'] = u_df['symbol'].astype(str).map(_norm_symbol)
     df["_key"] = df["symbol"].astype(str).map(_sym_key)
     df = df.merge(u_df.drop(columns=["symbol","_sym_norm"], errors="ignore"), left_on="_key", right_on="_key", how="left")
-    df["sector33_name"] = df.get("sector33_name").apply(_normalize_sector_value)
+    df["sector33_name"] = df.get("sector33_name").replace("", None).fillna("不明")
     df["name"] = df.get("name").fillna("")
     df["pct_change_1d"] = (df["close_latest"] / (df["close_prev"] + 1e-12) - 1.0) * 100.0
 
@@ -1933,25 +1933,6 @@ def run_scan_3stage(
         sel["最大保有"] = "10営業日"
     sel["最大保有"] = sel["最大保有"].fillna("10営業日").astype(str)
 
-    # v17.3 final selected enrichment
-    try:
-        sel = _enrich_selected_with_meta(sel)
-        sel = _apply_ai_order_sizing(sel, capital_total=float(capital_total), max_positions=int(max_positions))
-        # normalize string cols shown in UI
-        for c in ["銘柄","企業名","セクター","推奨方式","Entry状態","発注不可理由","発注単位"]:
-            if c not in sel.columns:
-                sel[c] = ""
-            sel[c] = sel[c].apply(lambda x: _normalize_sector_value(x) if c == "セクター" else _normalize_text_value(x, "不明" if c in ["企業名","セクター"] else ""))
-        if "最大保有" not in sel.columns:
-            sel["最大保有"] = "10営業日"
-        sel["最大保有"] = sel["最大保有"].fillna("10営業日").astype(str)
-        # align guide with selected, so symbols match
-        gcols = [c for c in ["銘柄","企業名","セクター","推奨方式","発注単位","Entry目安","SL目安","TP目安","最大保有","Entry状態"] if c in sel.columns]
-        guide = sel[gcols].copy() if len(gcols) else guide
-    except Exception as e:
-        diag["mode"] = "degraded"
-        diag["errors"].append(f"v17.3 final enrich warning: {type(e).__name__}: {e}")
-
     diag["stage"] = "done"
     diag["elapsed_sec"] = time.time() - t0
     return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
@@ -1973,142 +1954,63 @@ def load_last_diag() -> Optional[Dict[str, Any]]:
     return None
 
 
-# --- v17.3 helpers ---
-def _normalize_text_value(x, default=""):
-    if x is None:
-        return default
-    s = str(x).strip()
-    if s.lower() in ["none", "nan", "nat"]:
-        return default
-    return s
-
-def _normalize_sector_value(x):
-    return _normalize_text_value(x, default="不明") or "不明"
-
-def _ensure_series(df: pd.DataFrame, col: str, default):
+def _ensure_series(df, col, default=0):
+    import pandas as pd
     if col not in df.columns:
-        df[col] = default
-    s = df[col]
-    if not isinstance(s, pd.Series):
-        df[col] = pd.Series([default] * len(df), index=df.index)
-        s = df[col]
-    return s
+        df[col] = pd.Series([default]*len(df), index=df.index)
+    if not hasattr(df[col], "fillna"):
+        df[col] = pd.Series([df[col]]*len(df), index=df.index)
+    return df[col]
 
-def _enrich_selected_with_meta(sel: pd.DataFrame) -> pd.DataFrame:
-    if sel is None or sel.empty:
+
+def _sym_key(x):
+    s=str(x)
+    if "." in s:
+        s=s.split(".")[0]
+    return s.strip()
+
+def _join_sector_meta(sel, meta):
+    if sel is None or len(sel)==0:
         return sel
-    out = sel.copy()
-    # normalize candidate keys
-    sym_col = "銘柄" if "銘柄" in out.columns else ("symbol" if "symbol" in out.columns else None)
-    if sym_col is not None:
-        out["_key"] = out[sym_col].astype(str).map(_sym_key)
-    else:
-        out["_key"] = ""
-    try:
-        meta_df = universe_load_meta()
-    except Exception:
-        meta_df = pd.DataFrame()
-    if isinstance(meta_df, pd.DataFrame) and len(meta_df):
-        m = meta_df.copy()
-        if "symbol" in m.columns:
-            m["_key"] = m["symbol"].astype(str).map(_sym_key)
-        else:
-            m["_key"] = ""
-        keep = [c for c in ["_key","name","sector33_name"] if c in m.columns]
-        m = m[keep].drop_duplicates("_key")
-        out = out.merge(m, on="_key", how="left", suffixes=("", "_meta"))
-        # fill company
-        if "企業名" not in out.columns:
-            out["企業名"] = ""
-        if "name" in out.columns:
-            out["企業名"] = out["企業名"].where(out["企業名"].astype(str).str.strip() != "", out["name"].fillna("").astype(str))
-        if "name_meta" in out.columns:
-            out["企業名"] = out["企業名"].where(out["企業名"].astype(str).str.strip() != "", out["name_meta"].fillna("").astype(str))
-        # fill sector
-        if "セクター" not in out.columns:
-            out["セクター"] = ""
-        if "sector33_name" in out.columns:
-            out["セクター"] = out["セクター"].where(out["セクター"].astype(str).str.strip() != "", out["sector33_name"].fillna("").astype(str))
-        if "sector33_name_meta" in out.columns:
-            out["セクター"] = out["セクター"].where(out["セクター"].astype(str).str.strip() != "", out["sector33_name_meta"].fillna("").astype(str))
-    # final normalization
-    out["企業名"] = out.get("企業名", "").apply(lambda x: _normalize_text_value(x, "不明"))
-    out["セクター"] = out.get("セクター", "").apply(_normalize_sector_value)
+    sel["_key"]=sel["銘柄"].astype(str).map(_sym_key)
+    meta["_key"]=meta["symbol"].astype(str).map(_sym_key)
+    m=meta[["_key","name","sector33_name"]].drop_duplicates("_key")
+    out=sel.merge(m,on="_key",how="left")
+    out["企業名"]=out.get("企業名","").replace("",None).fillna(out["name"])
+    out["セクター"]=out.get("セクター","").replace("",None).fillna(out["sector33_name"])
+    out["セクター"]=out["セクター"].fillna("不明")
     return out
 
-def _apply_ai_order_sizing(sel: pd.DataFrame, capital_total: float, max_positions: int) -> pd.DataFrame:
-    if sel is None or sel.empty:
-        return sel
-    out = sel.copy()
-    # ensure numeric cols exist
-    for c in ["Entry目安","SL目安","TP目安","RR"]:
-        _ensure_series(out, c, 0.0)
-        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
-    # Auto decide order unit: prefer 単元株 if affordable & positive size, else S株
-    budget_per_pos = float(capital_total) / max(int(max_positions), 1)
-    risk_budget = float(capital_total) * 0.01
-    unit_list, shares_list, invest_list, loss_list, reason_list = [], [], [], [], []
-    exp_profit_list = []
-    for _, r in out.iterrows():
-        entry = float(r.get("Entry目安", 0.0) or 0.0)
-        sl = float(r.get("SL目安", 0.0) or 0.0)
-        tp = float(r.get("TP目安", 0.0) or 0.0)
-        risk = max(entry - sl, 0.0)
-        reward = max(tp - entry, 0.0)
-        if entry <= 0 or risk <= 0:
-            unit_list.append("未計算")
-            shares_list.append(0)
-            invest_list.append(0.0)
-            loss_list.append(0.0)
-            exp_profit_list.append(0.0)
-            reason_list.append("エントリー未計算")
+
+def _ai_position_sizing(df, capital=300000, max_pos=8):
+    import pandas as pd
+    if df is None or len(df)==0:
+        return df
+    risk_budget=capital*0.01
+    pos_budget=capital/max_pos
+    shares=[]
+    invest=[]
+    loss=[]
+    unit=[]
+    for _,r in df.iterrows():
+        entry=float(r.get("Entry目安",0) or 0)
+        sl=float(r.get("SL目安",0) or 0)
+        risk=max(entry-sl,0)
+        if entry<=0 or risk<=0:
+            shares.append(0); invest.append(0); loss.append(0); unit.append("S株")
             continue
-
-        # evaluate 100-share and 1-share plans
-        def calc_for_lot(lot):
-            s = int(risk_budget / risk)
-            s = (s // lot) * lot
-            # cap by budget per position
-            if entry > 0:
-                s = min(s, int(budget_per_pos // entry))
-                s = (s // lot) * lot
-            invest = float(s * entry)
-            loss = float(s * risk)
-            profit = float(s * reward)
-            return s, invest, loss, profit
-
-        s100, inv100, los100, prof100 = calc_for_lot(100)
-        s1, inv1, los1, prof1 = calc_for_lot(1)
-
-        # choose larger expected profit among feasible plans
-        if s100 > 0 and prof100 >= prof1:
-            unit = "単元株"
-            s, inv, los, prof = s100, inv100, los100, prof100
-        elif s1 > 0:
-            unit = "S株"
-            s, inv, los, prof = s1, inv1, los1, prof1
+        s=int(risk_budget/risk)
+        s=min(s,int(pos_budget//entry))
+        if s>=100:
+            s=(s//100)*100
+            unit.append("単元株")
         else:
-            unit = "S株"
-            s, inv, los, prof = 0, 0.0, 0.0, 0.0
-
-        unit_list.append(unit)
-        shares_list.append(int(s))
-        invest_list.append(float(inv))
-        loss_list.append(float(los))
-        exp_profit_list.append(float(prof))
-        reason_list.append("" if s > 0 else "資金不足または単元未満")
-
-    out["発注単位"] = unit_list
-    out["推奨株数"] = shares_list
-    out["推奨投資額(円)"] = invest_list
-    out["想定損失(円)"] = loss_list
-    out["期待利益(円)"] = exp_profit_list
-    out["発注不可理由"] = reason_list
-    # keep candidates with zero shares; sort by expected profit then score
-    score_col = "総合スコア" if "総合スコア" in out.columns else None
-    if score_col:
-        out[score_col] = pd.to_numeric(out[score_col], errors="coerce").fillna(0.0)
-        out = out.sort_values(["期待利益(円)", score_col], ascending=False).reset_index(drop=True)
-    else:
-        out = out.sort_values(["期待利益(円)"], ascending=False).reset_index(drop=True)
-    return out
+            unit.append("S株")
+        shares.append(int(s))
+        invest.append(float(s*entry))
+        loss.append(float(s*risk))
+    df["発注単位"]=unit
+    df["推奨株数"]=shares
+    df["推奨投資額(円)"]=invest
+    df["想定損失(円)"]=loss
+    return df
