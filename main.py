@@ -18,7 +18,7 @@ def render_cards_selected(df: pd.DataFrame):
         strat = r.get("推奨方式","")
         title = f"{sym} / {strat}"
         items = []
-        for k in ["現在値（終値）","TP目安","SL目安","TP到達率","利確スコア","総合スコア","平均利確日数","イベント注意","バフェット簡易スコア"]:
+        for k in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","推奨株数","推奨投資額(円)","想定損失(円)","発注不可理由","総合スコア"]:
             if k in df.columns:
                 v = r.get(k)
                 items.append(f"{k}:{v}")
@@ -89,6 +89,7 @@ if "NEON_DATABASE_URL" in st.secrets and not os.environ.get("NEON_DATABASE_URL")
 st.sidebar.header("💰 資金設定")
 capital_total = st.sidebar.number_input("運用資金（円）", min_value=50000.0, value=300000.0, step=10000.0)
 max_positions = st.sidebar.selectbox("同時保有数（最大）", [1,2,3], index=0, key="max_positions")
+lot_mode = st.sidebar.selectbox("注文単位", ["S株（1株）","単元（100株）"], index=0, key="lot_mode")
 mobile_mode = st.sidebar.toggle("📱スマホ表示（カード）", value=True)
 
 show_top_n = int(max_positions)
@@ -254,7 +255,8 @@ if run_scan:
         with st.spinner("スキャン中...（DB読み込み→段階絞り込み→利確スコア）"):
             out = logic.run_scan_3stage(
                 capital_total=capital_total,
-                max_positions=int(max_positions, lot_mode=lot_mode),
+                max_positions=int(max_positions),
+                lot_mode=lot_mode,
 
                 stage0_keep=stage0_keep,
                 stage1_keep=stage1_keep,
@@ -276,19 +278,7 @@ if run_scan:
         st.success(f"スキャン完了（{elapsed:.1f}秒） / mode={diag.get('mode','?')}")
         with st.expander("📊 診断（JSON）", expanded=False):
             st.json(diag)
-        st.subheader("🏁 セクター強度ランキング（Stage0）")
-        st.caption("（補足）セクターが「不明」ばかりの場合は、銘柄マスタの33業種がDBに入っていません。サイドバーの『33業種を再同期（JPX）』を実行してください。")
-        st.caption("※ここは **33業種ごとの“強度（中央値）”** ランキングです。銘柄ランキングではありません。")
-        sec = out.get("sector_strength")
-        if isinstance(sec, pd.DataFrame) and len(sec):
-            if mobile_cards:
-                render_cards_sector(sec.head(20))
-                with st.expander("表で見る（PC向け）", expanded=False):
-                    st.dataframe(sec, width="stretch")
-            else:
-                st.dataframe(sec, width="stretch")
-        else:
-            st.info("セクター情報が不足しているため、セクター強度は非表示です（銘柄マスタに33業種が入っているか確認してください）。")
+        # セクター強度ランキングはバックエンド利用のみ（UI非表示）
 
         st.subheader("🏆 AI最終選定銘柄（利確スコア統合）")
         st.caption("どれを買うか？（利確評価＋資金効率でランキング）")
@@ -298,6 +288,7 @@ if run_scan:
         if isinstance(df, pd.DataFrame) and len(df):
             if "銘柄" in df.columns and "symbol" not in df.columns: df["symbol"] = df["銘柄"]
             if "銘柄名" in df.columns and "name" not in df.columns: df["name"] = df["銘柄名"]
+            if "name" in df.columns and "企業名" not in df.columns: df["企業名"] = df["name"]
             if "セクター" in df.columns and "sector33_name" not in df.columns: df["sector33_name"] = df["セクター"]
             if "3ヶ月リターン" in df.columns and "RET_3M" not in df.columns: df["RET_3M"] = df["3ヶ月リターン"]
             if "WF勝率（OOS）" in df.columns and "wf_oos_wr" not in df.columns: df["wf_oos_wr"] = df["WF勝率（OOS）"]
@@ -329,13 +320,13 @@ if run_scan:
                 if k in df.columns and v not in df.columns:
                     df[v] = df[k]
             # 列が無い場合は作る（落ちない）
-            for v in ["銘柄","企業名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式","Kelly最適化（f）","AIトレンド"]:
+            for v in ["銘柄","企業名","セクター","現在値（終値）","Entry目安","SL目安","TP目安","RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由"]:
                 if v not in df.columns:
                     df[v] = None
-            show_cols = ["順位","銘柄","企業名","セクター","3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","推奨方式","Kelly最適化（f）","AIトレンド"]
+            show_cols = ["順位","銘柄","企業名","セクター","現在値（終値）","Entry目安","SL目安","TP目安","RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由"]
             df = df[show_cols]
             try:
-                for c in ["3ヶ月リターン","WF勝率（OOS）","WF損益比RR（OOS）","MC DD 5%（推定）","総合スコア","Kelly最適化（f）","AIトレンド"]:
+                for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","推奨投資額(円)","想定損失(円)","総合スコア"]:
                     df[c] = pd.to_numeric(df[c], errors="coerce").round(4)
             except Exception:
                 pass
