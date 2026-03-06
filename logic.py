@@ -1767,95 +1767,7 @@ def run_scan_3stage(
         diag["elapsed_sec"] = time.time() - t0
         return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
 
-    
-    # ---- v14: 必須エントリー情報 + ポジションサイズを必ず埋める（None禁止） ----
-    try:
-        if '銘柄' in sel.columns and 'symbol' not in sel.columns:
-            sel['symbol'] = sel['銘柄']
-
-        # --- (1) Company/Sector + lot_size from universe meta ---
-        try:
-            meta = universe_load_meta()
-            if meta is not None and len(meta):
-                meta2 = meta.copy()
-                meta2['symbol_norm'] = meta2['symbol'].astype(str).map(_norm_symbol)
-                meta2['企業名_meta'] = meta2['name'].astype(str) if 'name' in meta2.columns else ''
-                meta2['セクター_meta'] = meta2['sector33_name'].astype(str) if 'sector33_name' in meta2.columns else ''
-                meta2['lot_size_meta'] = meta2['lot_size'] if 'lot_size' in meta2.columns else 100
-                sel['symbol_norm'] = sel['symbol'].astype(str).map(_norm_symbol)
-                sel = sel.merge(meta2[['symbol_norm','企業名_meta','セクター_meta','lot_size_meta']], on='symbol_norm', how='left')
-        except Exception:
-            pass
-
-        if '企業名' not in sel.columns: sel['企業名'] = ''
-        if 'セクター' not in sel.columns: sel['セクター'] = ''
-        if 'lot_size' not in sel.columns: sel['lot_size'] = 100
-
-        if 'name' in sel.columns:
-            sel['企業名'] = sel['企業名'].where(sel['企業名'].astype(str).str.strip()!='', sel['name'].astype(str))
-        if 'sector33_name' in sel.columns:
-            sel['セクター'] = sel['セクター'].where(sel['セクター'].astype(str).str.strip()!='', sel['sector33_name'].astype(str))
-        if '企業名_meta' in sel.columns:
-            sel['企業名'] = sel['企業名'].where(sel['企業名'].astype(str).str.strip()!='', sel['企業名_meta'].fillna('').astype(str))
-        if 'セクター_meta' in sel.columns:
-            sel['セクター'] = sel['セクター'].where(sel['セクター'].astype(str).str.strip()!='', sel['セクター_meta'].fillna('').astype(str))
-        if 'lot_size_meta' in sel.columns:
-            sel['lot_size'] = sel['lot_size'].fillna(sel['lot_size_meta']).fillna(100)
-
-        sel['企業名'] = sel['企業名'].apply(lambda x: _fill_text(x, '不明'))
-        sel['セクター'] = sel['セクター'].apply(lambda x: _fill_text(x, '不明'))
-        sel['lot_size'] = sel['lot_size'].apply(lambda x: _safe_int(x, 100))
-
-        # --- (2) Entry plan (breakout-based) ---
-        topN_entry = min(len(sel), max(50, int(stage2_keep)))
-        plans = []
-        for sym in sel['symbol'].astype(str).tolist()[:topN_entry]:
-            dfh = fetch_last_n_days([sym], n_days=220)
-            if dfh is None or dfh.empty:
-                plans.append({'現在値（終値）':0.0,'Entry目安':0.0,'SL目安':0.0,'TP目安':0.0,'最大保有':8,'ATR14':0.0,'Entry状態':'','RR':0.0})
-            else:
-                p = _compute_breakout_entry_plan(dfh, tp_atr=2.4, sl_atr=1.2, entry_atr=0.3, max_hold_days=8)
-                for k in ['現在値（終値）','Entry目安','SL目安','TP目安','ATR14','RR']:
-                    p[k] = _safe_float(p.get(k), 0.0)
-                p['最大保有'] = int(p.get('最大保有', 8) or 8)
-                p['Entry状態'] = _fill_text(p.get('Entry状態',''), '')
-                plans.append(p)
-
-        plan_df = pd.DataFrame(plans)
-        for col in ['現在値（終値）','Entry目安','SL目安','TP目安','最大保有','ATR14','Entry状態','RR']:
-            if col not in plan_df.columns: plan_df[col] = 0.0 if col != 'Entry状態' else ''
-        for col in ['現在値（終値）','Entry目安','SL目安','TP目安','最大保有','ATR14','Entry状態','RR']:
-            sel.loc[:topN_entry-1, col] = plan_df[col].values
-
-        # --- (3) Position sizing ---
-        sizes = []
-        for i in range(topN_entry):
-            entry = _safe_float(sel.loc[i, 'Entry目安'], 0.0)
-            sl = _safe_float(sel.loc[i, 'SL目安'], 0.0)
-            lot_meta = _safe_int(sel.loc[i, 'lot_size'], 100)
-            lot = _choose_lot_size_v14(str(lot_mode), lot_meta)
-            sizes.append(_position_sizing(float(capital_total), int(max_positions), entry, sl, lot_size=lot, risk_pct_per_pos=float(risk_pct_per_pos), max_alloc_pct_per_pos=float(max_alloc_pct_per_pos)))
-        sz_df = pd.DataFrame(sizes)
-        for col in ['推奨株数(株)','推奨投資額(円)','想定損失(円)','リスク率(%)']:
-            if col not in sz_df.columns: sz_df[col] = 0.0
-            sel.loc[:topN_entry-1, col] = sz_df[col].values
-
-        if 'イベント注意' not in sel.columns: sel['イベント注意'] = ''
-        sel['イベント注意'] = sel['イベント注意'].apply(lambda x: _fill_text(x, ''))
-
-        sel = sel.replace([np.inf, -np.inf], np.nan)
-        for c in ['現在値（終値）','Entry目安','SL目安','TP目安','ATR14','RR','推奨投資額(円)','想定損失(円)','リスク率(%)']:
-            if c in sel.columns: sel[c] = pd.to_numeric(sel[c], errors='coerce').fillna(0.0)
-        if '推奨株数(株)' in sel.columns: sel['推奨株数(株)'] = pd.to_numeric(sel['推奨株数(株)'], errors='coerce').fillna(0).astype(int)
-        if '最大保有' in sel.columns: sel['最大保有'] = pd.to_numeric(sel['最大保有'], errors='coerce').fillna(8).astype(int)
-
-        diag['v14_entry_and_sizing'] = True
-    except Exception as _e_v14:
-        diag['v14_entry_and_sizing'] = False
-        try: diag['errors'].append(f"v14 entry/sizing failed: {type(_e_v14).__name__}: {_e_v14}")
-        except Exception: pass
-
-# Stage3: capital efficiency (資金効率最優先)
+    # Stage3: capital efficiency (資金効率最優先)
     try:
         # lot size from universe table
         conn_l = _connect()
@@ -1940,7 +1852,64 @@ def run_scan_3stage(
 
     diag["stage"] = "done"
     diag["elapsed_sec"] = time.time() - t0
-    return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
+    
+    # --- v16 execution sizing (non-filtering) ---
+    try:
+        lot_mode=_ignored.get("lot_mode","S株（1株）")
+        lot=1 if "S株" in str(lot_mode) else 100
+
+        if "Entry目安" not in sel.columns:
+            sel["Entry目安"]=0
+        if "SL目安" not in sel.columns:
+            sel["SL目安"]=0
+
+        shares=[]
+        reasons=[]
+        invest=[]
+        loss=[]
+
+        for _,r in sel.iterrows():
+            entry=float(r.get("Entry目安",0))
+            sl=float(r.get("SL目安",0))
+            risk=max(entry-sl,0)
+
+            if risk<=0:
+                shares.append(0)
+                invest.append(0)
+                loss.append(0)
+                reasons.append("エントリー未計算")
+                continue
+
+            risk_budget=capital_total*0.01
+            s=int(risk_budget/risk)
+            s=(s//lot)*lot
+
+            shares.append(s)
+            invest.append(s*entry)
+            loss.append(s*risk)
+
+            if s==0:
+                reasons.append("資金不足または単元未満")
+            else:
+                reasons.append("")
+
+        sel["推奨株数"]=shares
+        sel["推奨投資額"]=invest
+        sel["想定損失"]=loss
+        sel["発注不可理由"]=reasons
+
+        sel=sel.fillna({
+            "企業名":"不明",
+            "セクター":"不明",
+            "Entry目安":0,
+            "SL目安":0,
+            "TP目安":0,
+            "RR":0
+        })
+    except Exception as _e:
+        diag["errors"].append(f"v16 sizing failed: {type(_e).__name__}:{_e}")
+
+return {"selected": sel, "guide": guide, "sector_strength": sec, "diag": diag}
 
 def save_last_diag(diag: Dict[str, Any]) -> None:
     try:
@@ -1957,227 +1926,3 @@ def load_last_diag() -> Optional[Dict[str, Any]]:
     except Exception:
         return None
     return None
-
-
-
-# =====================================================
-# JPX_AI_TRADER_v14: Entry + Position Sizing (Institutional-style)
-# =====================================================
-
-def _safe_float(x, default=0.0):
-    try:
-        v = float(x)
-        if np.isfinite(v):
-            return float(v)
-        return float(default)
-    except Exception:
-        return float(default)
-
-def _safe_int(x, default=0):
-    try:
-        v = int(float(x))
-        return int(v)
-    except Exception:
-        return int(default)
-
-def _fill_text(x, default="不明"):
-    try:
-        s = "" if x is None else str(x)
-        s = s.strip()
-        return s if s else default
-    except Exception:
-        return default
-
-def _compute_breakout_entry_plan(df_hist: pd.DataFrame, tp_atr=2.4, sl_atr=1.2, entry_atr=0.3, max_hold_days=8) -> Dict[str, Any]:
-    # Institutional-style swing entry:
-    #   Entry = 20D High + entry_atr*ATR14
-    #   SL    = Entry - sl_atr*ATR14
-    #   TP    = Entry + tp_atr*ATR14
-    # Adds status note if not yet broken out.
-    out = {
-        "現在値（終値）": None,
-        "Entry目安": None,
-        "SL目安": None,
-        "TP目安": None,
-        "最大保有": int(max_hold_days),
-        "ATR14": None,
-        "Entry状態": "",
-        "RR": None,
-    }
-    try:
-        if df_hist is None or df_hist.empty:
-            return out
-        d = df_hist.copy()
-        for col in ["Close","High","Low","Volume"]:
-            if col not in d.columns and col.lower() in d.columns:
-                d[col] = d[col.lower()]
-        if "Close" not in d.columns:
-            return out
-        close = d["Close"].astype(float)
-        last_close = float(close.iloc[-1])
-        out["現在値（終値）"] = last_close
-
-        # ATR14
-        atr14 = None
-        try:
-            if all(c in d.columns for c in ["High","Low","Close"]):
-                atr = _atr14(d.rename(columns={"High":"High","Low":"Low","Close":"Close"})).dropna()
-                atr14 = float(atr.iloc[-1]) if len(atr) else None
-        except Exception:
-            atr14 = None
-        if atr14 is None or (not np.isfinite(atr14)) or atr14 <= 0:
-            ret = close.pct_change().dropna()
-            atr14 = float(last_close * (ret.tail(14).std() if len(ret) else 0.02))
-        out["ATR14"] = atr14
-
-        high20 = None
-        try:
-            if "High" in d.columns:
-                high20 = float(d["High"].astype(float).tail(21).max())
-        except Exception:
-            high20 = None
-        ma20 = float(close.tail(20).mean()) if len(close) >= 20 else float(close.mean())
-
-        entry = (high20 if high20 is not None else last_close) + entry_atr * atr14
-        sl = entry - sl_atr * atr14
-        tp = entry + tp_atr * atr14
-
-        out["Entry目安"] = float(entry)
-        out["SL目安"] = float(sl)
-        out["TP目安"] = float(tp)
-
-        status = []
-        if last_close >= entry:
-            status.append("✅ブレイク済")
-        else:
-            status.append("⏳未ブレイク")
-        if last_close >= ma20:
-            status.append("MA20上")
-        else:
-            status.append("MA20下")
-        out["Entry状態"] = " / ".join(status)
-
-        risk = max(entry - sl, 1e-9)
-        reward = max(tp - entry, 0.0)
-        out["RR"] = float(reward / risk) if risk > 0 else None
-
-        return out
-    except Exception:
-        return out
-
-def _position_sizing(capital_total: float, max_positions: int, entry: float, sl: float, lot_size: int = 100,
-                     risk_pct_per_pos: float = 0.01, max_alloc_pct_per_pos: float = 0.35) -> Dict[str, Any]:
-    # Risk-based sizing (institutional default)
-    out = {"推奨株数(株)": 0, "推奨投資額(円)": 0.0, "想定損失(円)": 0.0, "リスク率(%)": risk_pct_per_pos*100.0}
-    try:
-        entry = float(entry)
-        sl = float(sl)
-        if not np.isfinite(entry) or entry <= 0:
-            return out
-        lot = int(lot_size) if lot_size else 100
-        lot = max(lot, 1)
-
-        risk_per_share = max(entry - sl, 0.0)
-        if risk_per_share <= 0:
-            return out
-
-        risk_budget = float(capital_total) * float(risk_pct_per_pos)
-        alloc_budget = float(capital_total) * float(max_alloc_pct_per_pos)
-
-        shares_risk = int(math.floor(risk_budget / risk_per_share))
-        shares_alloc = int(math.floor(alloc_budget / entry))
-        shares = max(0, min(shares_risk, shares_alloc))
-
-        if max_positions and max_positions > 0:
-            shares = min(shares, int(math.floor((float(capital_total)/max_positions) / entry)))
-
-        shares = (shares // lot) * lot
-        out["推奨株数(株)"] = int(shares)
-        out["推奨投資額(円)"] = float(shares * entry)
-        out["想定損失(円)"] = float(shares * risk_per_share)
-        return out
-    except Exception:
-        return out
-
-
-# =====================================================
-# v14+ (CAP300K): lot mode + expected-profit selection
-# =====================================================
-def _choose_lot_size_v14(lot_mode: str, lot_size_meta: int) -> int:
-    try:
-        if lot_mode == "S株（1株）":
-            return 1
-        if lot_mode == "単元（100株）":
-            return 100
-        # "銘柄マスタ優先"
-        v = int(lot_size_meta) if lot_size_meta else 100
-        return v if v > 0 else 100
-    except Exception:
-        return 100
-
-def _expected_profit_proxy(row: dict) -> float:
-    # Profit proxy in JPY, using available fields.
-    # Prefer tp_rate if exists, else map final_score to [0.35..0.70].
-    try:
-        entry = float(row.get("Entry目安", 0.0))
-        tp = float(row.get("TP目安", 0.0))
-        sl = float(row.get("SL目安", 0.0))
-        shares = float(row.get("推奨株数(株)", 0.0))
-        if entry <= 0 or shares <= 0:
-            return 0.0
-        reward = max(tp - entry, 0.0)
-        risk = max(entry - sl, 0.0)
-        # win prob proxy
-        if row.get("TP到達率") is not None:
-            try:
-                p = float(row.get("TP到達率"))
-                # allow 0..1 or 0..100
-                p = p/100.0 if p > 1.5 else p
-                p = min(max(p, 0.05), 0.95)
-            except Exception:
-                p = 0.55
-        else:
-            # map score to probability band
-            s = row.get("総合スコア", row.get("final_score", 0.0))
-            try:
-                s = float(s)
-            except Exception:
-                s = 0.0
-            # clamp to 0..1-ish
-            s2 = 1.0 / (1.0 + np.exp(-s))  # sigmoid
-            p = 0.35 + 0.35 * s2  # 0.35..0.70
-        ev_per_share = p * reward - (1 - p) * risk
-        return float(ev_per_share * shares)
-    except Exception:
-        return 0.0
-
-def _select_under_budget(df: pd.DataFrame, capital_total: float, max_positions: int) -> pd.DataFrame:
-    # Choose up to max_positions candidates maximizing expected profit proxy under budget.
-    try:
-        if df is None or df.empty:
-            return df
-        d = df.copy()
-        if "推奨投資額(円)" not in d.columns:
-            d["推奨投資額(円)"] = 0.0
-        # compute proxy
-        d["期待利益(円)_proxy"] = d.apply(lambda r: _expected_profit_proxy(r.to_dict()), axis=1)
-        # sort by proxy desc
-        d = d.sort_values("期待利益(円)_proxy", ascending=False).reset_index(drop=True)
-        chosen = []
-        spent = 0.0
-        for _, r in d.iterrows():
-            if len(chosen) >= int(max_positions):
-                break
-            cost = float(r.get("推奨投資額(円)", 0.0) or 0.0)
-            if cost <= 0:
-                continue
-            if spent + cost <= float(capital_total) + 1e-9:
-                chosen.append(r)
-                spent += cost
-        if not chosen:
-            # fallback: top by score even if cost is zero
-            return d.head(int(max_positions))
-        out = pd.DataFrame(chosen).reset_index(drop=True)
-        return out
-    except Exception:
-        return df
