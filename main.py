@@ -40,13 +40,10 @@ def render_cards_sector(sec: pd.DataFrame):
 def render_cards_guide(df: pd.DataFrame):
     for _, r in df.iterrows():
         sym = r.get("銘柄","")
-        name = r.get("企業名","")
-        sector = r.get("セクター","")
         strat = r.get("推奨方式","")
-        unit = r.get("発注単位","")
-        title = f"{sym} / {name} / {strat}"
+        title = f"{sym} / {strat}"
         items = []
-        for k in ["セクター","発注単位","Entry目安","SL目安","TP目安","最大保有","Entry状態"]:
+        for k in ["Entry目安","SL目安","TP目安","最大保有"]:
             if k in df.columns:
                 items.append(f"{k}:{r.get(k)}")
         st.markdown(
@@ -195,6 +192,7 @@ stage2_days = st.sidebar.slider("Stage2 利確評価に使う履歴日数", 60, 
 stage2_min_bars = st.sidebar.slider("Stage2 最低バー数（短期は暫定評価）", 40, 140, 60, 5)
 
 
+mobile_cards = st.sidebar.checkbox("📱 スマホ表示（カード）", value=True)
 include_fund = st.sidebar.checkbox("🧾 財務/イベント簡易チェック（RateLimit時は自動スキップ）", value=True)
 fund_top_n = st.sidebar.slider("財務/イベント取得数（上位Nのみ）", 0, 60, 20, 5)
 
@@ -257,6 +255,7 @@ if run_scan:
             out = logic.run_scan_3stage(
                 capital_total=capital_total,
                 max_positions=int(max_positions),
+                
 
                 stage0_keep=stage0_keep,
                 stage1_keep=stage1_keep,
@@ -320,20 +319,10 @@ if run_scan:
                 if k in df.columns and v not in df.columns:
                     df[v] = df[k]
             # 列が無い場合は作る（落ちない）
-            for v in ["銘柄","企業名","セクター","現在値（終値）","Entry目安","SL目安","TP目安","RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由","発注単位"]:
+            for v in ["銘柄","企業名","セクター","現在値（終値）","Entry目安","SL目安","TP目安","RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由"]:
                 if v not in df.columns:
                     df[v] = None
-            # 文字列列のクリーニング
-            for c in ["銘柄","企業名","セクター","推奨方式","Entry状態","発注不可理由","発注単位"]:
-                if c in df.columns:
-                    df[c] = (
-                        df[c]
-                        .astype(str)
-                        .replace(["None","none","nan","NaN"], "")
-                        .str.strip()
-                        .replace("", "不明" if c in ["企業名","セクター"] else "")
-                    )
-            show_cols = ["順位","銘柄","企業名","セクター","推奨方式","発注単位","現在値（終値）","Entry目安","SL目安","TP目安","RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","Entry状態","発注不可理由"]
+            show_cols = ["順位","銘柄","企業名","セクター","現在値（終値）","Entry目安","SL目安","TP目安","RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由"]
             df = df[show_cols]
             try:
                 for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","推奨投資額(円)","想定損失(円)","総合スコア"]:
@@ -342,7 +331,7 @@ if run_scan:
                 pass
 
 
-            if mobile_mode:
+            if mobile_cards:
                 render_cards_selected(df.head(show_top_n))
                 with st.expander("表で見る（PC向け）", expanded=False):
                     st.dataframe(df, width="stretch")
@@ -370,7 +359,7 @@ if run_scan:
                 pass
             guide = guide.reset_index(drop=True)
             guide.insert(0, "順位", range(1, len(guide)+1))
-            if mobile_mode:
+            if mobile_cards:
                 render_cards_guide(guide.head(show_top_n))
                 with st.expander("表で見る（PC向け）", expanded=False):
                     st.dataframe(guide, width="stretch")
