@@ -41,11 +41,10 @@ def render_cards_guide(df: pd.DataFrame):
     for _, r in df.iterrows():
         sym = r.get("銘柄","")
         name = r.get("企業名","")
-        sector = r.get("セクター","")
         strat = r.get("推奨方式","")
         title = f"{sym} / {name} / {strat}"
         items = []
-        for k in ["セクター","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有"]:
+        for k in ["セクター","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]:
             if k in df.columns:
                 items.append(f"{k}:{r.get(k)}")
         st.markdown(
@@ -192,9 +191,7 @@ atr_pct_max = st.sidebar.number_input("ATR% 上限", min_value=0.0, value=8.0, s
 
 stage2_days = st.sidebar.slider("Stage2 利確評価に使う履歴日数", 60, 365, 180, 5)
 stage2_min_bars = st.sidebar.slider("Stage2 最低バー数（短期は暫定評価）", 40, 140, 60, 5)
-
-
-include_fund = st.sidebar.checkbox("🧾 財務簡易チェック（上位銘柄のみ。バフェット簡易スコア/イベント注意を付与）", value=True)
+include_fund = st.sidebar.checkbox("🧾 財務簡易チェック（上位銘柄だけ。バフェット簡易スコア/イベント注意を付与）", value=True)
 fund_top_n = st.sidebar.slider("財務/イベント取得数（上位Nのみ）", 0, 60, 20, 5)
 
 st.sidebar.markdown("---")
@@ -256,7 +253,6 @@ if run_scan:
             out = logic.run_scan_3stage(
                 capital_total=capital_total,
                 max_positions=int(max_positions),
-                
 
                 stage0_keep=stage0_keep,
                 stage1_keep=stage1_keep,
@@ -320,19 +316,15 @@ if run_scan:
                 if k in df.columns and v not in df.columns:
                     df[v] = df[k]
             # 列が無い場合は作る（落ちない）
-            for v in ["銘柄","企業名","セクター","現在値（終値）","Entry目安","SL目安","TP目安","RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由"]:
+            for v in ["銘柄","企業名","セクター","発注単位","現在値（終値）","Entry目安","SL目安","TP目安","RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由"]:
                 if v not in df.columns:
                     df[v] = None
-            show_cols = ["順位","銘柄","企業名","セクター","現在値（終値）","Entry目安","SL目安","TP目安","RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由"]
+            show_cols = ["順位","銘柄","企業名","セクター","推奨方式","発注単位","現在値（終値）","Entry目安","SL目安","TP目安","RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","Entry状態","発注不可理由"]
             df = df[show_cols]
             try:
-                for c in ["企業名","セクター","推奨方式","Entry状態","発注不可理由"]:
+                for c in ["企業名","セクター","推奨方式","発注単位","Entry状態","発注不可理由"]:
                     if c in df.columns:
-                        df[c] = (
-                            df[c].astype(str)
-                            .replace(["None","none","nan","NaN",""], "不明" if c in ["企業名","セクター"] else "")
-                            .str.strip()
-                        )
+                        df[c] = (df[c].astype(str).replace(["None","none","nan","NaN",""], "不明" if c in ["企業名","セクター"] else "").str.strip())
                 for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","推奨投資額(円)","想定損失(円)","総合スコア"]:
                     df[c] = pd.to_numeric(df[c], errors="coerce").round(4)
             except Exception:
@@ -361,24 +353,13 @@ if run_scan:
         guide = out.get("guide")
         if isinstance(guide, pd.DataFrame) and len(guide):
             try:
-                # selected側の銘柄名/セクター/株数/投資額/損失/発注単位をguideへ付与
-                if isinstance(df, pd.DataFrame) and len(df) and "銘柄" in guide.columns and "銘柄" in df.columns:
-                    extra_cols = [c for c in ["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry状態"] if c in df.columns]
-                    if len(extra_cols) >= 2:
-                        guide = guide.merge(df[extra_cols].drop_duplicates(subset=["銘柄"]), on="銘柄", how="left", suffixes=("","_sel"))
+                for c in ["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]:
+                    if c not in guide.columns:
+                        guide[c] = None
+                guide = guide[["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]]
                 for c in ["企業名","セクター","推奨方式","発注単位","Entry状態"]:
-                    if c not in guide.columns:
-                        guide[c] = ""
-                    guide[c] = (
-                        guide[c].astype(str)
-                        .replace(["None","none","nan","NaN",""], "不明" if c in ["企業名","セクター"] else "")
-                        .str.strip()
-                    )
-                for c in ["推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安"]:
-                    if c not in guide.columns:
-                        guide[c] = 0
-                order_cols = [c for c in ["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"] if c in guide.columns]
-                guide = guide[order_cols].head(int(max_positions))
+                    guide[c] = (guide[c].astype(str).replace(["None","none","nan","NaN",""], "不明" if c in ["企業名","セクター"] else "").str.strip())
+                guide = guide.head(int(max_positions))
             except Exception:
                 pass
             guide = guide.reset_index(drop=True)
