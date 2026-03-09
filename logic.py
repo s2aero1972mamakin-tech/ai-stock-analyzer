@@ -1899,10 +1899,14 @@ def run_scan_3stage(
         diag["mode"] = "degraded"
         diag["errors"].append(f"Stage3 warning: 資金最適化/発注計画で例外: {type(e).__name__}: {e}")
 
-    for c in ["企業名","セクター","発注不可理由","Entry状態"]:
+    for c in ["企業名","セクター","発注不可理由","Entry状態","発注単位"]:
         if c not in sel.columns:
             sel[c] = ""
-        sel[c] = sel[c].fillna("").replace("", "不明" if c in ["企業名","セクター"] else "")
+        sel[c] = sel[c].fillna("").astype(str)
+        if c in ["企業名","セクター"]:
+            sel[c] = sel[c].replace(["","None","none","nan","NaN"], "不明")
+        else:
+            sel[c] = sel[c].replace(["None","none","nan","NaN"], "")
     for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","推奨投資額(円)","想定損失(円)","総合スコア"]:
         if c not in sel.columns:
             sel[c] = 0.0
@@ -2009,25 +2013,44 @@ def _safe_series(df: pd.DataFrame, key: str, default=0):
     return s
 
 def _merge_meta_by_symkey(sel: pd.DataFrame, meta_df: pd.DataFrame) -> pd.DataFrame:
-    if sel is None or sel.empty or meta_df is None or meta_df.empty:
+    if sel is None or sel.empty:
         return sel
     out = sel.copy()
     out["_key"] = out["銘柄"].astype(str).map(_sym_key)
-    m = meta_df.copy()
-    if "symbol" not in m.columns:
-        return out
-    m["_key"] = m["symbol"].astype(str).map(_sym_key)
-    keep = [c for c in ["_key","name","sector33_name"] if c in m.columns]
-    m = m[keep].drop_duplicates(subset=["_key"])
-    out = out.merge(m, on="_key", how="left", suffixes=("","_meta"))
+
+    # 既存列から先に補完
     if "企業名" not in out.columns:
         out["企業名"] = ""
-    if "セクター" not in out.columns:
-        out["セクター"] = ""
+    if "銘柄名" in out.columns:
+        out["企業名"] = out["企業名"].where(out["企業名"].astype(str).str.strip() != "", out["銘柄名"].fillna("").astype(str))
     if "name" in out.columns:
         out["企業名"] = out["企業名"].where(out["企業名"].astype(str).str.strip() != "", out["name"].fillna("").astype(str))
+    if "セクター" not in out.columns:
+        out["セクター"] = ""
     if "sector33_name" in out.columns:
         out["セクター"] = out["セクター"].where(out["セクター"].astype(str).str.strip() != "", out["sector33_name"].fillna("").astype(str))
-    out["企業名"] = out["企業名"].fillna("").replace("", "不明")
-    out["セクター"] = out["セクター"].fillna("").replace(["","None","none","nan"], "不明")
+
+    if meta_df is not None and isinstance(meta_df, pd.DataFrame) and not meta_df.empty and "symbol" in meta_df.columns:
+        m = meta_df.copy()
+        m["_key"] = m["symbol"].astype(str).map(_sym_key)
+        keep = [c for c in ["_key","name","sector33_name"] if c in m.columns]
+        m = m[keep].drop_duplicates(subset=["_key"])
+        out = out.merge(m, on="_key", how="left", suffixes=("","_meta"))
+        if "name_meta" in out.columns:
+            out["企業名"] = out["企業名"].where(out["企業名"].astype(str).str.strip() != "", out["name_meta"].fillna("").astype(str))
+        if "sector33_name_meta" in out.columns:
+            out["セクター"] = out["セクター"].where(out["セクター"].astype(str).str.strip() != "", out["sector33_name_meta"].fillna("").astype(str))
+
+    out["企業名"] = (
+        out["企業名"].astype(str)
+        .replace(["None","none","nan","NaN",""], "不明")
+        .str.strip()
+        .replace("", "不明")
+    )
+    out["セクター"] = (
+        out["セクター"].astype(str)
+        .replace(["None","none","nan","NaN",""], "不明")
+        .str.strip()
+        .replace("", "不明")
+    )
     return out.drop(columns=["_key"], errors="ignore")
