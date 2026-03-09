@@ -326,6 +326,13 @@ if run_scan:
             show_cols = ["順位","銘柄","企業名","セクター","現在値（終値）","Entry目安","SL目安","TP目安","RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由"]
             df = df[show_cols]
             try:
+                for c in ["企業名","セクター","推奨方式","Entry状態","発注不可理由"]:
+                    if c in df.columns:
+                        df[c] = (
+                            df[c].astype(str)
+                            .replace(["None","none","nan","NaN",""], "不明" if c in ["企業名","セクター"] else "")
+                            .str.strip()
+                        )
                 for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","推奨投資額(円)","想定損失(円)","総合スコア"]:
                     df[c] = pd.to_numeric(df[c], errors="coerce").round(4)
             except Exception:
@@ -356,10 +363,22 @@ if run_scan:
             try:
                 # selected側の銘柄名/セクター/株数/投資額/損失/発注単位をguideへ付与
                 if isinstance(df, pd.DataFrame) and len(df) and "銘柄" in guide.columns and "銘柄" in df.columns:
-                    extra_cols = [c for c in ["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)"] if c in df.columns]
+                    extra_cols = [c for c in ["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry状態"] if c in df.columns]
                     if len(extra_cols) >= 2:
                         guide = guide.merge(df[extra_cols].drop_duplicates(subset=["銘柄"]), on="銘柄", how="left", suffixes=("","_sel"))
-                guide = guide.head(int(max_positions))
+                for c in ["企業名","セクター","推奨方式","発注単位","Entry状態"]:
+                    if c not in guide.columns:
+                        guide[c] = ""
+                    guide[c] = (
+                        guide[c].astype(str)
+                        .replace(["None","none","nan","NaN",""], "不明" if c in ["企業名","セクター"] else "")
+                        .str.strip()
+                    )
+                for c in ["推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安"]:
+                    if c not in guide.columns:
+                        guide[c] = 0
+                order_cols = [c for c in ["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"] if c in guide.columns]
+                guide = guide[order_cols].head(int(max_positions))
             except Exception:
                 pass
             guide = guide.reset_index(drop=True)
