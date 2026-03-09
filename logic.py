@@ -1986,3 +1986,71 @@ def _merge_meta_by_symkey(sel: pd.DataFrame, meta_df: pd.DataFrame) -> pd.DataFr
     out["企業名"] = out["企業名"].apply(lambda x: _clean_text(x, "不明"))
     out["セクター"] = out["セクター"].apply(_norm_sector)
     return out.drop(columns=["_key"], errors="ignore")
+
+
+
+
+# ==============================
+# v18 AI MODULES
+# ==============================
+
+def breakout_quality_ai(df):
+    try:
+        ma20 = df["Close"].rolling(20).mean()
+        ma60 = df["Close"].rolling(60).mean()
+        vol20 = df["Volume"].rolling(20).mean()
+
+        cond_trend = (df["Close"].iloc[-1] > ma20.iloc[-1]) and (df["Close"].iloc[-1] > ma60.iloc[-1])
+        cond_vol = df["Volume"].iloc[-1] > 1.5 * vol20.iloc[-1]
+        cond_break = df["High"].iloc[-1] >= df["High"].rolling(20).max().iloc[-1]
+
+        score = 0
+        if cond_trend: score += 0.4
+        if cond_vol: score += 0.3
+        if cond_break: score += 0.3
+        return score
+    except Exception:
+        return 0.0
+
+
+def liquidity_trap_filter(avg_volume):
+    if avg_volume < 100000:
+        return -0.2
+    return 0.0
+
+
+def atr_volatility_ai(atr_pct):
+    try:
+        return 1 - abs(atr_pct - 3)/5
+    except:
+        return 0
+
+
+def earnings_risk_ai(symbol):
+    try:
+        import yfinance as yf
+        t = yf.Ticker(symbol)
+        cal = t.calendar
+        if cal is None or len(cal) == 0:
+            return False
+        ed = cal.index[0]
+        import datetime
+        today = datetime.datetime.utcnow().date()
+        diff = (ed.date() - today).days
+        if -2 <= diff <= 5:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def dynamic_tp_engine(entry, atr):
+    tp1 = entry + 1.0 * atr
+    tp2 = entry + 2.0 * atr
+    trailing = atr
+    return {
+        "tp1": tp1,
+        "tp2": tp2,
+        "trail": trailing
+    }
+
