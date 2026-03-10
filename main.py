@@ -280,6 +280,16 @@ if run_scan:
         st.caption("どれを買うか？（利確評価＋資金効率でランキング）")
         st.caption("※ここは **Stage2（固定TP/SL/最大保有）で“利確が再現しやすい順”** に並べた最終ランキングです。")
         df = out.get("selected")
+
+        # --- Live refresh for top 20 ---
+        try:
+            df = logic.refresh_topn_prices_and_recalc(df, top_n=20)
+        except Exception:
+            pass
+
+        # limit display to top 20
+        df = df.head(20)
+
         # --- column bridge (logic.py output may use JP labels) ---
         if isinstance(df, pd.DataFrame) and len(df):
             if "銘柄" in df.columns and "symbol" not in df.columns: df["symbol"] = df["銘柄"]
