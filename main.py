@@ -18,7 +18,7 @@ def render_cards_selected(df: pd.DataFrame):
         strat = r.get("推奨方式","")
         title = f"{sym} / {strat}"
         items = []
-        for k in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","推奨株数","推奨投資額(円)","想定損失(円)","発注不可理由","総合スコア"]:
+        for k in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","推奨株数","推奨投資額(円)","想定損失(円)","発注不可理由","総合スコア"]:
             if k in df.columns:
                 v = r.get(k)
                 items.append(f"{k}:{v}")
@@ -326,16 +326,16 @@ if run_scan:
                 if k in df.columns and v not in df.columns:
                     df[v] = df[k]
             # 列が無い場合は作る（落ちない）
-            for v in ["銘柄","企業名","セクター","発注単位","現在値（終値）","Entry目安","SL目安","TP目安","RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由"]:
+            for v in ["銘柄","企業名","セクター","発注単位","現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由"]:
                 if v not in df.columns:
                     df[v] = None
-            show_cols = ["順位","銘柄","企業名","セクター","推奨方式","発注単位","現在値（終値）","Entry目安","SL目安","TP目安","RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","Entry状態","発注不可理由"]
+            show_cols = ["順位","銘柄","企業名","セクター","推奨方式","発注単位","現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","Entry状態","発注不可理由"]
             df = df[show_cols]
             try:
                 for c in ["企業名","セクター","推奨方式","発注単位","Entry状態","発注不可理由"]:
                     if c in df.columns:
                         df[c] = (df[c].astype(str).replace(["None","none","nan","NaN",""], "不明" if c in ["企業名","セクター"] else "").str.strip())
-                for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","推奨投資額(円)","想定損失(円)","総合スコア"]:
+                for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","推奨投資額(円)","想定損失(円)","総合スコア"]:
                     df[c] = pd.to_numeric(df[c], errors="coerce").round(4)
             except Exception:
                 pass
