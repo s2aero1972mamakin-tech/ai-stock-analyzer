@@ -2057,67 +2057,177 @@ def dynamic_tp_engine(entry, atr):
 
 
 
+
 # -------------------------------
 # Live price refresh for top N
 # -------------------------------
 def refresh_topn_prices_and_recalc(df_selected, top_n=20, tp_atr=1.5, sl_atr=1.0):
-    """Fetch latest price for top N symbols and recompute Entry/TP/SL/RR."""
+    """上位N銘柄だけ現在値を再取得し、
+    - 現在値基準で Entry/TP/SL を再計算
+    - 元のTP/SLに対する 実質RR を算出
+    - Entry状態を再定義
+    - ライブ再計算後スコアで再ランキング
+    して返す。
+    """
     import yfinance as yf
     import pandas as pd
+    import numpy as np
 
     if df_selected is None or len(df_selected) == 0:
         return df_selected
 
-    df = df_selected.copy()
-    df = df.head(int(top_n)).copy()
+    out = df_selected.copy()
+    work = out.head(int(top_n)).copy()
+
+    # 必須列の確保
+    for c in ["銘柄", "現在値（終値）", "Entry目安", "SL目安", "TP目安", "RR", "総合スコア", "推奨株数"]:
+        if c not in work.columns:
+            work[c] = np.nan
+
+    # 元の値を退避（初回のみ）
+    if "元Entry目安" not in work.columns:
+        work["元Entry目安"] = pd.to_numeric(work["Entry目安"], errors="coerce")
+    if "元SL目安" not in work.columns:
+        work["元SL目安"] = pd.to_numeric(work["SL目安"], errors="coerce")
+    if "元TP目安" not in work.columns:
+        work["元TP目安"] = pd.to_numeric(work["TP目安"], errors="coerce")
+    if "元RR" not in work.columns:
+        work["元RR"] = pd.to_numeric(work["RR"], errors="coerce")
+    if "元総合スコア" not in work.columns:
+        work["元総合スコア"] = pd.to_numeric(work["総合スコア"], errors="coerce")
 
     symbols = []
-    for s in df["銘柄"].tolist():
-        s = str(s)
-        if not s.endswith(".T") and s.isdigit():
-            s = s + ".T"
+    for s in work["銘柄"].tolist():
+        s = str(s).strip()
+        if not s:
+            symbols.append("")
+            continue
+        if not s.endswith('.T') and s.isdigit():
+            s = s + '.T'
         symbols.append(s)
 
+    # 現在値の再取得
+    price_map = {}
+    valid_symbols = [s for s in symbols if s]
     try:
-        data = yf.download(" ".join(symbols), period="1d", interval="1m", progress=False, group_by="ticker")
+        data = yf.download(' '.join(valid_symbols), period='1d', interval='1m', progress=False, group_by='ticker', threads=True)
     except Exception:
-        return df_selected
+        data = None
 
-    for i,row in df.iterrows():
-        sym = row["銘柄"]
-        sym_yf = sym if sym.endswith(".T") else sym + ".T"
-        try:
-            if isinstance(data.columns, pd.MultiIndex):
-                last_price = float(data[sym_yf]["Close"].dropna().iloc[-1])
-            else:
-                last_price = float(data["Close"].dropna().iloc[-1])
-        except Exception:
-            continue
+    if data is not None:
+        for sym in valid_symbols:
+            try:
+                if isinstance(data.columns, pd.MultiIndex):
+                    ser = data[sym]["Close"].dropna()
+                else:
+                    ser = data["Close"].dropna()
+                if len(ser):
+                    price_map[sym] = float(ser.iloc[-1])
+            except Exception:
+                continue
 
-        entry = last_price
+    def _status_from_live(current, old_entry, old_tp, effective_rr):
+        if not np.isfinite(current) or current <= 0:
+            return "不明"
+        if np.isfinite(old_tp) and current >= old_tp * 0.995:
+            return "見送り（利確圏）"
+        if np.isfinite(effective_rr) and effective_rr < 0.80:
+            return "見送り（利幅薄い）"
+        if np.isfinite(old_entry) and old_entry > 0:
+            dev = (current / old_entry) - 1.0
+            if abs(dev) <= 0.003:
+                return "発注圏"
+            if 0.003 < dev <= 0.03 and (not np.isfinite(effective_rr) or effective_rr >= 0.80):
+                return "追随可"
+            if dev < -0.003:
+                return "押し目待ち"
+        return "様子見"
 
-        sl_old = row.get("SL目安")
-        entry_old = row.get("Entry目安")
+    def _status_bonus(s):
+        return {
+            "発注圏": 0.10,
+            "追随可": 0.04,
+            "押し目待ち": 0.00,
+            "様子見": -0.02,
+            "見送り（利幅薄い）": -0.10,
+            "見送り（利確圏）": -0.14,
+            "不明": -0.08,
+        }.get(str(s), 0.0)
 
-        atr = None
-        try:
-            if entry_old and sl_old:
-                atr = abs(entry_old - sl_old) / sl_atr
-        except:
-            pass
+    live_scores = []
+    eff_rrs = []
+    statuses = []
 
-        if atr is None:
-            continue
+    for i, row in work.iterrows():
+        sym = str(row.get("銘柄", "")).strip()
+        sym_yf = sym if sym.endswith('.T') else (sym + '.T' if sym.isdigit() else sym)
+        current = price_map.get(sym_yf, np.nan)
+        old_entry = pd.to_numeric(pd.Series([row.get("元Entry目安", row.get("Entry目安"))]), errors='coerce').iloc[0]
+        old_sl = pd.to_numeric(pd.Series([row.get("元SL目安", row.get("SL目安"))]), errors='coerce').iloc[0]
+        old_tp = pd.to_numeric(pd.Series([row.get("元TP目安", row.get("TP目安"))]), errors='coerce').iloc[0]
+        old_score = pd.to_numeric(pd.Series([row.get("元総合スコア", row.get("総合スコア"))]), errors='coerce').iloc[0]
+        shares = pd.to_numeric(pd.Series([row.get("推奨株数", 0)]), errors='coerce').fillna(0).iloc[0]
 
-        tp = entry + tp_atr * atr
-        sl = entry - sl_atr * atr
-        rr = (tp - entry) / max(entry - sl, 1e-9)
+        if not np.isfinite(current) or current <= 0:
+            current = pd.to_numeric(pd.Series([row.get("現在値（終値）")]), errors='coerce').fillna(0).iloc[0]
 
-        df.at[i,"現在値（終値）"] = round(entry,2)
-        df.at[i,"Entry目安"] = round(entry,2)
-        df.at[i,"TP目安"] = round(tp,2)
-        df.at[i,"SL目安"] = round(sl,2)
-        df.at[i,"RR"] = round(rr,3)
+        # 旧SL/Entry から ATR 幅を逆算し、現在値ベースに再計算
+        atr = np.nan
+        if np.isfinite(old_entry) and np.isfinite(old_sl) and old_entry > old_sl:
+            atr = (old_entry - old_sl) / max(float(sl_atr), 1e-9)
 
-    df_selected.update(df)
-    return df_selected
+        if np.isfinite(current) and current > 0 and np.isfinite(atr) and atr > 0:
+            new_entry = float(current)
+            new_sl = float(current - sl_atr * atr)
+            new_tp = float(current + tp_atr * atr)
+            nominal_rr = (new_tp - new_entry) / max(new_entry - new_sl, 1e-9)
+            work.at[i, "現在値（終値）"] = round(new_entry, 2)
+            work.at[i, "Entry目安"] = round(new_entry, 2)
+            work.at[i, "SL目安"] = round(new_sl, 2)
+            work.at[i, "TP目安"] = round(new_tp, 2)
+            work.at[i, "RR"] = round(nominal_rr, 3)
+            if shares > 0:
+                work.at[i, "推奨投資額(円)"] = round(float(shares) * new_entry, 0)
+                work.at[i, "想定損失(円)"] = round(float(shares) * max(new_entry - new_sl, 0.0), 0)
+
+        # 実質RRは「元のTP/SL」に対する現在値からの残り利幅で算出
+        effective_rr = np.nan
+        if np.isfinite(current) and np.isfinite(old_tp) and np.isfinite(old_sl):
+            risk_now = max(float(current) - float(old_sl), 0.0)
+            reward_now = max(float(old_tp) - float(current), 0.0)
+            if risk_now > 0:
+                effective_rr = reward_now / risk_now
+        eff_rrs.append(effective_rr)
+
+        status = _status_from_live(current, old_entry, old_tp, effective_rr)
+        statuses.append(status)
+
+        # ライブスコア: 元総合スコア + 実質RR + 伸びすぎペナルティ + 状態補正
+        base = float(old_score) if np.isfinite(old_score) else 0.0
+        rr_component = min(max(float(effective_rr) if np.isfinite(effective_rr) else 0.0, 0.0), 2.5) / 2.5
+        ext_penalty = 0.0
+        if np.isfinite(current) and np.isfinite(old_entry) and old_entry > 0:
+            ext = max((float(current) / float(old_entry)) - 1.0, 0.0)
+            ext_penalty = min(ext, 0.08) * 1.6
+        live_score = 0.62 * base + 0.30 * rr_component + _status_bonus(status) - ext_penalty
+        live_scores.append(float(live_score))
+
+    work["実質RR"] = np.round(eff_rrs, 3)
+    work["Entry状態"] = statuses
+    work["総合スコア"] = np.round(live_scores, 6)
+
+    # 再ランキング
+    sort_cols = ["総合スコア"]
+    ascending = [False]
+    if "実質RR" in work.columns:
+        sort_cols.append("実質RR")
+        ascending.append(False)
+    work = work.sort_values(sort_cols, ascending=ascending, na_position='last').reset_index(drop=True)
+    work["順位"] = np.arange(1, len(work) + 1)
+
+    # 元の out に topN 部分を置き換え、最後に topN だけ返す
+    tail = out.iloc[int(top_n):].copy() if len(out) > int(top_n) else out.iloc[0:0].copy()
+    if len(tail):
+        tail = tail.reset_index(drop=True)
+    merged = pd.concat([work, tail], ignore_index=True, sort=False)
+    return merged.head(int(top_n)).copy()
