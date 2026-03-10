@@ -2054,3 +2054,70 @@ def dynamic_tp_engine(entry, atr):
         "trail": trailing
     }
 
+
+
+
+# -------------------------------
+# Live price refresh for top N
+# -------------------------------
+def refresh_topn_prices_and_recalc(df_selected, top_n=20, tp_atr=1.5, sl_atr=1.0):
+    """Fetch latest price for top N symbols and recompute Entry/TP/SL/RR."""
+    import yfinance as yf
+    import pandas as pd
+
+    if df_selected is None or len(df_selected) == 0:
+        return df_selected
+
+    df = df_selected.copy()
+    df = df.head(int(top_n)).copy()
+
+    symbols = []
+    for s in df["銘柄"].tolist():
+        s = str(s)
+        if not s.endswith(".T") and s.isdigit():
+            s = s + ".T"
+        symbols.append(s)
+
+    try:
+        data = yf.download(" ".join(symbols), period="1d", interval="1m", progress=False, group_by="ticker")
+    except Exception:
+        return df_selected
+
+    for i,row in df.iterrows():
+        sym = row["銘柄"]
+        sym_yf = sym if sym.endswith(".T") else sym + ".T"
+        try:
+            if isinstance(data.columns, pd.MultiIndex):
+                last_price = float(data[sym_yf]["Close"].dropna().iloc[-1])
+            else:
+                last_price = float(data["Close"].dropna().iloc[-1])
+        except Exception:
+            continue
+
+        entry = last_price
+
+        sl_old = row.get("SL目安")
+        entry_old = row.get("Entry目安")
+
+        atr = None
+        try:
+            if entry_old and sl_old:
+                atr = abs(entry_old - sl_old) / sl_atr
+        except:
+            pass
+
+        if atr is None:
+            continue
+
+        tp = entry + tp_atr * atr
+        sl = entry - sl_atr * atr
+        rr = (tp - entry) / max(entry - sl, 1e-9)
+
+        df.at[i,"現在値（終値）"] = round(entry,2)
+        df.at[i,"Entry目安"] = round(entry,2)
+        df.at[i,"TP目安"] = round(tp,2)
+        df.at[i,"SL目安"] = round(sl,2)
+        df.at[i,"RR"] = round(rr,3)
+
+    df_selected.update(df)
+    return df_selected
