@@ -387,21 +387,19 @@ if run_scan:
             pass
 
         try:
-            live_df, now_df, wait_df = logic.build_live_execution_views(
+            now_df, wait_df = logic.split_live_rankings(
                 df,
-                live_top=20,
                 now_top=10,
                 wait_top=20,
                 now_rr_min=1.00,
                 chase_rr_min=1.30,
                 wait_rr_min=0.90,
                 s_now_rr_min=1.35,
-                s_now_max=1,
             )
         except Exception:
-            live_df, now_df, wait_df = df, pd.DataFrame(), pd.DataFrame()
+            now_df, wait_df = pd.DataFrame(), pd.DataFrame()
 
-        df_view = prepare_selected_view(live_df)
+        df_view = prepare_selected_view(df)
         now_view = prepare_selected_view(now_df)
         wait_view = prepare_selected_view(wait_df)
         now_guide = prepare_guide_view(now_view, max_rows=int(max_positions))
@@ -436,7 +434,7 @@ if st.session_state.get("scan_results_ready", False):
 
     render_selected_section(
         "🏆 AI最終選定銘柄（ライブ再計算後・全20件）",
-        "ライブ再計算後の全20件を、selected_now と同じ実行優先ロジックで再構成しています。先頭は今すぐ発注候補、その次に監視候補、その後ろに見送り/保留候補を並べ、S株の即時候補は最大1件に抑えています。",
+        "ライブ再計算後の全20件を、総合スコアではなく実行優先順で並べています。単元株の発注圏/監視候補を先頭にし、S株は補助候補として後ろへ寄せています。",
         df_view,
         mobile_mode,
         show_top_n,
@@ -445,7 +443,7 @@ if st.session_state.get("scan_results_ready", False):
 
     render_selected_section(
         "🟢 今すぐ発注ランキング",
-        "単元株の発注圏を最優先にした即時発注候補です。単元株の追随可は実質RR>=1.30のかなり強い候補だけに限定し、S株は発注圏かつ実質RR>=1.35でも最大1件の例外採用に抑えています。",
+        "単元株の発注圏を最優先にした即時発注候補です。単元株の追随可は実質RR>=1.30のかなり強い候補だけに限定し、S株は発注圏かつ実質RR>=1.35の例外候補しか残しません。",
         now_view,
         mobile_mode,
         show_top_n,
@@ -454,7 +452,7 @@ if st.session_state.get("scan_results_ready", False):
 
     render_selected_section(
         "🟡 押し目待ちランキング",
-        "selected_now に入らなかった監視候補です。単元株の押し目・様子見を先頭に並べ、S株候補は原則こちらへ回します。S株の即時候補から外れた例外候補もここで確認できます。",
+        "実行優先順で、単元株の監視候補を先頭に並べています。単元の追随可で基準に届かない銘柄や、強いS株候補は原則こちらへ回します。",
         wait_view,
         mobile_mode,
         show_top_n,
