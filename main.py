@@ -18,7 +18,7 @@ def render_cards_selected(df: pd.DataFrame):
         strat = r.get("推奨方式","")
         title = f"{sym} / {strat}"
         items = []
-        for k in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","価格更新状態","再計算失敗フラグ","推奨株数","推奨投資額(円)","想定損失(円)","発注不可理由","総合スコア"]:
+        for k in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","価格更新状態","再計算失敗フラグ","売買優先区分","単元株可否","単元必要資金(円)","単元想定損失(円)","推奨株数","推奨投資額(円)","想定損失(円)","発注不可理由","総合スコア"]:
             if k in df.columns:
                 v = r.get(k)
                 items.append(f"{k}:{v}")
@@ -44,7 +44,7 @@ def render_cards_guide(df: pd.DataFrame):
         strat = r.get("推奨方式","")
         title = f"{sym} / {name} / {strat}"
         items = []
-        for k in ["セクター","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]:
+        for k in ["セクター","売買優先区分","発注単位","単元株可否","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]:
             if k in df.columns:
                 items.append(f"{k}:{r.get(k)}")
         st.markdown(
@@ -77,16 +77,16 @@ def prepare_selected_view(df: pd.DataFrame) -> pd.DataFrame:
     for k,v in list(col_map.items()):
         if k in df.columns and v not in df.columns:
             df[v] = df[k]
-    for v in ["銘柄","企業名","セクター","発注単位","現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","価格更新状態","再計算失敗フラグ","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由"]:
+    for v in ["銘柄","企業名","セクター","推奨方式","売買優先区分","発注単位","単元株可否","単元必要資金(円)","単元想定損失(円)","現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","価格更新状態","再計算失敗フラグ","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","Entry状態","発注不可理由"]:
         if v not in df.columns:
             df[v] = None
-    show_cols = ["順位","銘柄","企業名","セクター","推奨方式","発注単位","現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","価格更新状態","再計算失敗フラグ","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","Entry状態","発注不可理由"]
+    show_cols = ["順位","銘柄","企業名","セクター","推奨方式","売買優先区分","発注単位","単元株可否","単元必要資金(円)","単元想定損失(円)","現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","価格更新状態","再計算失敗フラグ","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","Entry状態","発注不可理由"]
     df = df[show_cols]
     try:
-        for c in ["企業名","セクター","推奨方式","発注単位","Entry状態","発注不可理由"]:
+        for c in ["企業名","セクター","推奨方式","売買優先区分","発注単位","単元株可否","Entry状態","発注不可理由"]:
             if c in df.columns:
                 df[c] = (df[c].astype(str).replace(["None","none","nan","NaN",""], "不明" if c in ["企業名","セクター"] else "").str.strip())
-        for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","再計算失敗フラグ","推奨投資額(円)","想定損失(円)","総合スコア"]:
+        for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","再計算失敗フラグ","単元必要資金(円)","単元想定損失(円)","推奨投資額(円)","想定損失(円)","総合スコア"]:
             df[c] = pd.to_numeric(df[c], errors="coerce").round(4)
     except Exception:
         pass
@@ -120,11 +120,11 @@ def prepare_guide_view(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
     guide = logic.build_live_linked_guide(df, max_rows=max_rows) if isinstance(df, pd.DataFrame) and len(df) else pd.DataFrame()
     if isinstance(guide, pd.DataFrame) and len(guide):
         try:
-            for c in ["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]:
+            for c in ["銘柄","企業名","セクター","推奨方式","売買優先区分","発注単位","単元株可否","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]:
                 if c not in guide.columns:
                     guide[c] = None
-            guide = guide[["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]]
-            for c in ["企業名","セクター","推奨方式","発注単位","Entry状態"]:
+            guide = guide[["銘柄","企業名","セクター","推奨方式","売買優先区分","発注単位","単元株可否","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]]
+            for c in ["企業名","セクター","推奨方式","売買優先区分","発注単位","単元株可否","Entry状態"]:
                 guide[c] = (guide[c].astype(str).replace(["None","none","nan","NaN",""], "不明" if c in ["企業名","セクター"] else "").str.strip())
             guide = guide.head(int(max_rows)).reset_index(drop=True)
             guide.insert(0, "順位", range(1, len(guide)+1))
@@ -382,7 +382,6 @@ if run_scan:
                 top_n=20,
                 capital_total=float(capital_total),
                 max_positions=int(max_positions),
-                wait_rr_floor=0.90,
             )
         except Exception:
             pass
@@ -395,6 +394,7 @@ if run_scan:
                 now_rr_min=1.00,
                 chase_rr_min=1.15,
                 wait_rr_min=0.90,
+                s_now_rr_min=1.30,
             )
         except Exception:
             now_df, wait_df = pd.DataFrame(), pd.DataFrame()
@@ -443,7 +443,7 @@ if st.session_state.get("scan_results_ready", False):
 
     render_selected_section(
         "🟢 今すぐ発注ランキング",
-        "S株の成行発注や、単元株の即時発注向けです。価格更新成功かつ実質RR>=1.00を基本条件にし、発注圏を強く優遇して上位10件まで表示します。追随可は実質RR>=1.15に限定しています。",
+        "単元株で買える強銘柄を最優先にした即時発注候補です。単元株は発注圏/追随可を採用し、S株は発注圏かつ実質RR>=1.30の非常に強い候補だけを例外採用します。S株の追随可は原則ここへ入れません。",
         now_view,
         mobile_mode,
         show_top_n,
@@ -452,7 +452,7 @@ if st.session_state.get("scan_results_ready", False):
 
     render_selected_section(
         "🟡 押し目待ちランキング",
-        "selected_now の厳しさは維持したまま、押し目待ち/様子見のうち実質RR>=0.90の監視候補を残しています。押し目待ちを優先しつつ、単元株もやや優先して並べています。",
+        "単元株の監視候補を優先しつつ、単元で入れない強銘柄はS株補助候補としてこちらへ寄せています。S株の追随可は原則この監視枠で扱います。",
         wait_view,
         mobile_mode,
         show_top_n,
@@ -461,7 +461,7 @@ if st.session_state.get("scan_results_ready", False):
 
     render_guide_section(
         "🧭 今すぐ発注の価格目安（Entry/SL/TP）",
-        "成行発注を前提に、今の価格で使いやすい候補だけを表示します。",
+        "単元株主力候補を先頭に、今の価格で即時発注しやすい候補だけを表示します。S株は例外的に非常に強い発注圏のみ残します。",
         now_guide,
         mobile_mode,
         show_top_n,
@@ -469,7 +469,7 @@ if st.session_state.get("scan_results_ready", False):
 
     render_guide_section(
         "🧭 押し目待ちの価格目安（Entry/SL/TP）",
-        "今は飛びつかず監視したい候補です。selected_now の基準を満たさないが、押し目や再接近で有望な銘柄を残します。価格未更新銘柄は今すぐ発注から外れ、総合表の警告列で確認できます。",
+        "今は飛びつかず監視したい候補です。単元株で入れる強銘柄を優先し、S株は補助候補として後ろに並べます。価格未更新銘柄は今すぐ発注から外れ、総合表の警告列で確認できます。",
         wait_guide,
         mobile_mode,
         show_top_n,
