@@ -283,7 +283,7 @@ if run_scan:
 
         # --- Live refresh for top 20 ---
         try:
-            df = logic.refresh_topn_prices_and_recalc(df, top_n=20)
+            df = logic.refresh_topn_prices_and_recalc(df, top_n=20, capital_total=float(capital_total), max_positions=int(max_positions))
         except Exception:
             pass
 
@@ -360,7 +360,7 @@ if run_scan:
 
         st.subheader("🧭 推奨方式と価格目安（Entry/SL/TP）")
         st.caption("どう買うか？（Entry/SL/TP と最大保有日数の具体案）")
-        guide = out.get("guide")
+        guide = logic.build_live_linked_guide(df, max_rows=20) if isinstance(df, pd.DataFrame) and len(df) else out.get("guide")
         if isinstance(guide, pd.DataFrame) and len(guide):
             try:
                 for c in ["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]:
