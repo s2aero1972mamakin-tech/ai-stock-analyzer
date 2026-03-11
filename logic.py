@@ -2321,3 +2321,57 @@ def refresh_topn_prices_and_recalc(df_selected, top_n=20, tp_atr=1.5, sl_atr=1.0
         tail = tail.reset_index(drop=True)
     merged = pd.concat([work, tail], ignore_index=True, sort=False)
     return merged.head(int(top_n)).copy()
+
+
+
+def split_live_rankings(df_selected: pd.DataFrame, now_top: int = 20, wait_top: int = 20):
+    """ライブ再計算後の selected を
+    - 今すぐ発注ランキング（発注圏/追随可）
+    - 押し目待ちランキング（押し目待ち/様子見）
+    に分割して返す。
+    S株が成行のみであることを踏まえ、見送り系は除外する。
+    """
+    import pandas as pd
+    import numpy as np
+
+    empty = pd.DataFrame()
+    if df_selected is None or len(df_selected) == 0:
+        return empty, empty
+
+    work = df_selected.copy()
+    for c in ["Entry状態", "発注単位", "発注不可理由"]:
+        if c not in work.columns:
+            work[c] = ""
+    for c in ["実質RR", "総合スコア", "推奨投資額(円)", "想定損失(円)", "推奨株数"]:
+        if c not in work.columns:
+            work[c] = np.nan
+        work[c] = pd.to_numeric(work[c], errors='coerce')
+
+    status = work["Entry状態"].astype(str).fillna("")
+    unit = work["発注単位"].astype(str).fillna("")
+    reason = work["発注不可理由"].astype(str).fillna("")
+    actionable = (~status.str.startswith("見送り")) & ((reason == "") | (reason == "nan")) & (work["推奨株数"].fillna(0) > 0)
+
+    now_mask = actionable & status.isin(["発注圏", "追随可"])
+    wait_mask = actionable & status.isin(["押し目待ち", "様子見"])
+
+    now_df = work[now_mask].copy()
+    wait_df = work[wait_mask].copy()
+
+    # 今すぐ発注: 総合スコアと実質RRを優先
+    if len(now_df):
+        now_df = now_df.sort_values(["総合スコア", "実質RR"], ascending=[False, False], na_position='last').reset_index(drop=True)
+        now_df["順位"] = range(1, len(now_df) + 1)
+        if now_top is not None:
+            now_df = now_df.head(int(now_top)).copy()
+
+    # 押し目待ち: 単元株をやや優先（S株成行の不便さを考慮） + 実質RR + 総合スコア
+    if len(wait_df):
+        wait_df["_unit_priority"] = np.where(unit.loc[wait_df.index].astype(str).eq("単元株"), 1, 0)
+        wait_df = wait_df.sort_values(["_unit_priority", "実質RR", "総合スコア"], ascending=[False, False, False], na_position='last').reset_index(drop=True)
+        wait_df.drop(columns=["_unit_priority"], inplace=True, errors='ignore')
+        wait_df["順位"] = range(1, len(wait_df) + 1)
+        if wait_top is not None:
+            wait_df = wait_df.head(int(wait_top)).copy()
+
+    return now_df, wait_df
