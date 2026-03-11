@@ -2560,6 +2560,7 @@ def split_live_rankings(
     chase_rr_min: float = 1.30,
     wait_rr_min: float = 0.90,
     s_now_rr_min: float = 1.35,
+    s_now_max: int = 1,
 ):
     """ライブ再計算後の selected を
     - 今すぐ発注ランキング（単元株中心、S株は例外）
@@ -2571,6 +2572,7 @@ def split_live_rankings(
     - 単元株の発注圏を最優先
     - 単元株の追随可は 実質RR >= chase_rr_min のかなり強い候補だけ
     - S株は 発注圏 かつ 実質RR >= s_now_rr_min の非常に強い候補のみ例外採用
+    - S株の即時候補は 0〜1件を想定し、上限を s_now_max で強制する
     """
     import pandas as pd
     import numpy as np
@@ -2592,8 +2594,9 @@ def split_live_rankings(
 
     rr_floor = float(now_rr_min) if np.isfinite(now_rr_min) else 1.0
     chase_floor = max(rr_floor, float(chase_rr_min) if np.isfinite(chase_rr_min) else max(rr_floor, 1.30))
-    wait_floor = float(wait_rr_min) if np.isfinite(wait_rr_min) else min(rr_floor, 0.9)
+    wait_floor = float(wait_rr_min) if np.isfinite(wait_rr_min) else min(rr_floor, 0.90)
     s_floor = max(chase_floor, float(s_now_rr_min) if np.isfinite(s_now_rr_min) else 1.35)
+    s_limit = max(int(s_now_max or 0), 0)
 
     status = work["Entry状態"].astype(str).fillna("")
     unit = work["発注単位"].astype(str).fillna("")
@@ -2613,13 +2616,27 @@ def split_live_rankings(
         | ((status == "追随可") & (rr >= chase_floor))
     )
     s_now_mask = actionable & unit.eq("S株") & (status == "発注圏") & (rr >= s_floor)
-    now_mask = unit_now_mask | s_now_mask
+
+    keep_s_idx = []
+    if s_limit > 0 and bool(s_now_mask.any()):
+        s_candidates = work.loc[s_now_mask].copy()
+        s_candidates = s_candidates.sort_values(
+            ["実行優先度", "実行優先スコア", "実質RR", "総合スコア"],
+            ascending=[False, False, False, False],
+            na_position='last'
+        )
+        keep_s_idx = s_candidates.head(s_limit).index.tolist()
+    s_now_mask_limited = pd.Series(False, index=work.index)
+    if keep_s_idx:
+        s_now_mask_limited.loc[keep_s_idx] = True
+
+    now_mask = unit_now_mask | s_now_mask_limited
 
     watchable_status = status.isin(["発注圏", "追随可", "押し目待ち", "様子見"])
     wait_mask = actionable & (~now_mask) & watchable_status & (rr >= wait_floor)
 
-    now_df = work[now_mask].copy()
-    wait_df = work[wait_mask].copy()
+    now_df = work.loc[now_mask].copy()
+    wait_df = work.loc[wait_mask].copy()
 
     if len(now_df):
         def _norm01(s: pd.Series) -> pd.Series:
@@ -2633,15 +2650,15 @@ def split_live_rankings(
         base_norm = _norm01(now_df["総合スコア"])
         rr_norm = _norm01(now_df["実質RR"].fillna(0.0))
         exec_norm = _norm01(now_df["実行優先スコア"].fillna(0.0))
-        status_bonus = now_df["Entry状態"].astype(str).map({"発注圏": 1.00, "追随可": 0.18}).fillna(0.0)
-        unit_bonus = now_df["発注単位"].astype(str).map({"単元株": 0.30, "S株": 0.00}).fillna(0.0)
-        priority_bonus = now_df["売買優先区分"].astype(str).map({"単元株主力候補": 0.18, "S株補助候補": 0.00}).fillna(0.0)
+        status_bonus = now_df["Entry状態"].astype(str).map({"発注圏": 1.00, "追随可": 0.10}).fillna(0.0)
+        unit_bonus = now_df["発注単位"].astype(str).map({"単元株": 0.34, "S株": -0.06}).fillna(0.0)
+        priority_bonus = now_df["売買優先区分"].astype(str).map({"単元株主力候補": 0.22, "S株補助候補": -0.04}).fillna(0.0)
 
         now_df["今すぐ発注スコア"] = (
-            0.36 * exec_norm
-            + 0.22 * rr_norm
-            + 0.14 * base_norm
-            + 0.28 * status_bonus
+            0.42 * exec_norm
+            + 0.24 * rr_norm
+            + 0.12 * base_norm
+            + 0.22 * status_bonus
             + unit_bonus
             + priority_bonus
         )
@@ -2666,3 +2683,71 @@ def split_live_rankings(
             wait_df = wait_df.head(int(wait_top)).copy()
 
     return now_df, wait_df
+
+
+def build_live_execution_views(
+    df_selected: pd.DataFrame,
+    live_top: int = 20,
+    now_top: int = 10,
+    wait_top: int = 20,
+    now_rr_min: float = 1.00,
+    chase_rr_min: float = 1.30,
+    wait_rr_min: float = 0.90,
+    s_now_rr_min: float = 1.35,
+    s_now_max: int = 1,
+):
+    """selected_live_top20 / selected_now / selected_wait を同じ実行優先ロジックで再構成する。"""
+    import pandas as pd
+    import numpy as np
+
+    empty = pd.DataFrame()
+    if df_selected is None or len(df_selected) == 0:
+        return empty, empty, empty
+
+    work = _compute_live_execution_priority(df_selected, strict_chase_rr=float(chase_rr_min), strict_s_rr=float(s_now_rr_min)).copy()
+    work = work.reset_index().rename(columns={"index": "__source_idx__"})
+    now_df, wait_df = split_live_rankings(
+        work,
+        now_top=now_top,
+        wait_top=wait_top,
+        now_rr_min=now_rr_min,
+        chase_rr_min=chase_rr_min,
+        wait_rr_min=wait_rr_min,
+        s_now_rr_min=s_now_rr_min,
+        s_now_max=s_now_max,
+    )
+
+    used_idx = set()
+    for df_part in [now_df, wait_df]:
+        if isinstance(df_part, pd.DataFrame) and len(df_part) and "__source_idx__" in df_part.columns:
+            used_idx.update(pd.to_numeric(df_part["__source_idx__"], errors="coerce").dropna().astype(int).tolist())
+
+    remainder = work.loc[~work["__source_idx__"].astype(int).isin(list(used_idx))].copy()
+    if len(remainder):
+        for c in ["実行優先度", "実行優先スコア", "実質RR", "総合スコア"]:
+            if c not in remainder.columns:
+                remainder[c] = np.nan
+        remainder = remainder.sort_values(
+            ["実行優先度", "実行優先スコア", "実質RR", "総合スコア"],
+            ascending=[False, False, False, False],
+            na_position='last'
+        ).copy()
+
+    live_df = pd.concat([now_df, wait_df, remainder], ignore_index=True, sort=False)
+    if live_top is not None:
+        live_df = live_df.head(int(live_top)).copy()
+    for df_part in [live_df, now_df, wait_df]:
+        if isinstance(df_part, pd.DataFrame) and "__source_idx__" in df_part.columns:
+            df_part.drop(columns=["__source_idx__"], inplace=True, errors="ignore")
+
+    if len(live_df):
+        live_df = live_df.reset_index(drop=True)
+        live_df["順位"] = range(1, len(live_df) + 1)
+    if len(now_df):
+        now_df = now_df.reset_index(drop=True)
+        now_df["順位"] = range(1, len(now_df) + 1)
+    if len(wait_df):
+        wait_df = wait_df.reset_index(drop=True)
+        wait_df["順位"] = range(1, len(wait_df) + 1)
+
+    return live_df, now_df, wait_df
