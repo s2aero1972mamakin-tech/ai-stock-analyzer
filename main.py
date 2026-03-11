@@ -382,6 +382,7 @@ if run_scan:
                 top_n=20,
                 capital_total=float(capital_total),
                 max_positions=int(max_positions),
+                wait_rr_floor=0.90,
             )
         except Exception:
             pass
@@ -393,6 +394,7 @@ if run_scan:
                 wait_top=20,
                 now_rr_min=1.00,
                 chase_rr_min=1.15,
+                wait_rr_min=0.90,
             )
         except Exception:
             now_df, wait_df = pd.DataFrame(), pd.DataFrame()
@@ -450,7 +452,7 @@ if st.session_state.get("scan_results_ready", False):
 
     render_selected_section(
         "🟡 押し目待ちランキング",
-        "S株の成行では飛びつきにくい候補です。単元株をやや優先して並べています。",
+        "selected_now の厳しさは維持したまま、押し目待ち/様子見のうち実質RR>=0.90の監視候補を残しています。押し目待ちを優先しつつ、単元株もやや優先して並べています。",
         wait_view,
         mobile_mode,
         show_top_n,
@@ -467,7 +469,7 @@ if st.session_state.get("scan_results_ready", False):
 
     render_guide_section(
         "🧭 押し目待ちの価格目安（Entry/SL/TP）",
-        "今は飛びつかず監視したい候補です。S株成行より単元株の待機候補が向いています。価格未更新銘柄は今すぐ発注から外れ、総合表の警告列で確認できます。",
+        "今は飛びつかず監視したい候補です。selected_now の基準を満たさないが、押し目や再接近で有望な銘柄を残します。価格未更新銘柄は今すぐ発注から外れ、総合表の警告列で確認できます。",
         wait_guide,
         mobile_mode,
         show_top_n,
