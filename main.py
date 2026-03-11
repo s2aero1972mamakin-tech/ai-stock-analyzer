@@ -110,6 +110,7 @@ def render_selected_section(title: str, caption: str, df: pd.DataFrame, mobile_m
                 file_name=download_name,
                 mime="text/csv",
                 use_container_width=True,
+                on_click="ignore",
             )
     else:
         st.info("該当銘柄がありません。")
@@ -146,6 +147,15 @@ def render_guide_section(title: str, caption: str, guide: pd.DataFrame, mobile_m
         st.info("価格目安の生成に必要なデータが不足しています。")
 
 st.set_page_config(page_title="JPX Swing AI", layout="wide")
+if "scan_results_ready" not in st.session_state:
+    st.session_state["scan_results_ready"] = False
+    st.session_state["scan_diag"] = None
+    st.session_state["scan_selected_live"] = pd.DataFrame()
+    st.session_state["scan_selected_now"] = pd.DataFrame()
+    st.session_state["scan_selected_wait"] = pd.DataFrame()
+    st.session_state["scan_now_guide"] = pd.DataFrame()
+    st.session_state["scan_wait_guide"] = pd.DataFrame()
+
 
 # ---- スマホ最適化CSS（Streamlit Cloudでも効く）----
 st.markdown(
@@ -362,17 +372,10 @@ if run_scan:
         diag["elapsed_sec"] = elapsed
         logic.save_last_diag(diag)
 
-        st.success(f"スキャン完了（{elapsed:.1f}秒） / mode={diag.get('mode','?')}")
-        with st.expander("📊 診断（JSON）", expanded=False):
-            st.json(diag)
-        # セクター強度ランキングはバックエンド利用のみ（UI非表示）
-
-        # 元の selected を取得
         df = out.get("selected")
         if not isinstance(df, pd.DataFrame):
             df = pd.DataFrame()
 
-        # ライブ再計算後の全体ランキング（上位20）
         try:
             df = logic.refresh_topn_prices_and_recalc(
                 df,
@@ -383,63 +386,24 @@ if run_scan:
         except Exception:
             pass
 
-        df_view = prepare_selected_view(df)
-        render_selected_section(
-            "🏆 AI最終選定銘柄（ライブ再計算後・全20件）",
-            "ライブ再計算後の総合表です。S株の成行制約を踏まえた『今すぐ発注』と『押し目待ち』は下の分割表を見てください。",
-            df_view,
-            mobile_mode,
-            show_top_n,
-            "selected_live_top20.csv",
-        )
-
-        # 今すぐ発注 / 押し目待ち を分割
         try:
             now_df, wait_df = logic.split_live_rankings(df, now_top=20, wait_top=20)
         except Exception:
             now_df, wait_df = pd.DataFrame(), pd.DataFrame()
 
+        df_view = prepare_selected_view(df)
         now_view = prepare_selected_view(now_df)
         wait_view = prepare_selected_view(wait_df)
-
-        render_selected_section(
-            "🟢 今すぐ発注ランキング",
-            "S株の成行発注や、単元株の即時発注向けです。『発注圏 / 追随可』のみを抽出しています。",
-            now_view,
-            mobile_mode,
-            show_top_n,
-            "selected_now.csv",
-        )
-
-        render_selected_section(
-            "🟡 押し目待ちランキング",
-            "S株の成行では飛びつきにくい候補です。単元株をやや優先して並べています。",
-            wait_view,
-            mobile_mode,
-            show_top_n,
-            "selected_wait.csv",
-        )
-
-        # guide も分割
         now_guide = prepare_guide_view(now_view, max_rows=int(max_positions))
         wait_guide = prepare_guide_view(wait_view, max_rows=min(10, len(wait_view)) if isinstance(wait_view, pd.DataFrame) else 10)
 
-        render_guide_section(
-            "🧭 今すぐ発注の価格目安（Entry/SL/TP）",
-            "成行発注を前提に、今の価格で使いやすい候補だけを表示します。",
-            now_guide,
-            mobile_mode,
-            show_top_n,
-        )
-
-        render_guide_section(
-            "🧭 押し目待ちの価格目安（Entry/SL/TP）",
-            "今は飛びつかず監視したい候補です。S株成行より単元株の待機候補が向いています。",
-            wait_guide,
-            mobile_mode,
-            show_top_n,
-        )
-
+        st.session_state["scan_results_ready"] = True
+        st.session_state["scan_diag"] = diag
+        st.session_state["scan_selected_live"] = df_view
+        st.session_state["scan_selected_now"] = now_view
+        st.session_state["scan_selected_wait"] = wait_view
+        st.session_state["scan_now_guide"] = now_guide
+        st.session_state["scan_wait_guide"] = wait_guide
 
     except Exception:
         st.error("スキャン中にエラーが発生しました")
@@ -447,6 +411,61 @@ if run_scan:
             st.code(traceback.format_exc())
         else:
             st.caption("（デバッグ表示をONにすると詳細tracebackを表示します）")
+
+if st.session_state.get("scan_results_ready", False):
+    diag = st.session_state.get("scan_diag", {})
+    st.success(f"スキャン完了（{float(diag.get('elapsed_sec', 0.0)):.1f}秒） / mode={diag.get('mode','?')}")
+    with st.expander("📊 診断（JSON）", expanded=False):
+        st.json(diag)
+
+    df_view = st.session_state.get("scan_selected_live", pd.DataFrame())
+    now_view = st.session_state.get("scan_selected_now", pd.DataFrame())
+    wait_view = st.session_state.get("scan_selected_wait", pd.DataFrame())
+    now_guide = st.session_state.get("scan_now_guide", pd.DataFrame())
+    wait_guide = st.session_state.get("scan_wait_guide", pd.DataFrame())
+
+    render_selected_section(
+        "🏆 AI最終選定銘柄（ライブ再計算後・全20件）",
+        "ライブ再計算後の総合表です。S株の成行制約を踏まえた『今すぐ発注』と『押し目待ち』は下の分割表を見てください。",
+        df_view,
+        mobile_mode,
+        show_top_n,
+        "selected_live_top20.csv",
+    )
+
+    render_selected_section(
+        "🟢 今すぐ発注ランキング",
+        "S株の成行発注や、単元株の即時発注向けです。『発注圏 / 追随可』のみを抽出し、実質RR寄りで並べています。",
+        now_view,
+        mobile_mode,
+        show_top_n,
+        "selected_now.csv",
+    )
+
+    render_selected_section(
+        "🟡 押し目待ちランキング",
+        "S株の成行では飛びつきにくい候補です。単元株をやや優先して並べています。",
+        wait_view,
+        mobile_mode,
+        show_top_n,
+        "selected_wait.csv",
+    )
+
+    render_guide_section(
+        "🧭 今すぐ発注の価格目安（Entry/SL/TP）",
+        "成行発注を前提に、今の価格で使いやすい候補だけを表示します。",
+        now_guide,
+        mobile_mode,
+        show_top_n,
+    )
+
+    render_guide_section(
+        "🧭 押し目待ちの価格目安（Entry/SL/TP）",
+        "今は飛びつかず監視したい候補です。S株成行より単元株の待機候補が向いています。",
+        wait_guide,
+        mobile_mode,
+        show_top_n,
+    )
 
 st.markdown("---")
 st.caption("※注意：本ツールは投資助言ではありません。最終判断はご自身で行ってください。")
