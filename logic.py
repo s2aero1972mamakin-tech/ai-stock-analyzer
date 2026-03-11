@@ -2060,7 +2060,13 @@ def dynamic_tp_engine(entry, atr):
 
 
 def _recalc_live_execution_plan(df_plan: pd.DataFrame, capital_total: float = 300000.0, max_positions: int = 1) -> pd.DataFrame:
-    """ライブ再計算後の順位に対して、発注単位/株数/投資額/損失を再計算する。既存の警告理由は維持する。"""
+    """ライブ再計算後の順位に対して、発注単位/株数/投資額/損失を再計算する。
+
+    v4_fix4:
+    - 単元株を主力候補として優先評価
+    - 単元株が資金/損失条件に合わない場合のみ S株補助候補へ降ろす
+    - 既存の発注不可理由は維持しつつ、単元可否と必要資金を可視化
+    """
     import numpy as np
     import pandas as pd
 
@@ -2068,8 +2074,9 @@ def _recalc_live_execution_plan(df_plan: pd.DataFrame, capital_total: float = 30
         return df_plan
 
     out = df_plan.copy()
-    risk_budget = float(capital_total) * 0.01
     budget_per_pos = float(capital_total) / max(int(max_positions), 1)
+    fraction_risk_budget = float(capital_total) * 0.01
+    unit_risk_budget = float(capital_total) * 0.04
 
     shares_list = []
     invest_list = []
@@ -2077,6 +2084,12 @@ def _recalc_live_execution_plan(df_plan: pd.DataFrame, capital_total: float = 30
     reason_list = []
     unit_list = []
     rr_list = []
+    lot_size_list = []
+    lot_cost_list = []
+    lot_loss_list = []
+    lot_ok_list = []
+    lot_reason_list = []
+    priority_list = []
 
     for _, r in out.iterrows():
         entry = float(pd.to_numeric(pd.Series([r.get("Entry目安", r.get("現在値（終値）", 0))]), errors="coerce").fillna(0).iloc[0])
@@ -2091,12 +2104,34 @@ def _recalc_live_execution_plan(df_plan: pd.DataFrame, capital_total: float = 30
         if entry_status.lower() in ("nan", "none"):
             entry_status = ""
 
+        lot_size = int(pd.to_numeric(pd.Series([r.get("lot_size", 100)]), errors="coerce").fillna(100).iloc[0])
+        if lot_size <= 0:
+            lot_size = 100
+
         risk_per_share = max(entry - sl, 0.0)
         shares = 0
         invest = 0.0
         loss = 0.0
         reason = existing_reason
         unit = "S株"
+        priority = "保留"
+
+        lot_cost = float(lot_size) * max(entry, 0.0)
+        lot_loss = float(lot_size) * max(risk_per_share, 0.0)
+        lot_budget_ok = bool(entry > 0 and lot_cost <= budget_per_pos + 1e-9)
+        lot_risk_ok = bool(risk_per_share > 0 and lot_loss <= unit_risk_budget + 1e-9)
+        lot_trade_ok = lot_budget_ok and lot_risk_ok
+
+        if lot_trade_ok:
+            lot_reason = "可"
+        elif not lot_budget_ok and not lot_risk_ok:
+            lot_reason = "単元の必要資金・想定損失が条件超過"
+        elif not lot_budget_ok:
+            lot_reason = "単元の必要資金が予算超過"
+        elif not lot_risk_ok:
+            lot_reason = "単元の想定損失が上限超過"
+        else:
+            lot_reason = "条件未達"
 
         forced_block = False
         if existing_reason:
@@ -2109,23 +2144,36 @@ def _recalc_live_execution_plan(df_plan: pd.DataFrame, capital_total: float = 30
         if not forced_block:
             if entry <= 0 or sl <= 0 or tp <= 0:
                 reason = "エントリー未計算"
+                priority = "計算不可"
             elif risk_per_share <= 0:
                 reason = "損切幅不正"
+                priority = "計算不可"
             else:
-                shares_risk = int(risk_budget // risk_per_share)
                 shares_cap = int(budget_per_pos // entry) if entry > 0 else 0
-                shares100 = (min(shares_risk, shares_cap) // 100) * 100
-                shares1 = min(shares_risk, shares_cap)
-                if shares100 > 0:
-                    shares = shares100
+                shares_risk_fraction = int(fraction_risk_budget // risk_per_share) if risk_per_share > 0 else 0
+                shares_risk_unit = int(unit_risk_budget // risk_per_share) if risk_per_share > 0 else 0
+
+                if lot_trade_ok:
+                    shares_lot = (min(shares_cap, max(shares_risk_unit, lot_size)) // lot_size) * lot_size
+                    shares = shares_lot if shares_lot >= lot_size else lot_size
                     unit = "単元株"
+                    priority = "単元株主力候補"
                 else:
-                    shares = shares1
+                    shares = min(shares_risk_fraction, shares_cap)
                     unit = "S株"
+                    if shares > 0:
+                        priority = "S株補助候補"
+                    else:
+                        priority = "資金保留"
+                        reason = "資金不足または損失条件未達"
+
                 invest = shares * entry
                 loss = shares * risk_per_share
-                if shares <= 0:
-                    reason = "資金不足または単元未満"
+
+        if forced_block and not priority:
+            priority = "保留"
+        elif forced_block:
+            priority = "保留"
 
         rr = ((tp - entry) / risk_per_share) if (risk_per_share > 0 and tp > 0) else np.nan
 
@@ -2135,6 +2183,12 @@ def _recalc_live_execution_plan(df_plan: pd.DataFrame, capital_total: float = 30
         reason_list.append(reason)
         unit_list.append(unit)
         rr_list.append(float(rr) if np.isfinite(rr) else np.nan)
+        lot_size_list.append(int(lot_size))
+        lot_cost_list.append(float(lot_cost))
+        lot_loss_list.append(float(lot_loss))
+        lot_ok_list.append("可" if lot_trade_ok else "不可")
+        lot_reason_list.append(lot_reason)
+        priority_list.append(priority)
 
     out["発注単位"] = unit_list
     out["推奨株数"] = shares_list
@@ -2142,6 +2196,12 @@ def _recalc_live_execution_plan(df_plan: pd.DataFrame, capital_total: float = 30
     out["想定損失(円)"] = np.round(loss_list, 0)
     out["発注不可理由"] = reason_list
     out["RR"] = np.round(rr_list, 3)
+    out["単元株数"] = lot_size_list
+    out["単元必要資金(円)"] = np.round(lot_cost_list, 0)
+    out["単元想定損失(円)"] = np.round(lot_loss_list, 0)
+    out["単元株可否"] = lot_ok_list
+    out["単元判定理由"] = lot_reason_list
+    out["売買優先区分"] = priority_list
 
     if "最大保有" not in out.columns:
         out["最大保有"] = "10営業日"
@@ -2149,17 +2209,19 @@ def _recalc_live_execution_plan(df_plan: pd.DataFrame, capital_total: float = 30
     return out
 
 
+
 def build_live_linked_guide(df_selected: pd.DataFrame, max_rows: Optional[int] = None) -> pd.DataFrame:
     """selected から live 再計算後の guide を作る。"""
     import pandas as pd
     if df_selected is None or len(df_selected) == 0:
-        return pd.DataFrame(columns=["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"])
+        return pd.DataFrame(columns=["銘柄","企業名","セクター","推奨方式","売買優先区分","発注単位","単元株可否","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"])
 
-    cols = [c for c in ["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"] if c in df_selected.columns]
+    cols = [c for c in ["銘柄","企業名","セクター","推奨方式","売買優先区分","発注単位","単元株可否","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"] if c in df_selected.columns]
     guide = df_selected[cols].copy()
     if max_rows is not None:
         guide = guide.head(int(max_rows)).copy()
     return guide
+
 
 
 # -------------------------------
@@ -2174,7 +2236,6 @@ def refresh_topn_prices_and_recalc(
     max_positions=1,
     effective_rr_floor=1.0,
     chase_rr_floor=1.15,
-    wait_rr_floor=0.90,
 ):
     """上位N銘柄だけ現在値を再取得し、
     - 現在値基準で Entry/TP/SL を再計算
@@ -2183,10 +2244,6 @@ def refresh_topn_prices_and_recalc(
     - ライブ再計算後スコアで再ランキング
     - 価格未更新銘柄を強警告＋大幅減点
     して返す。
-
-    運用意図:
-    - selected_now は厳格維持（発注圏/追随可のRR条件は厳しめ）
-    - その一方で、押し目や監視候補は selected_wait に残しやすくする
     """
     import yfinance as yf
     import pandas as pd
@@ -2272,8 +2329,6 @@ def refresh_topn_prices_and_recalc(
 
     rr_floor = float(effective_rr_floor) if np.isfinite(effective_rr_floor) else 1.0
     chase_floor = max(rr_floor, float(chase_rr_floor) if np.isfinite(chase_rr_floor) else rr_floor)
-    wait_floor = min(rr_floor, float(wait_rr_floor) if np.isfinite(wait_rr_floor) else 0.90)
-    wait_floor = max(wait_floor, 0.0)
 
     def _status_from_live(current, old_entry, old_tp, effective_rr, live_price_ok):
         if not live_price_ok:
@@ -2282,39 +2337,24 @@ def refresh_topn_prices_and_recalc(
             return "不明"
         if np.isfinite(old_tp) and current >= old_tp * 0.995:
             return "見送り（利確圏）"
-
-        dev = np.nan
+        if np.isfinite(effective_rr) and effective_rr < rr_floor:
+            return "見送り（利幅薄い）"
         if np.isfinite(old_entry) and old_entry > 0:
             dev = (current / old_entry) - 1.0
-
-        rr_ok_now = (not np.isfinite(effective_rr)) or (effective_rr >= rr_floor)
-        rr_ok_chase = (not np.isfinite(effective_rr)) or (effective_rr >= chase_floor)
-        rr_ok_wait = (not np.isfinite(effective_rr)) or (effective_rr >= wait_floor)
-
-        # 押し目は「今すぐ候補」にしない一方で、監視候補としては残しやすくする。
-        if np.isfinite(dev) and dev < -0.003:
-            if rr_ok_wait:
-                return "押し目待ち"
-            return "見送り（利幅薄い）"
-
-        if np.isfinite(dev):
-            if abs(dev) <= 0.003 and rr_ok_now:
+            if abs(dev) <= 0.003 and (not np.isfinite(effective_rr) or effective_rr >= rr_floor):
                 return "発注圏"
-            if 0.003 < dev <= 0.02 and rr_ok_chase:
+            if 0.003 < dev <= 0.02 and (not np.isfinite(effective_rr) or effective_rr >= chase_floor):
                 return "追随可"
-            if -0.003 <= dev <= 0.02 and rr_ok_wait:
-                return "様子見"
-
-        if np.isfinite(effective_rr) and effective_rr < wait_floor:
-            return "見送り（利幅薄い）"
+            if dev < -0.003:
+                return "押し目待ち"
         return "様子見"
 
     def _status_bonus(s):
         return {
             "発注圏": 0.18,
             "追随可": 0.03,
-            "押し目待ち": 0.01,
-            "様子見": -0.01,
+            "押し目待ち": 0.00,
+            "様子見": -0.03,
             "見送り（利幅薄い）": -0.16,
             "見送り（利確圏）": -0.18,
             "見送り（価格未更新）": -0.60,
@@ -2423,7 +2463,6 @@ def refresh_topn_prices_and_recalc(
 
 
 
-
 def split_live_rankings(
     df_selected: pd.DataFrame,
     now_top: int = 10,
@@ -2431,21 +2470,18 @@ def split_live_rankings(
     now_rr_min: float = 1.00,
     chase_rr_min: float = 1.15,
     wait_rr_min: float = 0.90,
+    s_now_rr_min: float = 1.30,
 ):
     """ライブ再計算後の selected を
-    - 今すぐ発注ランキング（発注圏/追随可）
-    - 押し目待ちランキング（押し目待ち/様子見）
+    - 今すぐ発注ランキング（単元株中心、S株は例外）
+    - 押し目待ちランキング（単元株優先の監視候補 + S株補助候補）
     に分割して返す。
 
     実運用重視のため、今すぐ発注は以下を厳格適用する。
     - 見送り系/価格未更新/発注不可理由ありは除外
-    - 発注圏でも 実質RR >= now_rr_min
-    - 追随可は 実質RR >= chase_rr_min
-
-    一方で wait 側は、押し目・監視候補を残すため
-    - 押し目待ち/様子見
-    - 実質RR >= wait_rr_min
-    を条件に抽出する。
+    - 単元株: 発注圏は 実質RR >= now_rr_min、追随可は 実質RR >= chase_rr_min
+    - S株: 発注圏 かつ 実質RR >= s_now_rr_min の「非常に強い候補」のみ例外採用
+    - S株の追随可は now へ入れず wait 側へ回す
     """
     import pandas as pd
     import numpy as np
@@ -2455,24 +2491,25 @@ def split_live_rankings(
         return empty, empty
 
     work = df_selected.copy()
-    for c in ["Entry状態", "発注単位", "発注不可理由", "価格更新状態", "再計算失敗フラグ"]:
+    for c in ["Entry状態", "発注単位", "発注不可理由", "価格更新状態", "再計算失敗フラグ", "売買優先区分", "単元株可否"]:
         if c not in work.columns:
             work[c] = ""
-    for c in ["Entry状態", "発注単位", "発注不可理由", "価格更新状態"]:
+    for c in ["Entry状態", "発注単位", "発注不可理由", "価格更新状態", "売買優先区分", "単元株可否"]:
         work[c] = work[c].astype(str).replace(["nan", "None"], "")
-    for c in ["実質RR", "総合スコア", "推奨投資額(円)", "想定損失(円)", "推奨株数", "再計算失敗フラグ"]:
+    for c in ["実質RR", "総合スコア", "推奨投資額(円)", "想定損失(円)", "推奨株数", "再計算失敗フラグ", "単元必要資金(円)", "単元想定損失(円)"]:
         if c not in work.columns:
             work[c] = np.nan
         work[c] = pd.to_numeric(work[c], errors='coerce')
 
     rr_floor = float(now_rr_min) if np.isfinite(now_rr_min) else 1.0
     chase_floor = max(rr_floor, float(chase_rr_min) if np.isfinite(chase_rr_min) else rr_floor)
-    wait_floor = min(rr_floor, float(wait_rr_min) if np.isfinite(wait_rr_min) else 0.90)
-    wait_floor = max(wait_floor, 0.0)
+    wait_floor = float(wait_rr_min) if np.isfinite(wait_rr_min) else min(rr_floor, 0.9)
+    s_floor = max(rr_floor, float(s_now_rr_min) if np.isfinite(s_now_rr_min) else 1.30)
 
     status = work["Entry状態"].astype(str).fillna("")
     unit = work["発注単位"].astype(str).fillna("")
     reason = work["発注不可理由"].astype(str).fillna("")
+    rr = pd.to_numeric(work["実質RR"], errors='coerce')
     actionable = (
         (~status.str.startswith("見送り"))
         & ((reason == "") | (reason == "nan"))
@@ -2480,12 +2517,15 @@ def split_live_rankings(
         & (work["再計算失敗フラグ"].fillna(0) <= 0)
     )
 
-    rr = pd.to_numeric(work["実質RR"], errors='coerce')
-    now_mask = actionable & (
+    unit_now_mask = actionable & (unit == "単元株") & (
         ((status == "発注圏") & (rr >= rr_floor))
         | ((status == "追随可") & (rr >= chase_floor))
     )
-    wait_mask = actionable & status.isin(["押し目待ち", "様子見"]) & (rr >= wait_floor)
+    s_now_mask = actionable & (unit == "S株") & (status == "発注圏") & (rr >= s_floor)
+    now_mask = unit_now_mask | s_now_mask
+
+    watchable_status = status.isin(["発注圏", "追随可", "押し目待ち", "様子見"])
+    wait_mask = actionable & (~now_mask) & watchable_status & (rr >= wait_floor)
 
     now_df = work[now_mask].copy()
     wait_df = work[wait_mask].copy()
@@ -2503,19 +2543,21 @@ def split_live_rankings(
 
         base_norm = _norm01(now_df["総合スコア"])
         rr_norm = _norm01(now_df["実質RR"].fillna(0.0))
-        status_bonus = now_df["Entry状態"].astype(str).map({"発注圏": 1.00, "追随可": 0.25}).fillna(0.0)
-        unit_bonus = now_df["発注単位"].astype(str).map({"単元株": 0.08, "S株": 0.00}).fillna(0.0)
+        status_bonus = now_df["Entry状態"].astype(str).map({"発注圏": 1.00, "追随可": 0.35}).fillna(0.0)
+        unit_bonus = now_df["発注単位"].astype(str).map({"単元株": 0.22, "S株": 0.00}).fillna(0.0)
+        priority_bonus = now_df["売買優先区分"].astype(str).map({"単元株主力候補": 0.10, "S株補助候補": 0.00}).fillna(0.0)
 
         now_df["今すぐ発注スコア"] = (
-            0.38 * base_norm
-            + 0.32 * rr_norm
-            + 0.30 * status_bonus
+            0.34 * base_norm
+            + 0.31 * rr_norm
+            + 0.35 * status_bonus
             + unit_bonus
+            + priority_bonus
         )
 
         now_df = now_df.sort_values(
-            ["今すぐ発注スコア", "Entry状態", "実質RR", "総合スコア"],
-            ascending=[False, True, False, False],
+            ["今すぐ発注スコア", "発注単位", "Entry状態", "実質RR", "総合スコア"],
+            ascending=[False, True, True, False, False],
             na_position='last'
         ).reset_index(drop=True)
         now_df["順位"] = range(1, len(now_df) + 1)
@@ -2523,33 +2565,19 @@ def split_live_rankings(
             now_df = now_df.head(int(now_top)).copy()
 
     if len(wait_df):
-        def _norm01(s):
-            s = pd.to_numeric(s, errors='coerce')
-            if len(s.dropna()) == 0:
-                return pd.Series([0.0] * len(s), index=s.index, dtype=float)
-            smin = float(s.min())
-            smax = float(s.max())
-            if not np.isfinite(smin) or not np.isfinite(smax) or abs(smax - smin) < 1e-12:
-                return pd.Series([0.5] * len(s), index=s.index, dtype=float)
-            return ((s - smin) / (smax - smin)).clip(0.0, 1.0)
-
-        rr_norm = _norm01(wait_df["実質RR"].fillna(0.0))
-        base_norm = _norm01(wait_df["総合スコア"].fillna(0.0))
-        status_priority = wait_df["Entry状態"].astype(str).map({"押し目待ち": 1.00, "様子見": 0.55}).fillna(0.0)
-        unit_bonus = wait_df["発注単位"].astype(str).map({"単元株": 0.08, "S株": 0.00}).fillna(0.0)
-
-        wait_df["監視スコア"] = (
-            0.42 * rr_norm
-            + 0.28 * base_norm
-            + 0.25 * status_priority
-            + 0.05 * unit_bonus
-        )
-
+        wait_df["_unit_priority"] = np.where(wait_df["発注単位"].astype(str).eq("単元株"), 2, 1)
+        wait_df["_status_priority"] = wait_df["Entry状態"].astype(str).map({
+            "押し目待ち": 4,
+            "様子見": 3,
+            "発注圏": 2,
+            "追随可": 1,
+        }).fillna(0)
         wait_df = wait_df.sort_values(
-            ["監視スコア", "Entry状態", "実質RR", "総合スコア"],
-            ascending=[False, True, False, False],
+            ["_unit_priority", "_status_priority", "実質RR", "総合スコア"],
+            ascending=[False, False, False, False],
             na_position='last'
         ).reset_index(drop=True)
+        wait_df.drop(columns=["_unit_priority", "_status_priority"], inplace=True, errors='ignore')
         wait_df["順位"] = range(1, len(wait_df) + 1)
         if wait_top is not None:
             wait_df = wait_df.head(int(wait_top)).copy()
