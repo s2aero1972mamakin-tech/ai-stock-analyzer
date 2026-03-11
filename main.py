@@ -18,7 +18,7 @@ def render_cards_selected(df: pd.DataFrame):
         strat = r.get("推奨方式","")
         title = f"{sym} / {strat}"
         items = []
-        for k in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","推奨株数","推奨投資額(円)","想定損失(円)","発注不可理由","総合スコア"]:
+        for k in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","価格更新状態","再計算失敗フラグ","推奨株数","推奨投資額(円)","想定損失(円)","発注不可理由","総合スコア"]:
             if k in df.columns:
                 v = r.get(k)
                 items.append(f"{k}:{v}")
@@ -77,16 +77,16 @@ def prepare_selected_view(df: pd.DataFrame) -> pd.DataFrame:
     for k,v in list(col_map.items()):
         if k in df.columns and v not in df.columns:
             df[v] = df[k]
-    for v in ["銘柄","企業名","セクター","発注単位","現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由"]:
+    for v in ["銘柄","企業名","セクター","発注単位","現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","価格更新状態","再計算失敗フラグ","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由"]:
         if v not in df.columns:
             df[v] = None
-    show_cols = ["順位","銘柄","企業名","セクター","推奨方式","発注単位","現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","Entry状態","発注不可理由"]
+    show_cols = ["順位","銘柄","企業名","セクター","推奨方式","発注単位","現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","価格更新状態","再計算失敗フラグ","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","Entry状態","発注不可理由"]
     df = df[show_cols]
     try:
         for c in ["企業名","セクター","推奨方式","発注単位","Entry状態","発注不可理由"]:
             if c in df.columns:
                 df[c] = (df[c].astype(str).replace(["None","none","nan","NaN",""], "不明" if c in ["企業名","セクター"] else "").str.strip())
-        for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","推奨投資額(円)","想定損失(円)","総合スコア"]:
+        for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","再計算失敗フラグ","推奨投資額(円)","想定損失(円)","総合スコア"]:
             df[c] = pd.to_numeric(df[c], errors="coerce").round(4)
     except Exception:
         pass
@@ -387,7 +387,13 @@ if run_scan:
             pass
 
         try:
-            now_df, wait_df = logic.split_live_rankings(df, now_top=20, wait_top=20)
+            now_df, wait_df = logic.split_live_rankings(
+                df,
+                now_top=10,
+                wait_top=20,
+                now_rr_min=1.00,
+                chase_rr_min=1.15,
+            )
         except Exception:
             now_df, wait_df = pd.DataFrame(), pd.DataFrame()
 
@@ -426,7 +432,7 @@ if st.session_state.get("scan_results_ready", False):
 
     render_selected_section(
         "🏆 AI最終選定銘柄（ライブ再計算後・全20件）",
-        "ライブ再計算後の総合表です。S株の成行制約を踏まえた『今すぐ発注』と『押し目待ち』は下の分割表を見てください。",
+        "ライブ再計算後の総合表です。価格未更新銘柄には警告フラグを付け、今すぐ発注の抽出からは除外しています。",
         df_view,
         mobile_mode,
         show_top_n,
@@ -435,7 +441,7 @@ if st.session_state.get("scan_results_ready", False):
 
     render_selected_section(
         "🟢 今すぐ発注ランキング",
-        "S株の成行発注や、単元株の即時発注向けです。『発注圏 / 追随可』のみを抽出し、実質RR寄りで並べています。",
+        "S株の成行発注や、単元株の即時発注向けです。価格更新成功かつ実質RR>=1.00を基本条件にし、発注圏を強く優遇して上位10件まで表示します。追随可は実質RR>=1.15に限定しています。",
         now_view,
         mobile_mode,
         show_top_n,
@@ -461,7 +467,7 @@ if st.session_state.get("scan_results_ready", False):
 
     render_guide_section(
         "🧭 押し目待ちの価格目安（Entry/SL/TP）",
-        "今は飛びつかず監視したい候補です。S株成行より単元株の待機候補が向いています。",
+        "今は飛びつかず監視したい候補です。S株成行より単元株の待機候補が向いています。価格未更新銘柄は今すぐ発注から外れ、総合表の警告列で確認できます。",
         wait_guide,
         mobile_mode,
         show_top_n,
