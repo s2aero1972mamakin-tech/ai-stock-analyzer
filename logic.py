@@ -2058,10 +2058,97 @@ def dynamic_tp_engine(entry, atr):
 
 
 
+
+def _recalc_live_execution_plan(df_plan: pd.DataFrame, capital_total: float = 300000.0, max_positions: int = 1) -> pd.DataFrame:
+    """ライブ再計算後の順位に対して、発注単位/株数/投資額/損失を再計算する。"""
+    import numpy as np
+    import pandas as pd
+
+    if df_plan is None or len(df_plan) == 0:
+        return df_plan
+
+    out = df_plan.copy()
+    risk_budget = float(capital_total) * 0.01
+    budget_per_pos = float(capital_total) / max(int(max_positions), 1)
+
+    shares_list = []
+    invest_list = []
+    loss_list = []
+    reason_list = []
+    unit_list = []
+    rr_list = []
+
+    for _, r in out.iterrows():
+        entry = float(pd.to_numeric(pd.Series([r.get("Entry目安", r.get("現在値（終値）", 0))]), errors="coerce").fillna(0).iloc[0])
+        sl = float(pd.to_numeric(pd.Series([r.get("SL目安", 0)]), errors="coerce").fillna(0).iloc[0])
+        tp = float(pd.to_numeric(pd.Series([r.get("TP目安", 0)]), errors="coerce").fillna(0).iloc[0])
+
+        risk_per_share = max(entry - sl, 0.0)
+        shares = 0
+        invest = 0.0
+        loss = 0.0
+        reason = ""
+        unit = "S株"
+
+        if entry <= 0 or sl <= 0 or tp <= 0:
+            reason = "エントリー未計算"
+        elif risk_per_share <= 0:
+            reason = "損切幅不正"
+        else:
+            shares_risk = int(risk_budget // risk_per_share)
+            shares_cap = int(budget_per_pos // entry) if entry > 0 else 0
+            shares100 = (min(shares_risk, shares_cap) // 100) * 100
+            shares1 = min(shares_risk, shares_cap)
+            if shares100 > 0:
+                shares = shares100
+                unit = "単元株"
+            else:
+                shares = shares1
+                unit = "S株"
+            invest = shares * entry
+            loss = shares * risk_per_share
+            if shares <= 0:
+                reason = "資金不足または単元未満"
+
+        rr = ((tp - entry) / risk_per_share) if (risk_per_share > 0 and tp > 0) else np.nan
+
+        shares_list.append(int(shares))
+        invest_list.append(float(invest))
+        loss_list.append(float(loss))
+        reason_list.append(reason)
+        unit_list.append(unit)
+        rr_list.append(float(rr) if np.isfinite(rr) else np.nan)
+
+    out["発注単位"] = unit_list
+    out["推奨株数"] = shares_list
+    out["推奨投資額(円)"] = np.round(invest_list, 0)
+    out["想定損失(円)"] = np.round(loss_list, 0)
+    out["発注不可理由"] = reason_list
+    out["RR"] = np.round(rr_list, 3)
+
+    if "最大保有" not in out.columns:
+        out["最大保有"] = "10営業日"
+    out["最大保有"] = out["最大保有"].fillna("10営業日").astype(str)
+    return out
+
+
+def build_live_linked_guide(df_selected: pd.DataFrame, max_rows: Optional[int] = None) -> pd.DataFrame:
+    """selected から live 再計算後の guide を作る。"""
+    import pandas as pd
+    if df_selected is None or len(df_selected) == 0:
+        return pd.DataFrame(columns=["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"])
+
+    cols = [c for c in ["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"] if c in df_selected.columns]
+    guide = df_selected[cols].copy()
+    if max_rows is not None:
+        guide = guide.head(int(max_rows)).copy()
+    return guide
+
+
 # -------------------------------
 # Live price refresh for top N
 # -------------------------------
-def refresh_topn_prices_and_recalc(df_selected, top_n=20, tp_atr=1.5, sl_atr=1.0):
+def refresh_topn_prices_and_recalc(df_selected, top_n=20, tp_atr=1.5, sl_atr=1.0, capital_total=300000.0, max_positions=1):
     """上位N銘柄だけ現在値を再取得し、
     - 現在値基準で Entry/TP/SL を再計算
     - 元のTP/SLに対する 実質RR を算出
@@ -2224,6 +2311,9 @@ def refresh_topn_prices_and_recalc(df_selected, top_n=20, tp_atr=1.5, sl_atr=1.0
         ascending.append(False)
     work = work.sort_values(sort_cols, ascending=ascending, na_position='last').reset_index(drop=True)
     work["順位"] = np.arange(1, len(work) + 1)
+
+    # ライブ順位に完全連動した発注計画を再計算
+    work = _recalc_live_execution_plan(work, capital_total=float(capital_total), max_positions=int(max_positions))
 
     # 元の out に topN 部分を置き換え、最後に topN だけ返す
     tail = out.iloc[int(top_n):].copy() if len(out) > int(top_n) else out.iloc[0:0].copy()
