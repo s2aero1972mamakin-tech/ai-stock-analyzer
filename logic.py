@@ -2174,6 +2174,7 @@ def refresh_topn_prices_and_recalc(
     max_positions=1,
     effective_rr_floor=1.0,
     chase_rr_floor=1.15,
+    wait_rr_floor=0.90,
 ):
     """上位N銘柄だけ現在値を再取得し、
     - 現在値基準で Entry/TP/SL を再計算
@@ -2182,6 +2183,10 @@ def refresh_topn_prices_and_recalc(
     - ライブ再計算後スコアで再ランキング
     - 価格未更新銘柄を強警告＋大幅減点
     して返す。
+
+    運用意図:
+    - selected_now は厳格維持（発注圏/追随可のRR条件は厳しめ）
+    - その一方で、押し目や監視候補は selected_wait に残しやすくする
     """
     import yfinance as yf
     import pandas as pd
@@ -2267,6 +2272,8 @@ def refresh_topn_prices_and_recalc(
 
     rr_floor = float(effective_rr_floor) if np.isfinite(effective_rr_floor) else 1.0
     chase_floor = max(rr_floor, float(chase_rr_floor) if np.isfinite(chase_rr_floor) else rr_floor)
+    wait_floor = min(rr_floor, float(wait_rr_floor) if np.isfinite(wait_rr_floor) else 0.90)
+    wait_floor = max(wait_floor, 0.0)
 
     def _status_from_live(current, old_entry, old_tp, effective_rr, live_price_ok):
         if not live_price_ok:
@@ -2275,24 +2282,39 @@ def refresh_topn_prices_and_recalc(
             return "不明"
         if np.isfinite(old_tp) and current >= old_tp * 0.995:
             return "見送り（利確圏）"
-        if np.isfinite(effective_rr) and effective_rr < rr_floor:
-            return "見送り（利幅薄い）"
+
+        dev = np.nan
         if np.isfinite(old_entry) and old_entry > 0:
             dev = (current / old_entry) - 1.0
-            if abs(dev) <= 0.003 and (not np.isfinite(effective_rr) or effective_rr >= rr_floor):
-                return "発注圏"
-            if 0.003 < dev <= 0.02 and (not np.isfinite(effective_rr) or effective_rr >= chase_floor):
-                return "追随可"
-            if dev < -0.003:
+
+        rr_ok_now = (not np.isfinite(effective_rr)) or (effective_rr >= rr_floor)
+        rr_ok_chase = (not np.isfinite(effective_rr)) or (effective_rr >= chase_floor)
+        rr_ok_wait = (not np.isfinite(effective_rr)) or (effective_rr >= wait_floor)
+
+        # 押し目は「今すぐ候補」にしない一方で、監視候補としては残しやすくする。
+        if np.isfinite(dev) and dev < -0.003:
+            if rr_ok_wait:
                 return "押し目待ち"
+            return "見送り（利幅薄い）"
+
+        if np.isfinite(dev):
+            if abs(dev) <= 0.003 and rr_ok_now:
+                return "発注圏"
+            if 0.003 < dev <= 0.02 and rr_ok_chase:
+                return "追随可"
+            if -0.003 <= dev <= 0.02 and rr_ok_wait:
+                return "様子見"
+
+        if np.isfinite(effective_rr) and effective_rr < wait_floor:
+            return "見送り（利幅薄い）"
         return "様子見"
 
     def _status_bonus(s):
         return {
             "発注圏": 0.18,
             "追随可": 0.03,
-            "押し目待ち": 0.00,
-            "様子見": -0.03,
+            "押し目待ち": 0.01,
+            "様子見": -0.01,
             "見送り（利幅薄い）": -0.16,
             "見送り（利確圏）": -0.18,
             "見送り（価格未更新）": -0.60,
@@ -2401,12 +2423,14 @@ def refresh_topn_prices_and_recalc(
 
 
 
+
 def split_live_rankings(
     df_selected: pd.DataFrame,
     now_top: int = 10,
     wait_top: int = 20,
     now_rr_min: float = 1.00,
     chase_rr_min: float = 1.15,
+    wait_rr_min: float = 0.90,
 ):
     """ライブ再計算後の selected を
     - 今すぐ発注ランキング（発注圏/追随可）
@@ -2417,6 +2441,11 @@ def split_live_rankings(
     - 見送り系/価格未更新/発注不可理由ありは除外
     - 発注圏でも 実質RR >= now_rr_min
     - 追随可は 実質RR >= chase_rr_min
+
+    一方で wait 側は、押し目・監視候補を残すため
+    - 押し目待ち/様子見
+    - 実質RR >= wait_rr_min
+    を条件に抽出する。
     """
     import pandas as pd
     import numpy as np
@@ -2438,6 +2467,8 @@ def split_live_rankings(
 
     rr_floor = float(now_rr_min) if np.isfinite(now_rr_min) else 1.0
     chase_floor = max(rr_floor, float(chase_rr_min) if np.isfinite(chase_rr_min) else rr_floor)
+    wait_floor = min(rr_floor, float(wait_rr_min) if np.isfinite(wait_rr_min) else 0.90)
+    wait_floor = max(wait_floor, 0.0)
 
     status = work["Entry状態"].astype(str).fillna("")
     unit = work["発注単位"].astype(str).fillna("")
@@ -2454,7 +2485,7 @@ def split_live_rankings(
         ((status == "発注圏") & (rr >= rr_floor))
         | ((status == "追随可") & (rr >= chase_floor))
     )
-    wait_mask = actionable & status.isin(["押し目待ち", "様子見"])
+    wait_mask = actionable & status.isin(["押し目待ち", "様子見"]) & (rr >= wait_floor)
 
     now_df = work[now_mask].copy()
     wait_df = work[wait_mask].copy()
@@ -2492,11 +2523,36 @@ def split_live_rankings(
             now_df = now_df.head(int(now_top)).copy()
 
     if len(wait_df):
-        wait_df["_unit_priority"] = np.where(unit.loc[wait_df.index].astype(str).eq("単元株"), 1, 0)
-        wait_df = wait_df.sort_values(["_unit_priority", "実質RR", "総合スコア"], ascending=[False, False, False], na_position='last').reset_index(drop=True)
-        wait_df.drop(columns=["_unit_priority"], inplace=True, errors='ignore')
+        def _norm01(s):
+            s = pd.to_numeric(s, errors='coerce')
+            if len(s.dropna()) == 0:
+                return pd.Series([0.0] * len(s), index=s.index, dtype=float)
+            smin = float(s.min())
+            smax = float(s.max())
+            if not np.isfinite(smin) or not np.isfinite(smax) or abs(smax - smin) < 1e-12:
+                return pd.Series([0.5] * len(s), index=s.index, dtype=float)
+            return ((s - smin) / (smax - smin)).clip(0.0, 1.0)
+
+        rr_norm = _norm01(wait_df["実質RR"].fillna(0.0))
+        base_norm = _norm01(wait_df["総合スコア"].fillna(0.0))
+        status_priority = wait_df["Entry状態"].astype(str).map({"押し目待ち": 1.00, "様子見": 0.55}).fillna(0.0)
+        unit_bonus = wait_df["発注単位"].astype(str).map({"単元株": 0.08, "S株": 0.00}).fillna(0.0)
+
+        wait_df["監視スコア"] = (
+            0.42 * rr_norm
+            + 0.28 * base_norm
+            + 0.25 * status_priority
+            + 0.05 * unit_bonus
+        )
+
+        wait_df = wait_df.sort_values(
+            ["監視スコア", "Entry状態", "実質RR", "総合スコア"],
+            ascending=[False, True, False, False],
+            na_position='last'
+        ).reset_index(drop=True)
         wait_df["順位"] = range(1, len(wait_df) + 1)
         if wait_top is not None:
             wait_df = wait_df.head(int(wait_top)).copy()
 
     return now_df, wait_df
+
