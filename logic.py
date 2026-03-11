@@ -2358,9 +2358,33 @@ def split_live_rankings(df_selected: pd.DataFrame, now_top: int = 20, wait_top: 
     now_df = work[now_mask].copy()
     wait_df = work[wait_mask].copy()
 
-    # 今すぐ発注: 総合スコアと実質RRを優先
+    # 今すぐ発注: 実質RR寄りの合成スコアで再ランキング
     if len(now_df):
-        now_df = now_df.sort_values(["総合スコア", "実質RR"], ascending=[False, False], na_position='last').reset_index(drop=True)
+        def _norm01(s):
+            s = pd.to_numeric(s, errors='coerce')
+            if len(s.dropna()) == 0:
+                return pd.Series([0.0] * len(s), index=s.index, dtype=float)
+            smin = float(s.min())
+            smax = float(s.max())
+            if not np.isfinite(smin) or not np.isfinite(smax) or abs(smax - smin) < 1e-12:
+                return pd.Series([0.5] * len(s), index=s.index, dtype=float)
+            return ((s - smin) / (smax - smin)).clip(0.0, 1.0)
+
+        base_norm = _norm01(now_df["総合スコア"])
+        rr_norm = _norm01(now_df["実質RR"].fillna(0.0))
+        status_bonus = now_df["Entry状態"].astype(str).map({"発注圏": 1.0, "追随可": 0.6}).fillna(0.0)
+
+        now_df["今すぐ発注スコア"] = (
+            0.45 * base_norm
+            + 0.40 * rr_norm
+            + 0.15 * status_bonus
+        )
+
+        now_df = now_df.sort_values(
+            ["今すぐ発注スコア", "実質RR", "総合スコア"],
+            ascending=[False, False, False],
+            na_position='last'
+        ).reset_index(drop=True)
         now_df["順位"] = range(1, len(now_df) + 1)
         if now_top is not None:
             now_df = now_df.head(int(now_top)).copy()
