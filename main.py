@@ -54,6 +54,97 @@ def render_cards_guide(df: pd.DataFrame):
             unsafe_allow_html=True,
         )
 
+
+def prepare_selected_view(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or len(df) == 0:
+        return pd.DataFrame()
+    df = df.copy().reset_index(drop=True)
+    if "銘柄" in df.columns and "symbol" not in df.columns: df["symbol"] = df["銘柄"]
+    if "銘柄名" in df.columns and "name" not in df.columns: df["name"] = df["銘柄名"]
+    if "name" in df.columns and "企業名" not in df.columns: df["企業名"] = df["name"]
+    if "セクター" in df.columns and "sector33_name" not in df.columns: df["sector33_name"] = df["セクター"]
+    if "推奨方式" in df.columns and "strategy_name" not in df.columns: df["strategy_name"] = df["推奨方式"]
+    if "総合スコア" in df.columns and "final_score" not in df.columns: df["final_score"] = df["総合スコア"]
+    if "順位" in df.columns:
+        df = df.drop(columns=["順位"])
+    df.insert(0, "順位", range(1, len(df)+1))
+    col_map = {
+        "symbol":"銘柄",
+        "sector33_name":"セクター",
+        "final_score":"総合スコア",
+        "strategy_name":"推奨方式",
+    }
+    for k,v in list(col_map.items()):
+        if k in df.columns and v not in df.columns:
+            df[v] = df[k]
+    for v in ["銘柄","企業名","セクター","発注単位","現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由"]:
+        if v not in df.columns:
+            df[v] = None
+    show_cols = ["順位","銘柄","企業名","セクター","推奨方式","発注単位","現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","Entry状態","発注不可理由"]
+    df = df[show_cols]
+    try:
+        for c in ["企業名","セクター","推奨方式","発注単位","Entry状態","発注不可理由"]:
+            if c in df.columns:
+                df[c] = (df[c].astype(str).replace(["None","none","nan","NaN",""], "不明" if c in ["企業名","セクター"] else "").str.strip())
+        for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","推奨投資額(円)","想定損失(円)","総合スコア"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce").round(4)
+    except Exception:
+        pass
+    return df
+
+
+def render_selected_section(title: str, caption: str, df: pd.DataFrame, mobile_mode: bool, show_top_n: int, download_name: str | None = None):
+    st.subheader(title)
+    st.caption(caption)
+    if isinstance(df, pd.DataFrame) and len(df):
+        if mobile_mode:
+            render_cards_selected(df.head(show_top_n))
+            with st.expander("表で見る（PC向け）", expanded=False):
+                st.dataframe(df, width="stretch")
+        else:
+            st.dataframe(df, width="stretch")
+        if download_name:
+            st.download_button(
+                f"⬇️ {download_name}",
+                data=df.to_csv(index=False).encode("utf-8-sig"),
+                file_name=download_name,
+                mime="text/csv",
+                use_container_width=True,
+            )
+    else:
+        st.info("該当銘柄がありません。")
+
+
+def prepare_guide_view(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
+    guide = logic.build_live_linked_guide(df, max_rows=max_rows) if isinstance(df, pd.DataFrame) and len(df) else pd.DataFrame()
+    if isinstance(guide, pd.DataFrame) and len(guide):
+        try:
+            for c in ["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]:
+                if c not in guide.columns:
+                    guide[c] = None
+            guide = guide[["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]]
+            for c in ["企業名","セクター","推奨方式","発注単位","Entry状態"]:
+                guide[c] = (guide[c].astype(str).replace(["None","none","nan","NaN",""], "不明" if c in ["企業名","セクター"] else "").str.strip())
+            guide = guide.head(int(max_rows)).reset_index(drop=True)
+            guide.insert(0, "順位", range(1, len(guide)+1))
+        except Exception:
+            pass
+    return guide
+
+
+def render_guide_section(title: str, caption: str, guide: pd.DataFrame, mobile_mode: bool, show_top_n: int):
+    st.subheader(title)
+    st.caption(caption)
+    if isinstance(guide, pd.DataFrame) and len(guide):
+        if mobile_mode:
+            render_cards_guide(guide.head(show_top_n))
+            with st.expander("表で見る（PC向け）", expanded=False):
+                st.dataframe(guide, width="stretch")
+        else:
+            st.dataframe(guide, width="stretch")
+    else:
+        st.info("価格目安の生成に必要なデータが不足しています。")
+
 st.set_page_config(page_title="JPX Swing AI", layout="wide")
 
 # ---- スマホ最適化CSS（Streamlit Cloudでも効く）----
@@ -275,113 +366,64 @@ if run_scan:
         with st.expander("📊 診断（JSON）", expanded=False):
             st.json(diag)
         # セクター強度ランキングはバックエンド利用のみ（UI非表示）
+        # 全体ランキング（ライブ再計算後）
+        df_view = prepare_selected_view(df)
+        render_selected_section(
+            "🏆 AI最終選定銘柄（ライブ再計算後・全20件）",
+            "ライブ再計算後の総合表です。S株の成行制約を踏まえた『今すぐ発注』と『押し目待ち』は下の分割表を見てください。",
+            df_view,
+            mobile_mode,
+            show_top_n,
+            "selected_live_top20.csv",
+        )
 
-        st.subheader("🏆 AI最終選定銘柄（利確スコア統合）")
-        st.caption("どれを買うか？（利確評価＋資金効率でランキング）")
-        st.caption("※ここは **Stage2（固定TP/SL/最大保有）で“利確が再現しやすい順”** に並べた最終ランキングです。")
-        df = out.get("selected")
-
-        # --- Live refresh for top 20 ---
+        # 今すぐ発注 / 押し目待ち を分割
         try:
-            df = logic.refresh_topn_prices_and_recalc(df, top_n=20, capital_total=float(capital_total), max_positions=int(max_positions))
+            now_df, wait_df = logic.split_live_rankings(df, now_top=20, wait_top=20)
         except Exception:
-            pass
+            now_df, wait_df = pd.DataFrame(), pd.DataFrame()
 
-        # limit display to top 20
-        df = df.head(20)
+        now_view = prepare_selected_view(now_df)
+        wait_view = prepare_selected_view(wait_df)
 
-        # --- column bridge (logic.py output may use JP labels) ---
-        if isinstance(df, pd.DataFrame) and len(df):
-            if "銘柄" in df.columns and "symbol" not in df.columns: df["symbol"] = df["銘柄"]
-            if "銘柄名" in df.columns and "name" not in df.columns: df["name"] = df["銘柄名"]
-            if "name" in df.columns and "企業名" not in df.columns: df["企業名"] = df["name"]
-            if "セクター" in df.columns and "sector33_name" not in df.columns: df["sector33_name"] = df["セクター"]
-            if "3ヶ月リターン" in df.columns and "RET_3M" not in df.columns: df["RET_3M"] = df["3ヶ月リターン"]
-            if "WF勝率（OOS）" in df.columns and "wf_oos_wr" not in df.columns: df["wf_oos_wr"] = df["WF勝率（OOS）"]
-            if "WF損益比RR（OOS）" in df.columns and "wf_oos_rr" not in df.columns: df["wf_oos_rr"] = df["WF損益比RR（OOS）"]
-            if "MC DD 5%（推定）" in df.columns and "mc_dd5" not in df.columns: df["mc_dd5"] = df["MC DD 5%（推定）"]
-            if "Kelly最適化（f）" in df.columns and "kelly_f" not in df.columns: df["kelly_f"] = df["Kelly最適化（f）"]
-            if "AIトレンド" in df.columns and "trend_score" not in df.columns: df["trend_score"] = df["AIトレンド"]
-            if "推奨方式" in df.columns and "strategy_name" not in df.columns: df["strategy_name"] = df["推奨方式"]
-            if "総合スコア" in df.columns and "final_score" not in df.columns: df["final_score"] = df["総合スコア"]
-        if isinstance(df, pd.DataFrame) and len(df):
-            df = df.reset_index(drop=True)
-            if "順位" in df.columns:
+        render_selected_section(
+            "🟢 今すぐ発注ランキング",
+            "S株の成行発注や、単元株の即時発注向けです。『発注圏 / 追随可』のみを抽出しています。",
+            now_view,
+            mobile_mode,
+            show_top_n,
+            "selected_now.csv",
+        )
 
-                df = df.drop(columns=["順位"])
+        render_selected_section(
+            "🟡 押し目待ちランキング",
+            "S株の成行では飛びつきにくい候補です。単元株をやや優先して並べています。",
+            wait_view,
+            mobile_mode,
+            show_top_n,
+            "selected_wait.csv",
+        )
 
-            df.insert(0, "順位", range(1, len(df)+1))
-            # 表示列を必要最低限に絞る（スマホ前提）
-            col_map = {
-                "symbol":"銘柄",
-                "sector33_name":"セクター",
-                "RET_3M":"3ヶ月リターン",
-                "wf_oos_wr":"WF勝率（OOS）",
-                "wf_oos_rr":"WF損益比RR（OOS）",
-                "mc_dd5":"MC DD 5%（推定）",
-                "final_score":"総合スコア",
-                "strategy_name":"推奨方式",
-            }
-            for k,v in list(col_map.items()):
-                if k in df.columns and v not in df.columns:
-                    df[v] = df[k]
-            # 列が無い場合は作る（落ちない）
-            for v in ["銘柄","企業名","セクター","発注単位","現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","推奨方式","Entry状態","発注不可理由"]:
-                if v not in df.columns:
-                    df[v] = None
-            show_cols = ["順位","銘柄","企業名","セクター","推奨方式","発注単位","現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","Entry状態","発注不可理由"]
-            df = df[show_cols]
-            try:
-                for c in ["企業名","セクター","推奨方式","発注単位","Entry状態","発注不可理由"]:
-                    if c in df.columns:
-                        df[c] = (df[c].astype(str).replace(["None","none","nan","NaN",""], "不明" if c in ["企業名","セクター"] else "").str.strip())
-                for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","推奨投資額(円)","想定損失(円)","総合スコア"]:
-                    df[c] = pd.to_numeric(df[c], errors="coerce").round(4)
-            except Exception:
-                pass
+        # guide も分割
+        now_guide = prepare_guide_view(now_view, max_rows=int(max_positions))
+        wait_guide = prepare_guide_view(wait_view, max_rows=min(10, len(wait_view)) if isinstance(wait_view, pd.DataFrame) else 10)
 
+        render_guide_section(
+            "🧭 今すぐ発注の価格目安（Entry/SL/TP）",
+            "成行発注を前提に、今の価格で使いやすい候補だけを表示します。",
+            now_guide,
+            mobile_mode,
+            show_top_n,
+        )
 
-            if mobile_mode:
-                render_cards_selected(df.head(show_top_n))
-                with st.expander("表で見る（PC向け）", expanded=False):
-                    st.dataframe(df, width="stretch")
-            else:
-                st.dataframe(df, width="stretch")
+        render_guide_section(
+            "🧭 押し目待ちの価格目安（Entry/SL/TP）",
+            "今は飛びつかず監視したい候補です。S株成行より単元株の待機候補が向いています。",
+            wait_guide,
+            mobile_mode,
+            show_top_n,
+        )
 
-            st.download_button(
-                "⬇️ 選定結果をCSVでダウンロード",
-                data=df.to_csv(index=False).encode("utf-8-sig"),
-                file_name="selected.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        else:
-            st.warning("選定結果が空です（DB更新不足・フィルタが厳しすぎる可能性）")
-
-        st.subheader("🧭 推奨方式と価格目安（Entry/SL/TP）")
-        st.caption("どう買うか？（Entry/SL/TP と最大保有日数の具体案）")
-        guide = logic.build_live_linked_guide(df, max_rows=20) if isinstance(df, pd.DataFrame) and len(df) else out.get("guide")
-        if isinstance(guide, pd.DataFrame) and len(guide):
-            try:
-                for c in ["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]:
-                    if c not in guide.columns:
-                        guide[c] = None
-                guide = guide[["銘柄","企業名","セクター","推奨方式","発注単位","推奨株数","推奨投資額(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]]
-                for c in ["企業名","セクター","推奨方式","発注単位","Entry状態"]:
-                    guide[c] = (guide[c].astype(str).replace(["None","none","nan","NaN",""], "不明" if c in ["企業名","セクター"] else "").str.strip())
-                guide = guide.head(int(max_positions))
-            except Exception:
-                pass
-            guide = guide.reset_index(drop=True)
-            guide.insert(0, "順位", range(1, len(guide)+1))
-            if mobile_mode:
-                render_cards_guide(guide.head(show_top_n))
-                with st.expander("表で見る（PC向け）", expanded=False):
-                    st.dataframe(guide, width="stretch")
-            else:
-                st.dataframe(guide, width="stretch")
-        else:
-            st.info("価格目安の生成に必要なデータが不足しています。")
 
     except Exception:
         st.error("スキャン中にエラーが発生しました")
