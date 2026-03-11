@@ -366,7 +366,23 @@ if run_scan:
         with st.expander("📊 診断（JSON）", expanded=False):
             st.json(diag)
         # セクター強度ランキングはバックエンド利用のみ（UI非表示）
-        # 全体ランキング（ライブ再計算後）
+
+        # 元の selected を取得
+        df = out.get("selected")
+        if not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame()
+
+        # ライブ再計算後の全体ランキング（上位20）
+        try:
+            df = logic.refresh_topn_prices_and_recalc(
+                df,
+                top_n=20,
+                capital_total=float(capital_total),
+                max_positions=int(max_positions),
+            )
+        except Exception:
+            pass
+
         df_view = prepare_selected_view(df)
         render_selected_section(
             "🏆 AI最終選定銘柄（ライブ再計算後・全20件）",
