@@ -2366,9 +2366,9 @@ def _split_live_rankings_core(
     now_top: int = 10,
     wait_top: int = 20,
     now_rr_min: float = 1.00,
-    chase_rr_min: float = 1.40,
+    chase_rr_min: float = 1.45,
     wait_rr_min: float = 0.90,
-    s_now_rr_min: float = 1.35,
+    s_now_rr_min: float = 1.50,
     s_now_max: int = 1,
     chase_now_max: int = 1,
     recompute_priority: bool = True,
@@ -2380,21 +2380,36 @@ def _split_live_rankings_core(
     if df_selected is None or len(df_selected) == 0:
         return empty, empty
 
-    work = _compute_live_execution_priority(df_selected, strict_chase_rr=float(chase_rr_min), strict_s_rr=float(s_now_rr_min)).copy() if recompute_priority else df_selected.copy()
-    for c in ["Entry状態", "発注単位", "発注不可理由", "価格更新状態", "再計算失敗フラグ", "売買優先区分", "単元予算可否", "単元推奨可否", "単元株可否", "実行優先帯"]:
+    work = _compute_live_execution_priority(
+        df_selected,
+        strict_chase_rr=float(chase_rr_min),
+        strict_s_rr=float(s_now_rr_min),
+    ).copy() if recompute_priority else df_selected.copy()
+
+    for c in [
+        "Entry状態", "発注単位", "発注不可理由", "価格更新状態", "再計算失敗フラグ",
+        "売買優先区分", "単元予算可否", "単元推奨可否", "単元株可否", "実行優先帯"
+    ]:
         if c not in work.columns:
             work[c] = ""
-    for c in ["Entry状態", "発注単位", "発注不可理由", "価格更新状態", "売買優先区分", "単元予算可否", "単元推奨可否", "単元株可否", "実行優先帯"]:
+    for c in [
+        "Entry状態", "発注単位", "発注不可理由", "価格更新状態",
+        "売買優先区分", "単元予算可否", "単元推奨可否", "単元株可否", "実行優先帯"
+    ]:
         work[c] = work[c].astype(str).replace(["nan", "None"], "")
-    for c in ["実質RR", "総合スコア", "推奨投資額(円)", "想定損失(円)", "推奨株数", "再計算失敗フラグ", "単元必要資金(円)", "単元想定損失(円)", "実行優先度", "実行優先スコア"]:
+
+    for c in [
+        "実質RR", "総合スコア", "推奨投資額(円)", "想定損失(円)", "推奨株数",
+        "再計算失敗フラグ", "単元必要資金(円)", "単元想定損失(円)", "実行優先度", "実行優先スコア"
+    ]:
         if c not in work.columns:
             work[c] = np.nan
         work[c] = pd.to_numeric(work[c], errors='coerce')
 
-    rr_floor = float(now_rr_min) if np.isfinite(now_rr_min) else 1.0
-    chase_floor = max(rr_floor, float(chase_rr_min) if np.isfinite(chase_rr_min) else 1.40)
+    rr_floor = float(now_rr_min) if np.isfinite(now_rr_min) else 1.00
+    chase_floor = max(rr_floor, float(chase_rr_min) if np.isfinite(chase_rr_min) else 1.45)
     wait_floor = float(wait_rr_min) if np.isfinite(wait_rr_min) else min(rr_floor, 0.90)
-    s_floor = max(rr_floor, float(s_now_rr_min) if np.isfinite(s_now_rr_min) else 1.35)
+    s_floor = max(rr_floor, float(s_now_rr_min) if np.isfinite(s_now_rr_min) else 1.50)
     s_limit = max(int(s_now_max or 0), 0)
     chase_limit = max(int(chase_now_max or 0), 0)
 
@@ -2435,8 +2450,10 @@ def _split_live_rankings_core(
         used_idx.update(core_take.index.tolist())
 
     remaining_slots = max(int(now_top) - sum(len(x) for x in now_frames), 0) if now_top is not None else None
+    has_any_core = sum(len(x) for x in now_frames) > 0
 
-    if s_limit > 0 and (remaining_slots is None or remaining_slots > 0):
+    # S株例外は「単元株の発注圏が無い時のみ」最大1件に限定
+    if (not has_any_core) and s_limit > 0 and (remaining_slots is None or remaining_slots > 0):
         s_candidates = _sort_candidates(work.loc[s_now_mask & (~work.index.isin(list(used_idx)))].copy())
         if len(s_candidates):
             s_take_n = s_limit if remaining_slots is None else min(s_limit, remaining_slots)
@@ -2445,8 +2462,10 @@ def _split_live_rankings_core(
             used_idx.update(s_take.index.tolist())
             if remaining_slots is not None:
                 remaining_slots = max(remaining_slots - len(s_take), 0)
+            has_any_core = sum(len(x) for x in now_frames) > 0
 
-    if chase_limit > 0 and (remaining_slots is None or remaining_slots > 0):
+    # 追随可は「発注圏候補が0件の時のみ」最大1件に限定
+    if (not has_any_core) and chase_limit > 0 and (remaining_slots is None or remaining_slots > 0):
         chase_candidates = _sort_candidates(work.loc[unit_chase_mask & (~work.index.isin(list(used_idx)))].copy())
         if len(chase_candidates):
             chase_take_n = chase_limit if remaining_slots is None else min(chase_limit, remaining_slots)
@@ -2463,8 +2482,16 @@ def _split_live_rankings_core(
         & watchable_status
         & (rr >= wait_floor)
         & (band != "見送り")
+        & (~status.str.startswith("見送り"))
     )
     wait_df = work.loc[wait_mask].copy()
+
+    # symbol重複を排除（同一run内で同銘柄が now/wait に重ならないようにする）
+    if len(now_df) and "銘柄" in now_df.columns:
+        now_df = now_df.drop_duplicates(subset=["銘柄"], keep="first").copy()
+    if len(wait_df) and "銘柄" in wait_df.columns:
+        wait_df = wait_df.loc[~wait_df["銘柄"].isin(now_df.get("銘柄", pd.Series(dtype=str)).astype(str))].copy()
+        wait_df = wait_df.drop_duplicates(subset=["銘柄"], keep="first").copy()
 
     if len(now_df):
         def _norm01(s: pd.Series) -> pd.Series:
@@ -2478,14 +2505,14 @@ def _split_live_rankings_core(
         base_norm = _norm01(now_df["総合スコア"])
         rr_norm = _norm01(now_df["実質RR"].fillna(0.0))
         exec_norm = _norm01(now_df["実行優先スコア"].fillna(0.0))
-        status_bonus = now_df["Entry状態"].astype(str).map({"発注圏": 1.00, "追随可": -0.20}).fillna(0.0)
-        unit_bonus = now_df["発注単位"].astype(str).map({"単元株": 0.36, "S株": -0.08}).fillna(0.0)
-        priority_bonus = now_df["売買優先区分"].astype(str).map({"単元株主力候補": 0.24, "S株補助候補": -0.06}).fillna(0.0)
+        status_bonus = now_df["Entry状態"].astype(str).map({"発注圏": 1.20, "追随可": -0.40}).fillna(0.0)
+        unit_bonus = now_df["発注単位"].astype(str).map({"単元株": 0.42, "S株": -0.12}).fillna(0.0)
+        priority_bonus = now_df["売買優先区分"].astype(str).map({"単元株主力候補": 0.28, "S株補助候補": -0.10}).fillna(0.0)
 
         now_df["今すぐ発注スコア"] = (
-            0.46 * exec_norm
+            0.48 * exec_norm
             + 0.24 * rr_norm
-            + 0.10 * base_norm
+            + 0.08 * base_norm
             + 0.20 * status_bonus
             + unit_bonus
             + priority_bonus
@@ -2509,6 +2536,7 @@ def _split_live_rankings_core(
             wait_df = wait_df.head(int(wait_top)).copy()
 
     return now_df, wait_df
+
 
 
 def build_live_linked_guide(df_selected: pd.DataFrame, max_rows: Optional[int] = None) -> pd.DataFrame:
@@ -2794,13 +2822,13 @@ def build_live_execution_views(
     now_top: int = 10,
     wait_top: int = 20,
     now_rr_min: float = 1.00,
-    chase_rr_min: float = 1.40,
+    chase_rr_min: float = 1.45,
     wait_rr_min: float = 0.90,
-    s_now_rr_min: float = 1.35,
+    s_now_rr_min: float = 1.50,
     s_now_max: int = 1,
     chase_now_max: int = 1,
 ):
-    """selected_live_top20 / selected_now / selected_wait を同じ生成元DataFrameから再構成する。"""
+    """selected_live_top20 / selected_now / selected_wait を同一親DataFrame・同一スキーマで再構成する。"""
     import pandas as pd
     import numpy as np
 
@@ -2808,8 +2836,12 @@ def build_live_execution_views(
     if df_selected is None or len(df_selected) == 0:
         return empty, empty, empty
 
-    work = _compute_live_execution_priority(df_selected, strict_chase_rr=float(chase_rr_min), strict_s_rr=float(s_now_rr_min)).copy()
-    work = work.reset_index().rename(columns={"index": "__source_idx__"})
+    work = _compute_live_execution_priority(
+        df_selected,
+        strict_chase_rr=float(chase_rr_min),
+        strict_s_rr=float(s_now_rr_min),
+    ).copy().reset_index(drop=True)
+    work["__row_id__"] = np.arange(len(work), dtype=int)
 
     now_raw, wait_raw = _split_live_rankings_core(
         work,
@@ -2824,12 +2856,17 @@ def build_live_execution_views(
         recompute_priority=False,
     )
 
-    used_idx = set()
-    for df_part in [now_raw, wait_raw]:
-        if isinstance(df_part, pd.DataFrame) and len(df_part) and "__source_idx__" in df_part.columns:
-            used_idx.update(pd.to_numeric(df_part["__source_idx__"], errors="coerce").dropna().astype(int).tolist())
+    def _row_ids(df_part: pd.DataFrame):
+        if not isinstance(df_part, pd.DataFrame) or len(df_part) == 0 or "__row_id__" not in df_part.columns:
+            return []
+        return pd.to_numeric(df_part["__row_id__"], errors="coerce").dropna().astype(int).tolist()
 
-    remainder = work.loc[~work["__source_idx__"].astype(int).isin(list(used_idx))].copy()
+    now_ids = _row_ids(now_raw)
+    wait_raw = wait_raw.loc[~wait_raw["__row_id__"].isin(now_ids)].copy() if isinstance(wait_raw, pd.DataFrame) and len(wait_raw) and "__row_id__" in wait_raw.columns else wait_raw
+    wait_ids = _row_ids(wait_raw)
+    used_ids = set(now_ids) | set(wait_ids)
+
+    remainder = work.loc[~work["__row_id__"].isin(list(used_ids))].copy()
     if len(remainder):
         for c in ["実行優先度", "実行優先スコア", "実質RR", "総合スコア"]:
             if c not in remainder.columns:
@@ -2840,15 +2877,24 @@ def build_live_execution_views(
             na_position="last",
         ).copy()
 
-    live_raw = pd.concat([now_raw, wait_raw, remainder], ignore_index=True, sort=False)
-    if live_top is not None:
-        live_raw = live_raw.head(int(live_top)).copy()
+    ordered_ids = now_ids + wait_ids + pd.to_numeric(remainder.get("__row_id__", pd.Series(dtype=float)), errors="coerce").dropna().astype(int).tolist()
+    ordered_ids = ordered_ids[: int(live_top)] if live_top is not None else ordered_ids
 
-    for df_part in [live_raw, now_raw, wait_raw]:
-        if isinstance(df_part, pd.DataFrame) and "__source_idx__" in df_part.columns:
-            df_part.drop(columns=["__source_idx__"], inplace=True, errors="ignore")
+    parent = work.set_index("__row_id__", drop=False)
+    live_raw = parent.loc[[i for i in ordered_ids if i in parent.index]].copy() if ordered_ids else work.iloc[0:0].copy()
+    now_raw = parent.loc[[i for i in now_ids if i in parent.index]].copy() if now_ids else work.iloc[0:0].copy()
+    wait_raw = parent.loc[[i for i in wait_ids if i in parent.index]].copy() if wait_ids else work.iloc[0:0].copy()
 
-    live_df = _standardize_live_output_schema(live_raw)
-    now_df = _standardize_live_output_schema(now_raw)
-    wait_df = _standardize_live_output_schema(wait_raw)
+    # 同一親DFから切り出した後に hidden key を落とし、完全に同一スキーマ化
+    live_df = _standardize_live_output_schema(live_raw.drop(columns=["__row_id__"], errors="ignore"))
+    now_df = _standardize_live_output_schema(now_raw.drop(columns=["__row_id__"], errors="ignore"))
+    wait_df = _standardize_live_output_schema(wait_raw.drop(columns=["__row_id__"], errors="ignore"))
+
+    # 念のため schema / overlap を再保証
+    if len(now_df) and len(wait_df) and "銘柄" in now_df.columns and "銘柄" in wait_df.columns:
+        wait_df = wait_df.loc[~wait_df["銘柄"].isin(now_df["銘柄"])].copy().reset_index(drop=True)
+        wait_df = wait_df.drop(columns=["順位"], errors="ignore")
+        wait_df.insert(0, "順位", range(1, len(wait_df) + 1))
+        wait_df = wait_df[[c for c in LIVE_OUTPUT_SCHEMA if c in wait_df.columns or c == "順位"]]
+
     return live_df, now_df, wait_df
