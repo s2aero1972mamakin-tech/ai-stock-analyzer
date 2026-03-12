@@ -93,6 +93,33 @@ def prepare_selected_view(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def prepare_execution_views_for_display(live_df: pd.DataFrame, now_df: pd.DataFrame, wait_df: pd.DataFrame):
+    live_view = prepare_selected_view(live_df)
+    now_view = prepare_selected_view(now_df)
+    wait_view = prepare_selected_view(wait_df)
+
+    common_cols = []
+    for df_part in [live_view, now_view, wait_view]:
+        if isinstance(df_part, pd.DataFrame):
+            for c in df_part.columns.tolist():
+                if c not in common_cols:
+                    common_cols.append(c)
+
+    if not common_cols:
+        return live_view, now_view, wait_view
+
+    out = []
+    for df_part in [live_view, now_view, wait_view]:
+        if not isinstance(df_part, pd.DataFrame):
+            df_part = pd.DataFrame()
+        df_part = df_part.copy()
+        for c in common_cols:
+            if c not in df_part.columns:
+                df_part[c] = None
+        out.append(df_part[common_cols])
+    return tuple(out)
+
+
 def render_selected_section(title: str, caption: str, df: pd.DataFrame, mobile_mode: bool, show_top_n: int, download_name: str | None = None):
     st.subheader(title)
     st.caption(caption)
@@ -392,18 +419,16 @@ if run_scan:
                 now_top=10,
                 wait_top=20,
                 now_rr_min=1.00,
-                chase_rr_min=1.40,
+                chase_rr_min=1.45,
                 wait_rr_min=0.90,
-                s_now_rr_min=1.35,
+                s_now_rr_min=1.50,
                 s_now_max=1,
                 chase_now_max=1,
             )
         except Exception:
             live_df, now_df, wait_df = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-        df_view = prepare_selected_view(live_df)
-        now_view = prepare_selected_view(now_df)
-        wait_view = prepare_selected_view(wait_df)
+        df_view, now_view, wait_view = prepare_execution_views_for_display(live_df, now_df, wait_df)
         now_guide = prepare_guide_view(now_view, max_rows=int(max_positions))
         wait_guide = prepare_guide_view(wait_view, max_rows=min(10, len(wait_view)) if isinstance(wait_view, pd.DataFrame) else 10)
 
@@ -436,7 +461,7 @@ if st.session_state.get("scan_results_ready", False):
 
     render_selected_section(
         "🏆 AI最終選定銘柄（ライブ再計算後・全20件）",
-        "selected_live_top20 / selected_now / selected_wait を同じ生成元DataFrameから再構成しています。単元株の発注圏→監視候補→補完候補の順で並べ、S株は補助候補として後ろへ寄せています。",
+        "selected_live_top20 / selected_now / selected_wait を同一親DataFrame・同一スキーマで生成しています。先頭は selected_now、次に重複なしの selected_wait、その後ろに残り候補を同じ実行優先順で並べています。",
         df_view,
         mobile_mode,
         show_top_n,
@@ -445,7 +470,7 @@ if st.session_state.get("scan_results_ready", False):
 
     render_selected_section(
         "🟢 今すぐ発注ランキング",
-        "単元株の発注圏を最優先にした即時発注候補です。追随可は原則 now に入れず、単元株でも実質RR>=1.40 の補完候補を最大1件までに限定します。S株は発注圏かつ実質RR>=1.35 の例外候補を最大1件までに抑えます。",
+        "単元株の発注圏を最優先にした即時発注候補です。追随可は、発注圏候補が0件のときに限り単元株の実質RR>=1.45を最大1件だけ補完します。S株例外も、単元株の発注圏が無い場合に限り実質RR>=1.50を最大1件だけ許可します。",
         now_view,
         mobile_mode,
         show_top_n,
@@ -454,7 +479,7 @@ if st.session_state.get("scan_results_ready", False):
 
     render_selected_section(
         "🟡 押し目待ちランキング",
-        "実行優先順で、単元株の監視候補を先頭に並べています。見送りはここに入れず、単元の補完候補や強いS株候補だけを監視候補として残します。",
+        "重複なし・見送りなしの監視候補です。selected_now に入らなかった単元株の監視候補を先頭に置き、強いS株候補は補助的に後ろへ残します。",
         wait_view,
         mobile_mode,
         show_top_n,
@@ -463,7 +488,7 @@ if st.session_state.get("scan_results_ready", False):
 
     render_guide_section(
         "🧭 今すぐ発注の価格目安（Entry/SL/TP）",
-        "単元株の発注圏を先頭に、厳格条件を満たした追随可だけを補助的に表示します。予算内可否と推奨可否も併せて確認できます。",
+        "単元株の発注圏を先頭に表示し、追随可は発注圏候補が無い場合の補完候補だけを表示します。予算内可否と推奨可否も併せて確認できます。",
         now_guide,
         mobile_mode,
         show_top_n,
