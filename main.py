@@ -18,7 +18,7 @@ def render_cards_selected(df: pd.DataFrame):
         strat = r.get("推奨方式","")
         title = f"{sym} / {strat}"
         items = []
-        for k in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","価格更新状態","価格更新メモ","再計算失敗フラグ","売買優先区分","実行優先帯","実行優先スコア","今すぐ発注スコア","単元予算可否","単元推奨可否","単元必要資金(円)","単元想定損失(円)","推奨株数","推奨投資額(円)","想定損失(円)","発注不可理由","総合スコア"]:
+        for k in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","価格更新状態","価格更新メモ","再計算失敗フラグ","売買優先区分","実行優先帯","実行優先スコア","今すぐ発注スコア","単元予算可否","単元推奨可否","単元必要資金(円)","単元想定損失(円)","推奨株数","推奨投資額(円)","想定損失(円)","発注不可理由","selected_now判定","selected_now除外理由","selected_now空理由集計","総合スコア"]:
             if k in df.columns:
                 v = r.get(k)
                 items.append(f"{k}:{v}")
@@ -57,7 +57,7 @@ def render_cards_guide(df: pd.DataFrame):
 
 def prepare_selected_view(df: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(df, pd.DataFrame) or len(df) == 0:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=getattr(logic, "LIVE_OUTPUT_SCHEMA", []))
     df = df.copy().reset_index(drop=True)
     if "銘柄" in df.columns and "symbol" not in df.columns: df["symbol"] = df["銘柄"]
     if "銘柄名" in df.columns and "name" not in df.columns: df["name"] = df["銘柄名"]
@@ -65,29 +65,25 @@ def prepare_selected_view(df: pd.DataFrame) -> pd.DataFrame:
     if "セクター" in df.columns and "sector33_name" not in df.columns: df["sector33_name"] = df["セクター"]
     if "推奨方式" in df.columns and "strategy_name" not in df.columns: df["strategy_name"] = df["推奨方式"]
     if "総合スコア" in df.columns and "final_score" not in df.columns: df["final_score"] = df["総合スコア"]
+    schema = list(getattr(logic, "LIVE_OUTPUT_SCHEMA", [])) or ["順位","銘柄"]
     if "順位" in df.columns:
-        df = df.drop(columns=["順位"])
+        df = df.drop(columns=["順位"], errors="ignore")
     df.insert(0, "順位", range(1, len(df)+1))
-    col_map = {
-        "symbol":"銘柄",
-        "sector33_name":"セクター",
-        "final_score":"総合スコア",
-        "strategy_name":"推奨方式",
-    }
+    col_map = {"symbol":"銘柄","sector33_name":"セクター","final_score":"総合スコア","strategy_name":"推奨方式"}
     for k,v in list(col_map.items()):
         if k in df.columns and v not in df.columns:
             df[v] = df[k]
-    for v in ["銘柄","企業名","セクター","推奨方式","売買優先区分","実行優先帯","実行優先度","実行優先スコア","今すぐ発注スコア","発注単位","単元予算可否","単元推奨可否","単元必要資金(円)","単元想定損失(円)","単元予算判定理由","単元推奨判定理由","現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","価格更新状態","価格更新メモ","再計算失敗フラグ","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","Entry状態","発注不可理由"]:
+    for v in schema:
         if v not in df.columns:
             df[v] = None
-    show_cols = ["順位","銘柄","企業名","セクター","推奨方式","売買優先区分","実行優先帯","実行優先度","実行優先スコア","今すぐ発注スコア","発注単位","単元予算可否","単元推奨可否","単元必要資金(円)","単元想定損失(円)","単元予算判定理由","単元推奨判定理由","現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","価格更新状態","価格更新メモ","再計算失敗フラグ","最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","Entry状態","発注不可理由"]
-    df = df[show_cols]
+    df = df[schema]
     try:
-        for c in ["企業名","セクター","推奨方式","売買優先区分","実行優先帯","発注単位","単元予算可否","単元推奨可否","単元予算判定理由","単元推奨判定理由","Entry状態","発注不可理由","価格更新状態","価格更新メモ"]:
+        for c in ["企業名","セクター","推奨方式","売買優先区分","実行優先帯","発注単位","単元予算可否","単元推奨可否","単元予算判定理由","単元推奨判定理由","Entry状態","発注不可理由","価格更新状態","価格更新メモ","選定区分","selected_now判定","selected_now除外理由","selected_now空理由集計"]:
             if c in df.columns:
                 df[c] = (df[c].astype(str).replace(["None","none","nan","NaN",""], "不明" if c in ["企業名","セクター"] else "").str.strip())
-        for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","再計算失敗フラグ","単元必要資金(円)","単元想定損失(円)","推奨投資額(円)","想定損失(円)","総合スコア","実行優先度","実行優先スコア","今すぐ発注スコア"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce").round(4)
+        for c in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","再計算失敗フラグ","単元必要資金(円)","単元想定損失(円)","推奨投資額(円)","想定損失(円)","総合スコア","実行優先度","実行優先スコア","今すぐ発注スコア","推奨株数","元Entry目安","元SL目安","元TP目安","元RR","元総合スコア"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce").round(4)
     except Exception:
         pass
     return df
@@ -468,9 +464,21 @@ if st.session_state.get("scan_results_ready", False):
         "selected_live_top20.csv",
     )
 
+    now_empty_reason = ""
+    if isinstance(now_view, pd.DataFrame) and len(now_view) == 0:
+        for src_df in [df_view, wait_view]:
+            if isinstance(src_df, pd.DataFrame) and len(src_df) and "selected_now空理由集計" in src_df.columns:
+                vals = src_df["selected_now空理由集計"].astype(str).str.strip()
+                vals = vals[(vals != "") & (vals != "nan") & (vals != "None")]
+                if len(vals):
+                    now_empty_reason = vals.iloc[0]
+                    break
+        if now_empty_reason:
+            st.warning(now_empty_reason)
+
     render_selected_section(
         "🟢 今すぐ発注ランキング",
-        "単元株の発注圏を最優先にした即時発注候補です。追随可は、発注圏候補が0件のときに限り単元株の実質RR>=1.45を最大1件だけ補完します。S株例外も、単元株の発注圏が無い場合に限り実質RR>=1.50を最大1件だけ許可します。",
+        "単元株の発注圏を最優先にした即時発注候補です。追随可は、単元株の発注圏候補が0件のときに限り実質RR>=1.45を最大1件だけ補完します。S株例外も、単元株の発注圏・追随可補完が無い場合に限り実質RR>=1.50を最大1件だけ許可します。空の場合は除外理由集計を上に表示します。",
         now_view,
         mobile_mode,
         show_top_n,
