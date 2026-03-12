@@ -2307,6 +2307,7 @@ LIVE_OUTPUT_SCHEMA = [
     "発注単位","単元予算可否","単元推奨可否","単元株可否","単元必要資金(円)","単元想定損失(円)","単元予算判定理由","単元推奨判定理由",
     "現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","価格更新状態","価格更新メモ","再計算失敗フラグ",
     "最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","Entry状態","発注不可理由",
+    "選定区分","selected_now判定","selected_now除外理由","selected_now空理由集計",
     "元Entry目安","元SL目安","元TP目安","元RR","元総合スコア",
 ]
 
@@ -2332,6 +2333,7 @@ def _standardize_live_output_schema(df: pd.DataFrame) -> pd.DataFrame:
         "銘柄":"", "企業名":"不明", "セクター":"不明", "推奨方式":"", "売買優先区分":"", "実行優先帯":"",
         "発注単位":"", "単元予算可否":"", "単元推奨可否":"", "単元株可否":"", "単元予算判定理由":"", "単元推奨判定理由":"",
         "価格更新状態":"", "価格更新メモ":"", "最大保有":"10営業日", "Entry状態":"", "発注不可理由":"",
+        "選定区分":"", "selected_now判定":"", "selected_now除外理由":"", "selected_now空理由集計":"",
     }
     numeric_defaults = {
         "実行優先度":np.nan, "実行優先スコア":np.nan, "今すぐ発注スコア":np.nan,
@@ -2452,7 +2454,19 @@ def _split_live_rankings_core(
     remaining_slots = max(int(now_top) - sum(len(x) for x in now_frames), 0) if now_top is not None else None
     has_any_core = sum(len(x) for x in now_frames) > 0
 
-    # S株例外は「単元株の発注圏が無い時のみ」最大1件に限定
+    # 追随可は「発注圏候補が0件の時のみ」最大1件に限定（単元株をS株例外より優先）
+    if (not has_any_core) and chase_limit > 0 and (remaining_slots is None or remaining_slots > 0):
+        chase_candidates = _sort_candidates(work.loc[unit_chase_mask & (~work.index.isin(list(used_idx)))].copy())
+        if len(chase_candidates):
+            chase_take_n = chase_limit if remaining_slots is None else min(chase_limit, remaining_slots)
+            chase_take = chase_candidates.head(int(chase_take_n)).copy()
+            now_frames.append(chase_take)
+            used_idx.update(chase_take.index.tolist())
+            if remaining_slots is not None:
+                remaining_slots = max(remaining_slots - len(chase_take), 0)
+            has_any_core = sum(len(x) for x in now_frames) > 0
+
+    # S株例外は「単元株の発注圏/追随可補完が無い時のみ」最大1件に限定
     if (not has_any_core) and s_limit > 0 and (remaining_slots is None or remaining_slots > 0):
         s_candidates = _sort_candidates(work.loc[s_now_mask & (~work.index.isin(list(used_idx)))].copy())
         if len(s_candidates):
@@ -2463,15 +2477,6 @@ def _split_live_rankings_core(
             if remaining_slots is not None:
                 remaining_slots = max(remaining_slots - len(s_take), 0)
             has_any_core = sum(len(x) for x in now_frames) > 0
-
-    # 追随可は「発注圏候補が0件の時のみ」最大1件に限定
-    if (not has_any_core) and chase_limit > 0 and (remaining_slots is None or remaining_slots > 0):
-        chase_candidates = _sort_candidates(work.loc[unit_chase_mask & (~work.index.isin(list(used_idx)))].copy())
-        if len(chase_candidates):
-            chase_take_n = chase_limit if remaining_slots is None else min(chase_limit, remaining_slots)
-            chase_take = chase_candidates.head(int(chase_take_n)).copy()
-            now_frames.append(chase_take)
-            used_idx.update(chase_take.index.tolist())
 
     now_df = pd.concat(now_frames, axis=0, ignore_index=False, sort=False) if now_frames else work.iloc[0:0].copy()
 
@@ -2537,6 +2542,129 @@ def _split_live_rankings_core(
 
     return now_df, wait_df
 
+
+
+
+def _format_now_empty_reason_summary(work: pd.DataFrame) -> str:
+    import pandas as pd
+    if work is None or not isinstance(work, pd.DataFrame) or len(work) == 0:
+        return "selected_now候補なし"
+    reasons = work.get("selected_now除外理由", pd.Series(dtype=str)).astype(str).str.strip()
+    reasons = reasons[(reasons != "") & (reasons != "採用") & (reasons != "監視候補")]
+    counts = reasons.value_counts()
+    if counts.empty:
+        return "selected_now候補なし"
+    parts = [f"{idx}:{int(val)}件" for idx, val in counts.head(5).items()]
+    return "selected_nowが空の理由集計 / " + " / ".join(parts)
+
+
+def _annotate_execution_membership(
+    work: pd.DataFrame,
+    now_ids: list,
+    wait_ids: list,
+    now_rr_min: float = 1.00,
+    chase_rr_min: float = 1.45,
+    s_now_rr_min: float = 1.50,
+) -> pd.DataFrame:
+    import pandas as pd
+    import numpy as np
+
+    out = work.copy()
+    for c in ["選定区分", "selected_now判定", "selected_now除外理由", "selected_now空理由集計"]:
+        if c not in out.columns:
+            out[c] = ""
+    out["選定区分"] = "selected_live_only"
+    out["selected_now判定"] = "対象外"
+    out["selected_now除外理由"] = ""
+    out["selected_now空理由集計"] = ""
+
+    if "__row_id__" not in out.columns:
+        out["__row_id__"] = np.arange(len(out), dtype=int)
+
+    now_id_set = set([int(x) for x in now_ids])
+    wait_id_set = set([int(x) for x in wait_ids])
+
+    status = out.get("Entry状態", pd.Series([""] * len(out), index=out.index)).astype(str).fillna("")
+    unit = out.get("発注単位", pd.Series([""] * len(out), index=out.index)).astype(str).fillna("")
+    band = out.get("実行優先帯", pd.Series([""] * len(out), index=out.index)).astype(str).fillna("")
+    reason = out.get("発注不可理由", pd.Series([""] * len(out), index=out.index)).astype(str).fillna("")
+    rr = pd.to_numeric(out.get("実質RR", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+    unit_budget_ok = out.get("単元予算可否", pd.Series([""] * len(out), index=out.index)).astype(str).eq("可")
+    unit_reco_ok = out.get("単元推奨可否", out.get("単元株可否", pd.Series([""] * len(out), index=out.index))).astype(str).eq("可")
+    recalc_ok = pd.to_numeric(out.get("再計算失敗フラグ", pd.Series([0] * len(out), index=out.index)), errors="coerce").fillna(0).le(0)
+    shares_ok = pd.to_numeric(out.get("推奨株数", pd.Series([0] * len(out), index=out.index)), errors="coerce").fillna(0).gt(0)
+
+    unit_core_available = bool(((status == "発注圏") & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & rr.ge(float(now_rr_min)) & recalc_ok & shares_ok & band.ne("見送り") & reason.eq("")).any())
+
+    for idx, row in out.iterrows():
+        row_id = int(pd.to_numeric(row.get("__row_id__"), errors="coerce"))
+        stt = str(row.get("Entry状態", "") or "")
+        unt = str(row.get("発注単位", "") or "")
+        bnd = str(row.get("実行優先帯", "") or "")
+        rsn = str(row.get("発注不可理由", "") or "").strip()
+        rrv = pd.to_numeric(pd.Series([row.get("実質RR")]), errors="coerce").iloc[0]
+        budget_ok = str(row.get("単元予算可否", "") or "") == "可"
+        reco_ok = str(row.get("単元推奨可否", row.get("単元株可否", "")) or "") == "可"
+        fail_flag = pd.to_numeric(pd.Series([row.get("再計算失敗フラグ")]), errors="coerce").fillna(0).iloc[0]
+        shares = pd.to_numeric(pd.Series([row.get("推奨株数")]), errors="coerce").fillna(0).iloc[0]
+
+        if row_id in now_id_set:
+            out.at[idx, "選定区分"] = "selected_now"
+            out.at[idx, "selected_now判定"] = "採用"
+            out.at[idx, "selected_now除外理由"] = "採用"
+            continue
+        if row_id in wait_id_set:
+            out.at[idx, "選定区分"] = "selected_wait"
+            out.at[idx, "selected_now判定"] = "監視候補"
+        if fail_flag > 0:
+            out.at[idx, "selected_now除外理由"] = "再計算失敗/価格未更新"
+            continue
+        if shares <= 0:
+            out.at[idx, "selected_now除外理由"] = "推奨株数0"
+            continue
+        if rsn:
+            out.at[idx, "selected_now除外理由"] = rsn
+            continue
+        if stt.startswith("見送り") or bnd == "見送り":
+            out.at[idx, "selected_now除外理由"] = stt or "見送り"
+            continue
+        if unt == "単元株":
+            if not budget_ok:
+                out.at[idx, "selected_now除外理由"] = "単元予算不可"
+            elif not reco_ok:
+                out.at[idx, "selected_now除外理由"] = "単元推奨不可"
+            elif stt == "発注圏" and (not pd.isna(rrv)) and rrv < float(now_rr_min):
+                out.at[idx, "selected_now除外理由"] = f"発注圏RR不足<{float(now_rr_min):.2f}"
+            elif stt == "追随可" and (pd.isna(rrv) or rrv < float(chase_rr_min)):
+                out.at[idx, "selected_now除外理由"] = f"追随可RR不足<{float(chase_rr_min):.2f}"
+            elif stt == "追随可" and unit_core_available:
+                out.at[idx, "selected_now除外理由"] = "単元株発注圏優先のため追随可抑制"
+            elif stt == "追随可":
+                out.at[idx, "selected_now除外理由"] = "追随可上限超過"
+            elif stt in ["押し目待ち", "様子見"]:
+                out.at[idx, "selected_now除外理由"] = f"監視候補（{stt}）"
+            elif stt == "発注圏":
+                out.at[idx, "selected_now除外理由"] = "発注圏だが上位枠外"
+            else:
+                out.at[idx, "selected_now除外理由"] = "対象外"
+        elif unt == "S株":
+            if stt == "発注圏" and unit_core_available:
+                out.at[idx, "selected_now除外理由"] = "単元株発注圏優先のためS株例外不採用"
+            elif stt == "発注圏" and (pd.isna(rrv) or rrv < float(s_now_rr_min)):
+                out.at[idx, "selected_now除外理由"] = f"S株例外RR不足<{float(s_now_rr_min):.2f}"
+            elif stt == "発注圏":
+                out.at[idx, "selected_now除外理由"] = "S株例外上限超過"
+            elif stt in ["追随可", "押し目待ち", "様子見"]:
+                out.at[idx, "selected_now除外理由"] = f"監視候補（{stt}）"
+            else:
+                out.at[idx, "selected_now除外理由"] = "対象外"
+        else:
+            out.at[idx, "selected_now除外理由"] = "発注単位不明"
+
+    if len(now_id_set) == 0:
+        summary = _format_now_empty_reason_summary(out)
+        out["selected_now空理由集計"] = summary
+    return out
 
 
 def build_live_linked_guide(df_selected: pd.DataFrame, max_rows: Optional[int] = None) -> pd.DataFrame:
@@ -2800,9 +2928,10 @@ def split_live_rankings(
     s_now_max: int = 1,
     chase_now_max: int = 1,
 ):
-    """ライブ再計算後の selected を、発注圏優先で now/wait に分割して返す。"""
-    now_df, wait_df = _split_live_rankings_core(
+    """ライブ再計算後の selected を、build_live_execution_views と同一親DataFrame基準で now/wait に分割して返す。"""
+    _, now_df, wait_df = build_live_execution_views(
         df_selected,
+        live_top=max(int(now_top or 0) + int(wait_top or 0), 20),
         now_top=now_top,
         wait_top=wait_top,
         now_rr_min=now_rr_min,
@@ -2811,9 +2940,8 @@ def split_live_rankings(
         s_now_rr_min=s_now_rr_min,
         s_now_max=s_now_max,
         chase_now_max=chase_now_max,
-        recompute_priority=True,
     )
-    return _standardize_live_output_schema(now_df), _standardize_live_output_schema(wait_df)
+    return now_df, wait_df
 
 
 def build_live_execution_views(
@@ -2864,9 +2992,18 @@ def build_live_execution_views(
     now_ids = _row_ids(now_raw)
     wait_raw = wait_raw.loc[~wait_raw["__row_id__"].isin(now_ids)].copy() if isinstance(wait_raw, pd.DataFrame) and len(wait_raw) and "__row_id__" in wait_raw.columns else wait_raw
     wait_ids = _row_ids(wait_raw)
-    used_ids = set(now_ids) | set(wait_ids)
 
-    remainder = work.loc[~work["__row_id__"].isin(list(used_ids))].copy()
+    annotated = _annotate_execution_membership(
+        work,
+        now_ids=now_ids,
+        wait_ids=wait_ids,
+        now_rr_min=float(now_rr_min),
+        chase_rr_min=float(chase_rr_min),
+        s_now_rr_min=float(s_now_rr_min),
+    )
+
+    used_ids = set(now_ids) | set(wait_ids)
+    remainder = annotated.loc[~annotated["__row_id__"].isin(list(used_ids))].copy()
     if len(remainder):
         for c in ["実行優先度", "実行優先スコア", "実質RR", "総合スコア"]:
             if c not in remainder.columns:
@@ -2880,21 +3017,52 @@ def build_live_execution_views(
     ordered_ids = now_ids + wait_ids + pd.to_numeric(remainder.get("__row_id__", pd.Series(dtype=float)), errors="coerce").dropna().astype(int).tolist()
     ordered_ids = ordered_ids[: int(live_top)] if live_top is not None else ordered_ids
 
-    parent = work.set_index("__row_id__", drop=False)
-    live_raw = parent.loc[[i for i in ordered_ids if i in parent.index]].copy() if ordered_ids else work.iloc[0:0].copy()
-    now_raw = parent.loc[[i for i in now_ids if i in parent.index]].copy() if now_ids else work.iloc[0:0].copy()
-    wait_raw = parent.loc[[i for i in wait_ids if i in parent.index]].copy() if wait_ids else work.iloc[0:0].copy()
+    parent = annotated.set_index("__row_id__", drop=False)
+    live_raw = parent.loc[[i for i in ordered_ids if i in parent.index]].copy() if ordered_ids else annotated.iloc[0:0].copy()
+    now_raw = parent.loc[[i for i in now_ids if i in parent.index]].copy() if now_ids else annotated.iloc[0:0].copy()
+    wait_raw = parent.loc[[i for i in wait_ids if i in parent.index]].copy() if wait_ids else annotated.iloc[0:0].copy()
 
-    # 同一親DFから切り出した後に hidden key を落とし、完全に同一スキーマ化
+    if len(wait_raw) and "銘柄" in wait_raw.columns and len(now_raw) and "銘柄" in now_raw.columns:
+        wait_raw = wait_raw.loc[~wait_raw["銘柄"].astype(str).isin(now_raw["銘柄"].astype(str))].copy()
+    if len(wait_raw):
+        wait_raw = wait_raw.loc[~wait_raw["Entry状態"].astype(str).str.startswith("見送り")].copy()
+        wait_raw = wait_raw.loc[wait_raw.get("実行優先帯", pd.Series([""] * len(wait_raw), index=wait_raw.index)).astype(str) != "見送り"].copy()
+        if "銘柄" in wait_raw.columns:
+            wait_raw = wait_raw.drop_duplicates(subset=["銘柄"], keep="first").copy()
+
     live_df = _standardize_live_output_schema(live_raw.drop(columns=["__row_id__"], errors="ignore"))
     now_df = _standardize_live_output_schema(now_raw.drop(columns=["__row_id__"], errors="ignore"))
     wait_df = _standardize_live_output_schema(wait_raw.drop(columns=["__row_id__"], errors="ignore"))
 
-    # 念のため schema / overlap を再保証
+    common_cols = list(LIVE_OUTPUT_SCHEMA)
+    for name, df_part in [("live", live_df), ("now", now_df), ("wait", wait_df)]:
+        for c in common_cols:
+            if c not in df_part.columns:
+                df_part[c] = "" if c in ["選定区分", "selected_now判定", "selected_now除外理由", "selected_now空理由集計", "企業名", "セクター", "推奨方式", "売買優先区分", "実行優先帯", "発注単位", "単元予算可否", "単元推奨可否", "単元株可否", "単元予算判定理由", "単元推奨判定理由", "価格更新状態", "価格更新メモ", "Entry状態", "発注不可理由", "最大保有"] else np.nan
+            df_part = df_part[common_cols]
+        if name == "live":
+            live_df = df_part
+        elif name == "now":
+            now_df = df_part
+        else:
+            wait_df = df_part
+
+    if len(now_df) == 0:
+        summary = _format_now_empty_reason_summary(live_df)
+        if len(live_df):
+            live_df["selected_now空理由集計"] = summary
+        if len(wait_df):
+            wait_df["selected_now空理由集計"] = summary
+
+    # 不変条件の最終保証
     if len(now_df) and len(wait_df) and "銘柄" in now_df.columns and "銘柄" in wait_df.columns:
-        wait_df = wait_df.loc[~wait_df["銘柄"].isin(now_df["銘柄"])].copy().reset_index(drop=True)
-        wait_df = wait_df.drop(columns=["順位"], errors="ignore")
-        wait_df.insert(0, "順位", range(1, len(wait_df) + 1))
-        wait_df = wait_df[[c for c in LIVE_OUTPUT_SCHEMA if c in wait_df.columns or c == "順位"]]
+        wait_df = wait_df.loc[~wait_df["銘柄"].astype(str).isin(now_df["銘柄"].astype(str))].copy()
+        wait_df = _standardize_live_output_schema(wait_df)
+    if len(live_df) and len(now_df) and "銘柄" in live_df.columns and "銘柄" in now_df.columns:
+        now_df = now_df.loc[now_df["銘柄"].astype(str).isin(live_df["銘柄"].astype(str))].copy()
+        now_df = _standardize_live_output_schema(now_df)
+    if len(live_df) and len(wait_df) and "銘柄" in live_df.columns and "銘柄" in wait_df.columns:
+        wait_df = wait_df.loc[wait_df["銘柄"].astype(str).isin(live_df["銘柄"].astype(str))].copy()
+        wait_df = _standardize_live_output_schema(wait_df)
 
     return live_df, now_df, wait_df
