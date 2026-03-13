@@ -1112,22 +1112,30 @@ def stage0_select(min_price: float, min_avg_volume: float, keep: int) -> Tuple[p
             urows = cur_u.fetchall()
     finally:
         conn_u.close()
+    u_df = pd.DataFrame(columns=['symbol','name','sector33_name','sector33_code','lot_size'])
     if urows:
         # urows の列数はDBスキーマ/SELECTにより変わる可能性があるため動的に吸収
         first_len = len(urows[0])
-        if first_len == 5:
-            # Build universe meta DataFrame safely
-            if urows:
-                first_len = len(urows[0])
-                if first_len == 5:
-                    u_df = pd.DataFrame(urows, columns=['symbol','name','sector33_name','sector33_code','lot_size'])
-                elif first_len == 4:
-                    u_df = pd.DataFrame(urows, columns=['symbol','sector33_name','sector33_code','lot_size'])
-                    u_df['name'] = ''
-                else:
-                    u_df = pd.DataFrame(urows)
-            else:
-                u_df = pd.DataFrame(columns=['symbol','name','sector33_name','sector33_code','lot_size'])
+        if first_len >= 5:
+            u_df = pd.DataFrame([tuple(r[:5]) for r in urows], columns=['symbol','name','sector33_name','sector33_code','lot_size'])
+        elif first_len == 4:
+            u_df = pd.DataFrame(urows, columns=['symbol','sector33_name','sector33_code','lot_size'])
+            u_df['name'] = ''
+        elif first_len == 3:
+            u_df = pd.DataFrame(urows, columns=['symbol','sector33_name','sector33_code'])
+            u_df['name'] = ''
+            u_df['lot_size'] = 100
+        elif first_len == 2:
+            u_df = pd.DataFrame(urows, columns=['symbol','name'])
+            u_df['sector33_name'] = '不明'
+            u_df['sector33_code'] = ''
+            u_df['lot_size'] = 100
+        elif first_len == 1:
+            u_df = pd.DataFrame(urows, columns=['symbol'])
+            u_df['name'] = ''
+            u_df['sector33_name'] = '不明'
+            u_df['sector33_code'] = ''
+            u_df['lot_size'] = 100
     u_df['symbol'] = u_df['symbol'].astype(str).map(_norm_symbol)
     u_df['_key'] = u_df['symbol'].astype(str).map(_sym_key)
     ukeys = set([_sym_key(x) for x in universe])
@@ -3103,6 +3111,22 @@ def build_live_execution_views(
     ordered_ids = ordered_ids[: int(live_top)] if live_top is not None else ordered_ids
 
     parent = annotated.set_index("__row_id__", drop=False)
+
+    # _split_live_rankings_core 側で付与した「今すぐ発注スコア」や
+    # 最終補完時の「実行優先帯/実行優先度」を失わないように、
+    # now_raw / wait_raw で確定した列を親DataFrameへ上書き反映する。
+    preserve_cols = ["実行優先帯", "実行優先度", "実行優先スコア", "今すぐ発注スコア"]
+    for df_part in [now_raw, wait_raw]:
+        if not isinstance(df_part, pd.DataFrame) or len(df_part) == 0 or "__row_id__" not in df_part.columns:
+            continue
+        src = df_part.set_index("__row_id__", drop=False)
+        common_ids = parent.index.intersection(src.index)
+        if len(common_ids) == 0:
+            continue
+        for c in preserve_cols:
+            if c in src.columns:
+                parent.loc[common_ids, c] = src.loc[common_ids, c]
+
     live_raw = parent.loc[[i for i in ordered_ids if i in parent.index]].copy() if ordered_ids else annotated.iloc[0:0].copy()
     now_raw = parent.loc[[i for i in now_ids if i in parent.index]].copy() if now_ids else annotated.iloc[0:0].copy()
     wait_raw = parent.loc[[i for i in wait_ids if i in parent.index]].copy() if wait_ids else annotated.iloc[0:0].copy()
