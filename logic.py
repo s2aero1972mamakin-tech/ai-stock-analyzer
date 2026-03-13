@@ -2269,10 +2269,13 @@ def _compute_live_execution_priority(df: pd.DataFrame, strict_chase_rr: float = 
     band = pd.Series(np.where(actionable & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & status.eq("押し目待ち") & (rr >= 0.90), 80, band), index=out.index)
     band = pd.Series(np.where(actionable & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & status.eq("様子見") & (rr >= 0.90), 70, band), index=out.index)
     band = pd.Series(np.where(actionable & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & status.eq("追随可") & (rr >= strict_chase_rr), 60, band), index=out.index)
+    soft_s_chase_rr = max(1.30, min(float(strict_chase_rr), float(strict_s_rr) - 0.05))
     band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("発注圏") & (rr >= strict_s_rr), 50, band), index=out.index)
     band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("発注圏") & (rr >= soft_s_rr) & (rr < strict_s_rr) & (band < 50), 35, band), index=out.index)
+    band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("追随可") & (rr >= soft_s_chase_rr) & (band < 35), 34, band), index=out.index)
     band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("押し目待ち") & (rr >= 0.95), 40, band), index=out.index)
-    band = pd.Series(np.where(actionable & unit.eq("S株") & status.isin(["様子見", "追随可"]) & (rr >= 0.95), 30, band), index=out.index)
+    band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("様子見") & (rr >= 0.95) & (band < 34), 30, band), index=out.index)
+    band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("追随可") & (rr >= 0.95) & (band < 34), 30, band), index=out.index)
     band = pd.Series(np.where(refresh_ok & (~reason_blank) & (band == 0), 10, band), index=out.index)
 
     label_map = {
@@ -2282,6 +2285,7 @@ def _compute_live_execution_priority(df: pd.DataFrame, strict_chase_rr: float = 
         60: "単元株追随候補(厳格)",
         50: "S株即時候補(例外)",
         35: "S株発注圏候補(最終補完)",
+        34: "S株追随候補(最終補完)",
         40: "S株監視候補(押し目)",
         30: "S株監視候補",
         10: "発注保留",
@@ -2440,6 +2444,7 @@ def _split_live_rankings_core(
     wait_floor = float(wait_rr_min) if np.isfinite(wait_rr_min) else min(rr_floor, 0.90)
     s_floor = max(rr_floor, float(s_now_rr_min) if np.isfinite(s_now_rr_min) else 1.50)
     s_soft_floor = min(s_floor, max(1.20, s_floor - 0.20))
+    s_chase_soft_floor = max(1.30, min(chase_floor, s_floor - 0.05))
     s_limit = max(int(s_now_max or 0), 0)
     chase_limit = max(int(chase_now_max or 0), 0)
 
@@ -2463,6 +2468,7 @@ def _split_live_rankings_core(
     unit_chase_mask = actionable & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & status.eq("追随可") & (rr >= chase_floor)
     s_now_mask = actionable & unit.eq("S株") & status.eq("発注圏") & (rr >= s_floor)
     s_fallback_mask = actionable & unit.eq("S株") & status.eq("発注圏") & (rr >= s_soft_floor)
+    s_chase_fallback_mask = actionable & unit.eq("S株") & status.eq("追随可") & (rr >= s_chase_soft_floor)
 
     def _sort_candidates(df_part: pd.DataFrame, extra_cols=None):
         extra_cols = extra_cols or []
@@ -2525,6 +2531,26 @@ def _split_live_rankings_core(
                 used_idx.update(fallback_take.index.tolist())
                 if remaining_slots is not None:
                     remaining_slots = max(remaining_slots - len(fallback_take), 0)
+                has_any_core = sum(len(x) for x in now_frames) > 0
+
+    # 追加補完: 発注圏が無くても、S株の強い追随可があるなら最良の1件だけ採用
+    if (not has_any_core) and (remaining_slots is None or remaining_slots > 0):
+        chase_fallback_candidates = _sort_candidates(
+            work.loc[
+                s_chase_fallback_mask
+                & (~work.index.isin(list(used_idx)))
+            ].copy()
+        )
+        if len(chase_fallback_candidates):
+            chase_fallback_take_n = 1 if remaining_slots is None else min(1, remaining_slots)
+            chase_fallback_take = chase_fallback_candidates.head(int(chase_fallback_take_n)).copy()
+            if len(chase_fallback_take):
+                chase_fallback_take["実行優先帯"] = "S株追随候補(最終補完)"
+                chase_fallback_take["実行優先度"] = pd.to_numeric(chase_fallback_take.get("実行優先度", np.nan), errors="coerce").fillna(34).clip(lower=34)
+                now_frames.append(chase_fallback_take)
+                used_idx.update(chase_fallback_take.index.tolist())
+                if remaining_slots is not None:
+                    remaining_slots = max(remaining_slots - len(chase_fallback_take), 0)
                 has_any_core = sum(len(x) for x in now_frames) > 0
 
     now_df = pd.concat(now_frames, axis=0, ignore_index=False, sort=False) if now_frames else work.iloc[0:0].copy()
@@ -2698,6 +2724,7 @@ def _annotate_execution_membership(
                 out.at[idx, "selected_now除外理由"] = "対象外"
         elif unt == "S株":
             soft_s_now_rr_min = min(float(s_now_rr_min), max(1.20, float(s_now_rr_min) - 0.20))
+            soft_s_chase_rr_min = max(1.30, min(float(chase_rr_min), float(s_now_rr_min) - 0.05))
             if stt == "発注圏" and unit_core_available:
                 out.at[idx, "selected_now除外理由"] = "単元株発注圏優先のためS株例外不採用"
             elif stt == "発注圏" and (pd.isna(rrv) or rrv < float(soft_s_now_rr_min)):
@@ -2706,7 +2733,13 @@ def _annotate_execution_membership(
                 out.at[idx, "selected_now除外理由"] = f"S株発注圏候補（最終補完未採用）<{float(s_now_rr_min):.2f}"
             elif stt == "発注圏":
                 out.at[idx, "selected_now除外理由"] = "S株例外/最終補完上限超過"
-            elif stt in ["追随可", "押し目待ち", "様子見"]:
+            elif stt == "追随可" and unit_core_available:
+                out.at[idx, "selected_now除外理由"] = "単元株発注圏優先のためS株追随候補不採用"
+            elif stt == "追随可" and (pd.isna(rrv) or rrv < float(soft_s_chase_rr_min)):
+                out.at[idx, "selected_now除外理由"] = f"S株追随候補RR不足<{float(soft_s_chase_rr_min):.2f}"
+            elif stt == "追随可":
+                out.at[idx, "selected_now除外理由"] = "S株追随候補（最終補完未採用）"
+            elif stt in ["押し目待ち", "様子見"]:
                 out.at[idx, "selected_now除外理由"] = f"監視候補（{stt}）"
             else:
                 out.at[idx, "selected_now除外理由"] = "対象外"
