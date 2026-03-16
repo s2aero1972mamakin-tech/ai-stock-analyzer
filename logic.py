@@ -1227,37 +1227,157 @@ def _pick_strategy(features: Dict[str, float], atr_pct: float) -> str:
     r60 = pd.to_numeric(pd.Series([features.get("ret_60", np.nan)]), errors="coerce").iloc[0]
     reversal_score = pd.to_numeric(pd.Series([features.get("reversal_score", np.nan)]), errors="coerce").iloc[0]
     pullback = pd.to_numeric(pd.Series([features.get("pullback_from_high20", np.nan)]), errors="coerce").iloc[0]
+    rebound10 = pd.to_numeric(pd.Series([features.get("rebound_from_low10", np.nan)]), errors="coerce").iloc[0]
 
     strong_uptrend = bool(features.get("strong_uptrend", False))
     uptrend_bias = bool(features.get("uptrend_bias", False))
     pullback_candidate = bool(features.get("pullback_candidate", False))
     reversal_confirmed = bool(features.get("reversal_confirmed", False))
+    breakout_3 = bool(features.get("breakout_3", False))
     breakout_10 = bool(features.get("breakout_10", False))
     trend_headwind = bool(features.get("trend_headwind", False))
     strong_downtrend = bool(features.get("strong_downtrend", False))
 
-    if strong_uptrend and breakout_10 and (not np.isfinite(r20) or r20 > 0.03):
-        return "順張り（ブレイク/上昇トレンド）"
+    if strong_uptrend and breakout_10 and (not np.isfinite(r20) or r20 > 0.04):
+        return "順張り（上昇継続）"
 
-    if pullback_candidate and (reversal_confirmed or (np.isfinite(reversal_score) and reversal_score >= 0.46)):
-        return "押し目買い（回復狙い）"
+    if strong_uptrend and pullback_candidate and reversal_confirmed:
+        return "順張り（押し目反発）"
 
-    if (np.isfinite(r20) and r20 < -0.06) and (reversal_confirmed or (np.isfinite(reversal_score) and reversal_score >= 0.58)) and not strong_downtrend:
-        return "逆張り（リバウンド狙い）"
+    if pullback_candidate and reversal_confirmed and not trend_headwind:
+        return "押し目買い（反転確認）"
 
-    if np.isfinite(atr_pct) and atr_pct < 1.5 and not strong_uptrend and not trend_headwind:
+    if pullback_candidate and (np.isfinite(reversal_score) and reversal_score >= 0.46) and not strong_downtrend:
+        if uptrend_bias or strong_uptrend:
+            return "押し目買い（初動）"
+        return "押し目監視（初動待ち）"
+
+    if strong_downtrend:
+        if reversal_confirmed and (not np.isfinite(r20) or r20 < -0.04) and (not np.isfinite(r60) or r60 > -0.18):
+            return "逆張り（反転確認）"
+        if (np.isfinite(reversal_score) and reversal_score >= 0.58) and (not np.isfinite(rebound10) or rebound10 > 0.03):
+            return "逆張り（初動）"
+        return "押し目監視（下落調整）"
+
+    if trend_headwind:
+        if reversal_confirmed and (not np.isfinite(r20) or r20 > -0.08):
+            return "逆張り（反転確認）"
+        return "押し目監視（初動待ち）"
+
+    if uptrend_bias and pullback_candidate:
+        return "押し目買い（初動）" if (np.isfinite(reversal_score) and reversal_score >= 0.46) else "押し目監視（初動待ち）"
+
+    if reversal_confirmed and not strong_downtrend and (not np.isfinite(r60) or r60 > -0.08):
+        return "逆張り（反転確認）"
+
+    if breakout_3 and not trend_headwind and (not np.isfinite(r20) or r20 > 0.01):
+        return "順張り（上昇継続）"
+
+    if np.isfinite(atr_pct) and atr_pct < 1.5 and not trend_headwind:
         return "レンジ（小動き）"
 
-    if uptrend_bias and np.isfinite(pullback) and pullback <= -0.01:
-        return "押し目買い（回復狙い）"
-
-    if reversal_confirmed and not strong_downtrend and (not np.isfinite(r60) or r60 > -0.05):
-        return "逆張り（リバウンド狙い）"
-
-    if strong_uptrend:
-        return "順張り（ブレイク/上昇トレンド）"
+    if np.isfinite(pullback) and pullback <= -0.015:
+        return "押し目監視（初動待ち）"
 
     return "レンジ（小動き）"
+
+
+def _strategy_bucket(strategy_name: Any) -> str:
+    s = _clean_exec_text(strategy_name) if "_clean_exec_text" in globals() else ("" if strategy_name is None else str(strategy_name).strip())
+    if "順張り" in s:
+        return "順張り"
+    if "押し目" in s:
+        return "押し目"
+    if "逆張り" in s:
+        return "逆張り"
+    if "レンジ" in s:
+        return "レンジ"
+    return "その他"
+
+
+def _reorder_with_diversity(
+    df: pd.DataFrame,
+    top_n: Optional[int] = None,
+    score_cols: Optional[List[str]] = None,
+    prefer_unit: bool = False,
+    min_unit_ratio: float = 0.35,
+    max_bucket_ratio: float = 0.45,
+) -> pd.DataFrame:
+    import pandas as pd
+    import numpy as np
+
+    if df is None or not isinstance(df, pd.DataFrame) or len(df) == 0:
+        return df
+
+    base = df.copy()
+    if score_cols:
+        cols = [c for c in score_cols if c in base.columns]
+        if cols:
+            asc = [False] * len(cols)
+            base = base.sort_values(cols, ascending=asc, na_position="last").copy()
+
+    target_n = len(base) if top_n is None else max(0, min(int(top_n), len(base)))
+    if target_n <= 0:
+        return base.iloc[0:0].copy()
+
+    strategy_series = base.get("推奨方式", pd.Series([""] * len(base), index=base.index)).astype(str)
+    bucket_map = {idx: _strategy_bucket(strategy_series.loc[idx]) for idx in base.index}
+    unit_series = base.get("発注単位", pd.Series([""] * len(base), index=base.index)).astype(str)
+    idx_list = list(base.index)
+    is_unit_flags = [unit_series.loc[idx] == "単元株" for idx in idx_list]
+
+    total_units = int(sum(1 for x in is_unit_flags if x))
+    target_unit = 0
+    if prefer_unit and total_units > 0:
+        target_unit = min(total_units, max(0, int(np.ceil(target_n * float(min_unit_ratio)))))
+
+    suffix_units = [0] * len(idx_list)
+    running = 0
+    for pos in range(len(idx_list) - 1, -1, -1):
+        running += 1 if is_unit_flags[pos] else 0
+        suffix_units[pos] = running
+
+    max_bucket = max(2, int(np.ceil(target_n * float(max_bucket_ratio))))
+    bucket_counts: Dict[str, int] = {}
+    selected: List[Any] = []
+    deferred: List[Any] = []
+    selected_units = 0
+
+    for pos, idx in enumerate(idx_list):
+        if len(selected) >= target_n:
+            deferred.append(idx)
+            continue
+
+        bucket = bucket_map.get(idx, "その他")
+        is_unit = is_unit_flags[pos]
+        slots_left = target_n - len(selected)
+        need_units = max(target_unit - selected_units, 0)
+        units_left = suffix_units[pos]
+
+        if bucket_counts.get(bucket, 0) >= max_bucket and (len(idx_list) - pos) > slots_left:
+            deferred.append(idx)
+            continue
+
+        if prefer_unit and (not is_unit) and need_units > 0 and units_left >= need_units and slots_left > need_units:
+            deferred.append(idx)
+            continue
+
+        selected.append(idx)
+        bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+        if is_unit:
+            selected_units += 1
+
+    if len(selected) < target_n:
+        for idx in deferred + [i for i in idx_list if i not in selected and i not in deferred]:
+            if idx in selected:
+                continue
+            selected.append(idx)
+            if len(selected) >= target_n:
+                break
+
+    remainder = [idx for idx in idx_list if idx not in selected]
+    return base.loc[selected + remainder].copy()
+
 
 def _read_latest_dates(conn) -> Tuple[Optional[str], Optional[str]]:
     with conn.cursor() as cur:
@@ -1842,8 +1962,28 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_
     df["平均逆行(R)"] = df["平均逆行(R)"].clip(0,10)
     df["平均利確日数"] = df["平均利確日数"].clip(1,10)
 
-    df["総合スコア"] = 0.55*df["利確スコア"] + 0.20*df["TP到達率"] + 0.15*df["期待値EV(R)"] - 0.10*df["平均逆行(R)"]
-    df = df.sort_values("総合スコア", ascending=False).head(int(keep)).copy()
+    reversal_bonus = df["短期反転確認"].astype(str).map({"確認": 0.12, "準確認": 0.05, "未確認": -0.04}).fillna(0.0)
+    trend_bonus = df["トレンド監査"].astype(str).map(lambda x: 0.08 if "上昇基調" in x else (0.03 if "中期上向き" in x else (-0.12 if "下降継続" in x else (-0.06 if "下向き圧力" in x else 0.0))))
+    strat_bonus = df["推奨方式"].astype(str).map(lambda x: 0.05 if "順張り" in x else (0.03 if "反転確認" in x else (-0.04 if "監視" in x else 0.0)))
+    hold_penalty = (pd.to_numeric(df["平均利確日数"], errors="coerce").fillna(10.0) / 10.0) * 0.10
+
+    df["総合スコア"] = (
+        0.38 * df["利確スコア"]
+        + 0.24 * df["TP到達率"]
+        + 0.18 * df["期待値EV(R)"]
+        - 0.10 * df["平均逆行(R)"]
+        - hold_penalty
+        + reversal_bonus
+        + trend_bonus
+        + strat_bonus
+    )
+    df = _reorder_with_diversity(
+        df.sort_values(["総合スコア", "TP到達率", "期待値EV(R)"], ascending=False).head(int(keep) * 2).copy(),
+        top_n=int(keep),
+        score_cols=["総合スコア", "TP到達率", "期待値EV(R)", "利確スコア"],
+        prefer_unit=False,
+        max_bucket_ratio=0.42,
+    ).head(int(keep)).copy()
     # --- COMPLETE AI: WalkForward / MonteCarlo / Kelly (budgeted) ---
     try:
         # Streamlit Cloud対策：重い計算は上位N件だけ＆時間予算で打ち切り
@@ -1909,8 +2049,10 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_
             0.12 * (dd_score-0.5)*2.0 +
             0.06 * (kelly/0.25)
         )
-        df["総合スコア"] = (base * vol_adj).astype(float)
-        df = df.sort_values("総合スコア", ascending=False).copy()
+        prev_score = pd.to_numeric(df.get("総合スコア", np.nan), errors="coerce").fillna(0.0)
+        ai_score = (base * vol_adj).astype(float)
+        df["総合スコア"] = (0.65 * prev_score + 0.35 * ai_score).astype(float)
+        df = df.sort_values(["総合スコア", "TP到達率", "期待値EV(R)"], ascending=False).copy()
     except Exception:
         pass
 
@@ -2157,12 +2299,27 @@ def run_scan_3stage(
         dd_n = 1.0 - _z(pd.to_numeric(_safe_series(sel, "平均逆行(R)", 0), errors="coerce").fillna(0).values)
         buff_n = _z(pd.to_numeric(_safe_series(sel, "バフェット簡易スコア", 0), errors="coerce").fillna(0).values)
 
+        unit_exec = pd.Series(unit_list, index=sel.index).map({"単元株": 1.0, "S株": 0.45}).fillna(0.0).values
+        reversal_quality = pd.to_numeric(_safe_series(sel, "短期反転スコア", 0), errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0).values
+        reversal_label_series = _safe_series(sel, "短期反転確認", "未確認").astype(str)
+        reversal_bonus = reversal_label_series.map({"確認": 1.0, "準確認": 0.65, "未確認": 0.20}).fillna(0.20).values
+        trend_text_series = _safe_series(sel, "トレンド監査", "").astype(str)
+        trend_bonus = trend_text_series.map(lambda x: 1.0 if ("上昇基調" in x or "中期上向き" in x) else (0.35 if "方向感中立" in x else 0.10)).fillna(0.10).values
+        profit_precision = _z((pd.to_numeric(_safe_series(sel, "TP到達率", 0), errors="coerce").fillna(0).values * np.maximum(pd.to_numeric(_safe_series(sel, "期待値EV(R)", 0), errors="coerce").fillna(0).values, 0)) / np.maximum(pd.to_numeric(_safe_series(sel, "平均利確日数", 10), errors="coerce").fillna(10).values, 1))
+
         sel["資金最適スコア"] = np.round(
-            0.30 * eff_n + 0.18 * daily_n + 0.18 * ev_n + 0.14 * wr_n + 0.10 * dd_n + 0.10 * buff_n,
+            0.23 * eff_n + 0.12 * daily_n + 0.16 * ev_n + 0.12 * wr_n + 0.08 * dd_n + 0.07 * buff_n + 0.10 * profit_precision + 0.07 * unit_exec + 0.03 * reversal_quality + 0.02 * reversal_bonus + 0.00 * trend_bonus,
             6,
         )
-        sort_cols = ["資金最適スコア","総合スコア"] if "総合スコア" in sel.columns else ["資金最適スコア"]
-        sel = sel.sort_values(sort_cols, ascending=False).reset_index(drop=True)
+        sort_cols = ["資金最適スコア","総合スコア","TP到達率","期待値EV(R)"] if "総合スコア" in sel.columns else ["資金最適スコア"]
+        sel = _reorder_with_diversity(
+            sel.sort_values(sort_cols, ascending=False).copy(),
+            top_n=len(sel),
+            score_cols=sort_cols,
+            prefer_unit=True,
+            min_unit_ratio=0.40,
+            max_bucket_ratio=0.40,
+        ).reset_index(drop=True)
         sel.insert(0, "順位", range(1, len(sel) + 1))
     except Exception as e:
         diag["mode"] = "degraded"
@@ -2563,6 +2720,7 @@ def _derive_execution_band(
     reversal_strict = reversal_tag == "確認"
     trend_headwind = bool(re.search(r"下降継続|下向き圧力|弱い|調整継続", trend_text))
     strong_headwind = bool(re.search(r"下降継続", trend_text))
+    trend_tailwind = bool(re.search(r"上昇基調|中期上向き", trend_text))
     actionable = refresh_ok and shares_ok and (reason == "") and status != "" and (not status.startswith("見送り"))
 
     soft_s_rr = min(float(strict_s_rr), max(1.20, float(strict_s_rr) - 0.20))
@@ -2577,20 +2735,20 @@ def _derive_execution_band(
                 code = 90
             elif status == "追随可" and reversal_strict and (not trend_headwind) and (not pd.isna(rr)) and rr >= float(strict_chase_rr):
                 code = 60
-            elif status == "押し目待ち" and (pd.isna(rr) or rr >= 0.90) and (reversal_ok or (not strong_headwind)):
+            elif status == "押し目待ち" and (pd.isna(rr) or rr >= 0.95) and (reversal_ok or (trend_tailwind and not strong_headwind)):
                 code = 80
-            elif status == "様子見" and (pd.isna(rr) or rr >= 0.95) and (reversal_ok or ((not strong_headwind) and (pd.isna(reversal_score) or reversal_score >= 0.42))):
+            elif status == "様子見" and (pd.isna(rr) or rr >= 1.00) and ((reversal_ok and not trend_headwind) or (trend_tailwind and (pd.isna(reversal_score) or reversal_score >= 0.48))):
                 code = 70
     elif unit == "S株":
         if status == "発注圏" and reversal_strict and (not trend_headwind) and (not pd.isna(rr)) and rr >= float(strict_s_rr):
             code = 50
-        elif status == "発注圏" and reversal_ok and (pd.isna(rr) or rr >= soft_s_rr):
+        elif status == "発注圏" and reversal_ok and (not strong_headwind) and (pd.isna(rr) or rr >= soft_s_rr):
             code = 35
         elif status == "追随可" and reversal_strict and (not trend_headwind) and (not pd.isna(rr)) and rr >= soft_s_chase_rr:
             code = 34
-        elif status == "押し目待ち" and reversal_ok and (pd.isna(rr) or rr >= 0.95):
+        elif status == "押し目待ち" and (reversal_strict or (reversal_ok and trend_tailwind and (pd.isna(reversal_score) or reversal_score >= 0.55))) and (not trend_headwind) and (pd.isna(rr) or rr >= 1.00):
             code = 40
-        elif status in ("様子見", "追随可") and reversal_ok and (pd.isna(rr) or rr >= 1.00) and (not strong_headwind):
+        elif status in ("様子見", "追随可") and reversal_strict and trend_tailwind and (pd.isna(rr) or rr >= 1.05) and (not strong_headwind):
             code = 30
 
     meta = {
@@ -2668,21 +2826,24 @@ def _compute_live_execution_priority(df: pd.DataFrame, strict_chase_rr: float = 
     reversal_bonus = reversal_label.map({"確認": 0.24, "準確認": 0.10, "未確認": -0.12}).fillna(0.0)
     headwind_penalty = trend_headwind.astype(float) * 0.12
     tailwind_bonus = trend_tailwind.astype(float) * 0.08
-    unit_bonus = out.get("発注単位", pd.Series([""] * len(out), index=out.index)).astype(str).map({"単元株": 0.10, "S株": -0.04}).fillna(0.0)
-    status_bonus = out.get("Entry状態", pd.Series([""] * len(out), index=out.index)).astype(str).map({"発注圏": 0.18, "追随可": 0.08, "押し目待ち": 0.04, "様子見": -0.03}).fillna(0.0)
+    unit_bonus = out.get("発注単位", pd.Series([""] * len(out), index=out.index)).astype(str).map({"単元株": 0.16, "S株": -0.08}).fillna(0.0)
+    status_bonus = out.get("Entry状態", pd.Series([""] * len(out), index=out.index)).astype(str).map({"発注圏": 0.18, "追随可": 0.08, "押し目待ち": 0.02, "様子見": -0.05}).fillna(0.0)
+    strategy_text = out.get("推奨方式", pd.Series([""] * len(out), index=out.index)).astype(str)
+    strategy_bonus = strategy_text.map(lambda x: 0.08 if "順張り" in x else (0.04 if "反転確認" in x else (-0.08 if "監視" in x else (-0.03 if "レンジ" in x else 0.0))))
     actionable_bonus = actionable_series.astype(float) * 0.10
 
     out["実行優先スコア"] = (
         out["実行優先度"].astype(float)
         + 0.52 * rr_norm.fillna(0.0)
-        + 0.20 * base_norm.fillna(0.0)
-        + 0.18 * reversal_score.fillna(0.0)
+        + 0.18 * base_norm.fillna(0.0)
+        + 0.16 * reversal_score.fillna(0.0)
         + reversal_bonus
         + 0.06 * unit_budget_ok.astype(float)
         + 0.04 * unit_reco_ok.astype(float)
         + actionable_bonus
         + status_bonus
         + unit_bonus
+        + strategy_bonus
         + tailwind_bonus
         - headwind_penalty
     )
@@ -2909,6 +3070,14 @@ def _split_live_rankings_core(
     if len(wait_df):
         if "銘柄" in wait_df.columns:
             wait_df = wait_df.drop_duplicates(subset=["銘柄"], keep="first")
+        wait_df = _reorder_with_diversity(
+            wait_df,
+            top_n=int(wait_top) if wait_top is not None else len(wait_df),
+            score_cols=["実行優先度", "実行優先スコア", "実質RR", "短期反転スコア", "総合スコア"],
+            prefer_unit=True,
+            min_unit_ratio=0.50,
+            max_bucket_ratio=0.42,
+        )
         if wait_top is not None:
             wait_df = wait_df.head(int(wait_top)).copy()
 
@@ -3456,6 +3625,18 @@ def build_live_execution_views(
     live_order = now_ids + wait_ids
     if len(parent):
         remaining = [int(x) for x in parent.index.tolist() if int(x) not in set(live_order)]
+        if remaining:
+            remaining_df = parent.loc[[i for i in remaining if i in parent.index]].copy()
+            remaining_slots = len(remaining_df) if live_top is None else max(int(live_top) - len(live_order), 0)
+            remaining_df = _reorder_with_diversity(
+                remaining_df,
+                top_n=remaining_slots if remaining_slots > 0 else len(remaining_df),
+                score_cols=["実行優先度", "実行優先スコア", "実質RR", "短期反転スコア", "総合スコア"],
+                prefer_unit=True,
+                min_unit_ratio=0.40,
+                max_bucket_ratio=0.42,
+            )
+            remaining = pd.to_numeric(remaining_df["__row_id__"], errors="coerce").dropna().astype(int).tolist()
         live_order = live_order + remaining
     if live_top is not None:
         live_order = live_order[: int(live_top)]
