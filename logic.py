@@ -1222,67 +1222,42 @@ def _trend_features(df: pd.DataFrame) -> Dict[str, float]:
     }
 
 
-def _strategy_bucket(strategy_name: str) -> str:
-    s = str(strategy_name or "").strip()
-    if s.startswith("順張り"):
-        return "順張り"
-    if s.startswith("押し目買い") or s.startswith("押し目監視"):
-        return "押し目"
-    if s.startswith("逆張り"):
-        return "逆張り"
-    if s.startswith("レンジ"):
-        return "レンジ"
-    return s[:8] if s else "その他"
-
-
 def _pick_strategy(features: Dict[str, float], atr_pct: float) -> str:
     r20 = pd.to_numeric(pd.Series([features.get("ret_20", np.nan)]), errors="coerce").iloc[0]
     r60 = pd.to_numeric(pd.Series([features.get("ret_60", np.nan)]), errors="coerce").iloc[0]
     reversal_score = pd.to_numeric(pd.Series([features.get("reversal_score", np.nan)]), errors="coerce").iloc[0]
     pullback = pd.to_numeric(pd.Series([features.get("pullback_from_high20", np.nan)]), errors="coerce").iloc[0]
-    pos_vs_ma20 = pd.to_numeric(pd.Series([features.get("pos_vs_ma20", np.nan)]), errors="coerce").iloc[0]
 
     strong_uptrend = bool(features.get("strong_uptrend", False))
     uptrend_bias = bool(features.get("uptrend_bias", False))
     pullback_candidate = bool(features.get("pullback_candidate", False))
     reversal_confirmed = bool(features.get("reversal_confirmed", False))
-    breakout_3 = bool(features.get("breakout_3", False))
     breakout_10 = bool(features.get("breakout_10", False))
     trend_headwind = bool(features.get("trend_headwind", False))
     strong_downtrend = bool(features.get("strong_downtrend", False))
 
     if strong_uptrend and breakout_10 and (not np.isfinite(r20) or r20 > 0.03):
-        return "順張り（ブレイク）"
+        return "順張り（ブレイク/上昇トレンド）"
 
-    if strong_uptrend and pullback_candidate and reversal_confirmed:
-        return "押し目買い（反転確認）"
+    if pullback_candidate and (reversal_confirmed or (np.isfinite(reversal_score) and reversal_score >= 0.46)):
+        return "押し目買い（回復狙い）"
 
-    if pullback_candidate and (np.isfinite(reversal_score) and reversal_score >= 0.50) and not trend_headwind:
-        return "押し目買い（初動待ち）"
-
-    if uptrend_bias and breakout_3 and (not trend_headwind) and (not np.isfinite(pos_vs_ma20) or pos_vs_ma20 >= -0.01):
-        return "順張り（押し目継続）"
-
-    if (np.isfinite(r20) and r20 < -0.08) and reversal_confirmed and not strong_downtrend and (not np.isfinite(r60) or r60 > -0.08):
-        return "逆張り（反転確認）"
-
-    if (np.isfinite(r20) and r20 < -0.05) and (np.isfinite(reversal_score) and reversal_score >= 0.54) and not strong_downtrend:
-        return "逆張り（初動）"
+    if (np.isfinite(r20) and r20 < -0.06) and (reversal_confirmed or (np.isfinite(reversal_score) and reversal_score >= 0.58)) and not strong_downtrend:
+        return "逆張り（リバウンド狙い）"
 
     if np.isfinite(atr_pct) and atr_pct < 1.5 and not strong_uptrend and not trend_headwind:
         return "レンジ（小動き）"
 
-    if uptrend_bias and np.isfinite(pullback) and pullback <= -0.03 and not reversal_confirmed:
-        return "押し目監視（初動待ち）"
+    if uptrend_bias and np.isfinite(pullback) and pullback <= -0.01:
+        return "押し目買い（回復狙い）"
 
-    if strong_uptrend or uptrend_bias:
-        return "順張り（上昇継続）"
+    if reversal_confirmed and not strong_downtrend and (not np.isfinite(r60) or r60 > -0.05):
+        return "逆張り（リバウンド狙い）"
 
-    if (np.isfinite(reversal_score) and reversal_score >= 0.42) and not strong_downtrend:
-        return "レンジ（反発待ち）"
+    if strong_uptrend:
+        return "順張り（ブレイク/上昇トレンド）"
 
     return "レンジ（小動き）"
-
 
 def _read_latest_dates(conn) -> Tuple[Optional[str], Optional[str]]:
     with conn.cursor() as cur:
@@ -2532,6 +2507,103 @@ def _recalc_live_execution_plan(df_plan: pd.DataFrame, capital_total: float = 30
     return out
 
 
+
+def _clean_exec_text(value: Any) -> str:
+    s = "" if value is None else str(value).strip()
+    if s in ("nan", "NaN", "None", "none", "<NA>"):
+        return ""
+    return s
+
+
+def _execution_band_label(code: int) -> str:
+    return {
+        90: "単元株即時候補",
+        80: "単元株監視候補(押し目)",
+        70: "単元株監視候補",
+        60: "単元株追随候補(厳格)",
+        50: "S株即時候補(例外)",
+        40: "S株監視候補(押し目)",
+        35: "S株発注圏候補(最終補完)",
+        34: "S株追随候補(最終補完)",
+        30: "S株監視候補",
+        10: "発注保留",
+        0: "見送り",
+    }.get(int(code), "見送り")
+
+
+def _derive_execution_band(
+    row_like: Dict[str, Any],
+    strict_chase_rr: float = 1.30,
+    strict_s_rr: float = 1.35,
+    now_rr_min: float = 1.00,
+) -> Tuple[int, str, Dict[str, Any]]:
+    import pandas as pd
+    import numpy as np
+    import re
+
+    status = _clean_exec_text(row_like.get("Entry状態", ""))
+    unit = _clean_exec_text(row_like.get("発注単位", ""))
+    reason = _clean_exec_text(row_like.get("発注不可理由", ""))
+    reversal_tag = _clean_exec_text(row_like.get("短期反転確認", "")) or "未確認"
+    trend_text = _clean_exec_text(row_like.get("トレンド監査", ""))
+    rr = pd.to_numeric(pd.Series([row_like.get("実質RR", np.nan)]), errors="coerce").iloc[0]
+    fail_flag = pd.to_numeric(pd.Series([row_like.get("再計算失敗フラグ", 0)]), errors="coerce").fillna(0).iloc[0]
+    shares = pd.to_numeric(pd.Series([row_like.get("推奨株数", 0)]), errors="coerce").fillna(0).iloc[0]
+
+    refresh_ok = bool(fail_flag <= 0)
+    shares_ok = bool(shares > 0)
+    budget_ok = _clean_exec_text(row_like.get("単元予算可否", "")) == "可"
+    reco_ok = _clean_exec_text(row_like.get("単元推奨可否", row_like.get("単元株可否", ""))) == "可"
+    reversal_ok = reversal_tag in ("確認", "準確認")
+    reversal_strict = reversal_tag == "確認"
+    trend_headwind = bool(re.search(r"下降継続|下向き圧力", trend_text))
+    actionable = refresh_ok and shares_ok and (reason == "") and status != "" and (not status.startswith("見送り"))
+
+    soft_s_rr = min(float(strict_s_rr), max(1.20, float(strict_s_rr) - 0.20))
+    soft_s_chase_rr = max(1.30, min(float(strict_chase_rr), float(strict_s_rr) - 0.05))
+
+    code = 0
+    if not actionable:
+        code = 10 if (refresh_ok and reason != "") else 0
+    elif unit == "単元株":
+        if budget_ok and reco_ok:
+            if status == "発注圏" and reversal_ok and ((not trend_headwind) or reversal_strict) and (pd.isna(rr) or rr >= max(float(now_rr_min), 1.00)):
+                code = 90
+            elif status == "追随可" and reversal_strict and (not trend_headwind) and (not pd.isna(rr)) and rr >= float(strict_chase_rr):
+                code = 60
+            elif status == "押し目待ち" and (pd.isna(rr) or rr >= 0.90) and (reversal_ok or (not trend_headwind)):
+                code = 80
+            elif status == "様子見" and (pd.isna(rr) or rr >= 0.90) and (reversal_ok or (not trend_headwind)):
+                code = 70
+    elif unit == "S株":
+        if status == "発注圏" and reversal_strict and (not trend_headwind) and (not pd.isna(rr)) and rr >= float(strict_s_rr):
+            code = 50
+        elif status == "発注圏" and reversal_ok and (pd.isna(rr) or rr >= soft_s_rr):
+            code = 35
+        elif status == "追随可" and reversal_strict and (not trend_headwind) and (not pd.isna(rr)) and rr >= soft_s_chase_rr:
+            code = 34
+        elif status == "押し目待ち" and reversal_ok and (pd.isna(rr) or rr >= 0.95):
+            code = 40
+        elif status in ("様子見", "追随可") and reversal_ok and (pd.isna(rr) or rr >= 1.00):
+            code = 30
+
+    meta = {
+        "status": status,
+        "unit": unit,
+        "reason": reason,
+        "rr": float(rr) if pd.notna(rr) else np.nan,
+        "refresh_ok": refresh_ok,
+        "shares_ok": shares_ok,
+        "budget_ok": budget_ok,
+        "reco_ok": reco_ok,
+        "reversal_ok": reversal_ok,
+        "reversal_strict": reversal_strict,
+        "trend_headwind": trend_headwind,
+        "actionable": actionable,
+    }
+    return int(code), _execution_band_label(int(code)), meta
+
+
 def _compute_live_execution_priority(df: pd.DataFrame, strict_chase_rr: float = 1.30, strict_s_rr: float = 1.35) -> pd.DataFrame:
     """ライブ再計算後の実行優先度を付与する。selected_live_top20 の並び替えにも使う。"""
     import pandas as pd
@@ -2544,59 +2616,31 @@ def _compute_live_execution_priority(df: pd.DataFrame, strict_chase_rr: float = 
     for c in ["Entry状態", "発注単位", "発注不可理由", "売買優先区分", "単元予算可否", "単元推奨可否", "単元株可否", "短期反転確認", "トレンド監査"]:
         if c not in out.columns:
             out[c] = ""
-        out[c] = out[c].astype(str).replace(["nan", "None"], "")
+        out[c] = out[c].map(_clean_exec_text)
     for c in ["実質RR", "総合スコア", "再計算失敗フラグ", "短期反転スコア"]:
         if c not in out.columns:
             out[c] = np.nan
         out[c] = pd.to_numeric(out[c], errors="coerce")
 
-    status = out["Entry状態"].fillna("").astype(str)
-    unit = out["発注単位"].fillna("").astype(str)
-    reason = out["発注不可理由"].fillna("").astype(str)
+    band_codes = []
+    for _, row in out.iterrows():
+        code, _, _ = _derive_execution_band(
+            row.to_dict(),
+            strict_chase_rr=float(strict_chase_rr),
+            strict_s_rr=float(strict_s_rr),
+            now_rr_min=1.00,
+        )
+        band_codes.append(int(code))
+
+    out["実行優先度"] = pd.Series(band_codes, index=out.index, dtype="int64")
+    out["実行優先帯"] = out["実行優先度"].map(_execution_band_label).fillna("見送り")
+
     rr = out["実質RR"].fillna(0.0)
     base = out["総合スコア"].fillna(0.0)
     reversal_score = out["短期反転スコア"].fillna(0.0).clip(lower=0.0, upper=1.0)
     reversal_label = out["短期反転確認"].replace("", "未確認")
-    refresh_ok = out["再計算失敗フラグ"].fillna(0) <= 0
     unit_budget_ok = out.get("単元予算可否", pd.Series([""] * len(out), index=out.index)).astype(str).eq("可")
-    unit_reco_ok = out.get("単元推奨可否", out.get("単元株可否", pd.Series([""] * len(out), index=out.index))).astype(str).eq("可")
-    reason_blank = reason.str.strip().eq("")
     trend_headwind = out.get("トレンド監査", pd.Series([""] * len(out), index=out.index)).astype(str).str.contains("下降継続|下向き圧力", regex=True, na=False)
-    reversal_ok = reversal_label.isin(["確認", "準確認"])
-    reversal_strict = reversal_label.eq("確認")
-    actionable = refresh_ok & reason_blank & (~status.str.startswith("見送り"))
-
-    soft_s_rr = min(float(strict_s_rr), max(1.20, float(strict_s_rr) - 0.20))
-    soft_s_chase_rr = max(1.30, min(float(strict_chase_rr), float(strict_s_rr) - 0.05))
-
-    band = pd.Series(0, index=out.index, dtype="int64")
-    band = pd.Series(np.where(actionable & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & status.eq("発注圏") & reversal_ok & (~trend_headwind | reversal_strict) & (rr >= 1.00), 90, band), index=out.index)
-    band = pd.Series(np.where(actionable & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & status.eq("押し目待ち") & (rr >= 0.90), 80, band), index=out.index)
-    band = pd.Series(np.where(actionable & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & status.eq("様子見") & (rr >= 0.90), 70, band), index=out.index)
-    band = pd.Series(np.where(actionable & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & status.eq("追随可") & reversal_strict & (~trend_headwind) & (rr >= strict_chase_rr), 60, band), index=out.index)
-    band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("発注圏") & reversal_strict & (~trend_headwind) & (rr >= strict_s_rr), 50, band), index=out.index)
-    band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("発注圏") & reversal_ok & (rr >= soft_s_rr) & (rr < strict_s_rr) & (band < 50), 35, band), index=out.index)
-    band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("追随可") & reversal_strict & (rr >= soft_s_chase_rr) & (band < 35), 34, band), index=out.index)
-    band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("押し目待ち") & (rr >= 0.95), 40, band), index=out.index)
-    band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("様子見") & (rr >= 0.95) & (band < 34), 30, band), index=out.index)
-    band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("追随可") & reversal_ok & (rr >= 0.95) & (band < 34), 30, band), index=out.index)
-    band = pd.Series(np.where(refresh_ok & (~reason_blank) & (band == 0), 10, band), index=out.index)
-
-    label_map = {
-        90: "単元株即時候補",
-        80: "単元株監視候補(押し目)",
-        70: "単元株監視候補",
-        60: "単元株追随候補(厳格)",
-        50: "S株即時候補(例外)",
-        35: "S株発注圏候補(最終補完)",
-        34: "S株追随候補(最終補完)",
-        40: "S株監視候補(押し目)",
-        30: "S株監視候補",
-        10: "発注保留",
-        0: "見送り",
-    }
-    out["実行優先帯"] = band.map(label_map).fillna("見送り")
-    out["実行優先度"] = band.astype(int)
 
     rr_norm = rr.clip(lower=0.0, upper=2.5) / 2.5
     base_span = float(base.max() - base.min()) if len(base) else 0.0
@@ -2607,14 +2651,7 @@ def _compute_live_execution_priority(df: pd.DataFrame, strict_chase_rr: float = 
 
     reversal_bonus = reversal_label.map({"確認": 0.22, "準確認": 0.08, "未確認": -0.10}).fillna(0.0)
     headwind_penalty = trend_headwind.astype(float) * 0.12
-    strategy_name = out.get("推奨方式", pd.Series([""] * len(out), index=out.index)).astype(str)
-    strategy_bucket = strategy_name.map(_strategy_bucket)
-    single_lot_bonus = (
-        0.10 * (unit.eq("単元株") & unit_budget_ok & unit_reco_ok).astype(float)
-        + 0.04 * (unit.eq("単元株") & unit_budget_ok).astype(float)
-        - 0.03 * unit.eq("S株").astype(float)
-    )
-    strategy_seed_bonus = strategy_bucket.map({"順張り": 0.04, "逆張り": 0.03, "押し目": 0.00, "レンジ": -0.01}).fillna(0.0)
+    unit_bonus = out.get("発注単位", pd.Series([""] * len(out), index=out.index)).astype(str).map({"単元株": 0.06, "S株": -0.02}).fillna(0.0)
 
     out["実行優先スコア"] = (
         out["実行優先度"].astype(float)
@@ -2623,98 +2660,11 @@ def _compute_live_execution_priority(df: pd.DataFrame, strict_chase_rr: float = 
         + 0.18 * reversal_score.fillna(0.0)
         + reversal_bonus
         + 0.05 * unit_budget_ok.astype(float)
-        + single_lot_bonus
-        + strategy_seed_bonus
+        + unit_bonus
         - headwind_penalty
     )
     return out
 
-
-def _rebalance_live_top_order(df: pd.DataFrame, top_n: int) -> pd.DataFrame:
-    """selected_live_top20 の先頭側だけ、単元株を少し優遇しつつ戦略の偏りを緩和する。"""
-    import pandas as pd
-    import numpy as np
-
-    if df is None or len(df) == 0:
-        return df
-    if top_n is None or int(top_n) <= 0 or len(df) <= 1:
-        return df.copy()
-
-    work = df.copy().reset_index(drop=True)
-    for c in ["実行優先スコア", "実質RR", "短期反転スコア", "総合スコア"]:
-        if c not in work.columns:
-            work[c] = np.nan
-        work[c] = pd.to_numeric(work[c], errors="coerce")
-
-    def _norm01(s: pd.Series) -> pd.Series:
-        s = pd.to_numeric(s, errors="coerce")
-        lo = s.min(skipna=True)
-        hi = s.max(skipna=True)
-        if pd.isna(lo) or pd.isna(hi) or hi <= lo:
-            return pd.Series(np.zeros(len(s)), index=s.index, dtype=float)
-        return (s - lo) / (hi - lo)
-
-    exec_norm = _norm01(work["実行優先スコア"]).fillna(0.0)
-    rr_norm = _norm01(work["実質RR"]).fillna(0.0)
-    rev_norm = _norm01(work["短期反転スコア"]).fillna(0.0)
-    base_norm = _norm01(work["総合スコア"]).fillna(0.0)
-
-    unit = work.get("発注単位", pd.Series([""] * len(work), index=work.index)).astype(str)
-    unit_budget_ok = work.get("単元予算可否", pd.Series([""] * len(work), index=work.index)).astype(str).eq("可")
-    unit_reco_ok = work.get("単元推奨可否", work.get("単元株可否", pd.Series([""] * len(work), index=work.index))).astype(str).eq("可")
-    status = work.get("Entry状態", pd.Series([""] * len(work), index=work.index)).astype(str)
-    rev_label = work.get("短期反転確認", pd.Series(["未確認"] * len(work), index=work.index)).astype(str).replace("", "未確認")
-    trend_text = work.get("トレンド監査", pd.Series([""] * len(work), index=work.index)).astype(str)
-    strategy_bucket = work.get("推奨方式", pd.Series([""] * len(work), index=work.index)).astype(str).map(_strategy_bucket)
-
-    single_lot_bonus = np.where(unit.eq("単元株") & unit_budget_ok & unit_reco_ok, 0.16, 0.0)
-    single_lot_bonus = pd.Series(single_lot_bonus, index=work.index) - pd.Series(np.where(unit.eq("S株"), 0.04, 0.0), index=work.index)
-    rev_label_bonus = rev_label.map({"確認": 0.09, "準確認": 0.03, "未確認": -0.03}).fillna(0.0)
-    status_bonus = status.map({"発注圏": 0.10, "追随可": 0.05, "押し目待ち": 0.02, "様子見": -0.04}).fillna(0.0)
-    trend_bonus = trend_text.map(lambda x: 0.04 if ("上昇基調" in x or "中期上向き" in x) else (-0.05 if "下降継続" in x else 0.0))
-
-    base_priority = (
-        0.58 * exec_norm
-        + 0.18 * rr_norm
-        + 0.10 * rev_norm
-        + 0.08 * base_norm
-        + single_lot_bonus
-        + rev_label_bonus
-        + status_bonus
-        + trend_bonus
-    )
-
-    remaining = list(work.index)
-    selected = []
-    bucket_counts = {}
-    bucket_first_bonus = {"順張り": 0.06, "逆張り": 0.05, "レンジ": 0.03, "押し目": 0.00}
-    bucket_dup_penalty = {"押し目": 0.085, "順張り": 0.035, "逆張り": 0.030, "レンジ": 0.025}
-
-    pick_n = min(int(top_n), len(work))
-    for _ in range(pick_n):
-        best_idx = None
-        best_score = None
-        for idx in remaining:
-            bucket = strategy_bucket.get(idx, "その他")
-            used = int(bucket_counts.get(bucket, 0))
-            bonus = bucket_first_bonus.get(bucket, 0.02) if used == 0 else 0.0
-            penalty = bucket_dup_penalty.get(bucket, 0.03) * used
-            if bucket == "押し目" and used >= 2:
-                penalty += 0.03 * (used - 1)
-            score = float(base_priority.get(idx, 0.0)) + bonus - penalty
-            if best_score is None or score > best_score:
-                best_score = score
-                best_idx = idx
-        if best_idx is None:
-            break
-        selected.append(best_idx)
-        remaining.remove(best_idx)
-        bucket = strategy_bucket.get(best_idx, "その他")
-        bucket_counts[bucket] = int(bucket_counts.get(bucket, 0)) + 1
-
-    final_order = selected + remaining
-    out = work.loc[final_order].reset_index(drop=True)
-    return out
 
 
 def _ensure_profit_display_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -2800,6 +2750,7 @@ def _standardize_live_output_schema(df: pd.DataFrame) -> pd.DataFrame:
     return out[[c for c in LIVE_OUTPUT_SCHEMA if c in out.columns or c == "順位"]]
 
 
+
 def _split_live_rankings_core(
     df_selected: pd.DataFrame,
     now_top: int = 10,
@@ -2825,178 +2776,89 @@ def _split_live_rankings_core(
         strict_s_rr=float(s_now_rr_min),
     ).copy() if recompute_priority else df_selected.copy()
 
-    for c in [
-        "Entry状態", "発注単位", "発注不可理由", "価格更新状態", "再計算失敗フラグ",
-        "売買優先区分", "単元予算可否", "単元推奨可否", "単元株可否", "実行優先帯"
-    ]:
-        if c not in work.columns:
-            work[c] = ""
-    for c in [
-        "Entry状態", "発注単位", "発注不可理由", "価格更新状態",
-        "売買優先区分", "単元予算可否", "単元推奨可否", "単元株可否", "実行優先帯"
-    ]:
-        work[c] = work[c].astype(str).replace(["nan", "None"], "")
-
-    for c in [
-        "実質RR", "総合スコア", "推奨投資額(円)", "想定損失(円)", "推奨株数",
-        "再計算失敗フラグ", "単元必要資金(円)", "単元想定損失(円)", "実行優先度", "実行優先スコア"
-    ]:
+    for c in ["実行優先度", "実行優先スコア", "実質RR", "総合スコア", "推奨投資額(円)", "想定損失(円)", "推奨株数", "再計算失敗フラグ"]:
         if c not in work.columns:
             work[c] = np.nan
-        work[c] = pd.to_numeric(work[c], errors='coerce')
+        work[c] = pd.to_numeric(work[c], errors="coerce")
 
-    rr_floor = float(now_rr_min) if np.isfinite(now_rr_min) else 1.00
-    chase_floor = max(rr_floor, float(chase_rr_min) if np.isfinite(chase_rr_min) else 1.45)
-    wait_floor = float(wait_rr_min) if np.isfinite(wait_rr_min) else min(rr_floor, 0.90)
-    s_floor = max(rr_floor, float(s_now_rr_min) if np.isfinite(s_now_rr_min) else 1.50)
-    s_soft_floor = min(s_floor, max(1.20, s_floor - 0.20))
-    s_chase_soft_floor = max(1.30, min(chase_floor, s_floor - 0.05))
-    s_limit = max(int(s_now_max or 0), 0)
-    chase_limit = max(int(chase_now_max or 0), 0)
-
-    status = work["Entry状態"].astype(str).fillna("")
-    unit = work["発注単位"].astype(str).fillna("")
-    reason = work["発注不可理由"].astype(str).fillna("")
-    band = work.get("実行優先帯", pd.Series([""] * len(work), index=work.index)).astype(str)
-    rr = pd.to_numeric(work["実質RR"], errors='coerce')
-    unit_budget_ok = work.get("単元予算可否", pd.Series([""] * len(work), index=work.index)).astype(str).eq("可")
-    unit_reco_ok = work.get("単元推奨可否", work.get("単元株可否", pd.Series([""] * len(work), index=work.index))).astype(str).eq("可")
-
-    actionable = (
-        (~status.str.startswith("見送り"))
-        & (band != "見送り")
-        & ((reason == "") | (reason == "nan"))
-        & (work["推奨株数"].fillna(0) > 0)
-        & (work["再計算失敗フラグ"].fillna(0) <= 0)
-    )
-
-    unit_now_core_mask = actionable & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & status.eq("発注圏") & (rr >= rr_floor)
-    unit_chase_mask = actionable & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & status.eq("追随可") & (rr >= chase_floor)
-    s_now_mask = actionable & unit.eq("S株") & status.eq("発注圏") & (rr >= s_floor)
-    s_fallback_mask = actionable & unit.eq("S株") & status.eq("発注圏") & (rr >= s_soft_floor)
-    s_chase_fallback_mask = actionable & unit.eq("S株") & status.eq("追随可") & (rr >= s_chase_soft_floor)
+    band_code = pd.to_numeric(work.get("実行優先度", 0), errors="coerce").fillna(0).astype(int)
 
     def _sort_candidates(df_part: pd.DataFrame, extra_cols=None):
         extra_cols = extra_cols or []
-        cols = ["実行優先度", "実行優先スコア", "実質RR", "総合スコア"] + list(extra_cols)
+        cols = ["実行優先度", "実行優先スコア", "実質RR", "短期反転スコア", "総合スコア"] + list(extra_cols)
         existing = [c for c in cols if c in df_part.columns]
         if not len(df_part):
             return df_part
-        return df_part.sort_values(existing, ascending=[False] * len(existing), na_position='last')
+        return df_part.sort_values(existing, ascending=[False] * len(existing), na_position="last")
 
     now_frames = []
     used_idx = set()
-    unit_core_df = _sort_candidates(work.loc[unit_now_core_mask].copy())
+
+    unit_core_df = _sort_candidates(work.loc[band_code.eq(90)].copy())
     if len(unit_core_df):
-        core_take = unit_core_df.head(int(now_top)).copy() if now_top is not None else unit_core_df.copy()
-        now_frames.append(core_take)
-        used_idx.update(core_take.index.tolist())
+        take = unit_core_df.head(int(now_top)).copy() if now_top is not None else unit_core_df.copy()
+        now_frames.append(take)
+        used_idx.update(take.index.tolist())
 
     remaining_slots = max(int(now_top) - sum(len(x) for x in now_frames), 0) if now_top is not None else None
     has_any_core = sum(len(x) for x in now_frames) > 0
 
-    # 追随可は「発注圏候補が0件の時のみ」最大1件に限定（単元株をS株例外より優先）
-    if (not has_any_core) and chase_limit > 0 and (remaining_slots is None or remaining_slots > 0):
-        chase_candidates = _sort_candidates(work.loc[unit_chase_mask & (~work.index.isin(list(used_idx)))].copy())
+    if (not has_any_core) and max(int(chase_now_max or 0), 0) > 0 and (remaining_slots is None or remaining_slots > 0):
+        chase_candidates = _sort_candidates(work.loc[band_code.eq(60) & (~work.index.isin(list(used_idx)))].copy())
         if len(chase_candidates):
-            chase_take_n = chase_limit if remaining_slots is None else min(chase_limit, remaining_slots)
-            chase_take = chase_candidates.head(int(chase_take_n)).copy()
-            now_frames.append(chase_take)
-            used_idx.update(chase_take.index.tolist())
-            if remaining_slots is not None:
-                remaining_slots = max(remaining_slots - len(chase_take), 0)
-            has_any_core = sum(len(x) for x in now_frames) > 0
+            take_n = max(int(chase_now_max or 0), 0) if remaining_slots is None else min(max(int(chase_now_max or 0), 0), remaining_slots)
+            take = chase_candidates.head(int(take_n)).copy()
+            if len(take):
+                now_frames.append(take)
+                used_idx.update(take.index.tolist())
+                if remaining_slots is not None:
+                    remaining_slots = max(remaining_slots - len(take), 0)
+                has_any_core = True
 
-    # S株例外は「単元株の発注圏/追随可補完が無い時のみ」最大1件に限定
-    if (not has_any_core) and s_limit > 0 and (remaining_slots is None or remaining_slots > 0):
-        s_candidates = _sort_candidates(work.loc[s_now_mask & (~work.index.isin(list(used_idx)))].copy())
+    if (not has_any_core) and max(int(s_now_max or 0), 0) > 0 and (remaining_slots is None or remaining_slots > 0):
+        s_candidates = _sort_candidates(work.loc[band_code.eq(50) & (~work.index.isin(list(used_idx)))].copy())
         if len(s_candidates):
-            s_take_n = s_limit if remaining_slots is None else min(s_limit, remaining_slots)
-            s_take = s_candidates.head(int(s_take_n)).copy()
-            now_frames.append(s_take)
-            used_idx.update(s_take.index.tolist())
-            if remaining_slots is not None:
-                remaining_slots = max(remaining_slots - len(s_take), 0)
-            has_any_core = sum(len(x) for x in now_frames) > 0
-
-    # 最終補完: 厳格条件でnowが空でも、発注圏の候補があるなら最良の1件だけ採用
-    if (not has_any_core) and (remaining_slots is None or remaining_slots > 0):
-        fallback_candidates = _sort_candidates(
-            work.loc[
-                s_fallback_mask
-                & (~work.index.isin(list(used_idx)))
-            ].copy()
-        )
-        if len(fallback_candidates):
-            fallback_take_n = 1 if remaining_slots is None else min(1, remaining_slots)
-            fallback_take = fallback_candidates.head(int(fallback_take_n)).copy()
-            if len(fallback_take):
-                fallback_take["実行優先帯"] = "S株発注圏候補(最終補完)"
-                fallback_take["実行優先度"] = pd.to_numeric(fallback_take.get("実行優先度", np.nan), errors="coerce").fillna(35).clip(lower=35)
-                now_frames.append(fallback_take)
-                used_idx.update(fallback_take.index.tolist())
+            take_n = max(int(s_now_max or 0), 0) if remaining_slots is None else min(max(int(s_now_max or 0), 0), remaining_slots)
+            take = s_candidates.head(int(take_n)).copy()
+            if len(take):
+                now_frames.append(take)
+                used_idx.update(take.index.tolist())
                 if remaining_slots is not None:
-                    remaining_slots = max(remaining_slots - len(fallback_take), 0)
-                has_any_core = sum(len(x) for x in now_frames) > 0
+                    remaining_slots = max(remaining_slots - len(take), 0)
+                has_any_core = True
 
-    # 追加補完: 発注圏が無くても、S株の強い追随可があるなら最良の1件だけ採用
     if (not has_any_core) and (remaining_slots is None or remaining_slots > 0):
-        chase_fallback_candidates = _sort_candidates(
-            work.loc[
-                s_chase_fallback_mask
-                & (~work.index.isin(list(used_idx)))
-            ].copy()
-        )
-        if len(chase_fallback_candidates):
-            chase_fallback_take_n = 1 if remaining_slots is None else min(1, remaining_slots)
-            chase_fallback_take = chase_fallback_candidates.head(int(chase_fallback_take_n)).copy()
-            if len(chase_fallback_take):
-                chase_fallback_take["実行優先帯"] = "S株追随候補(最終補完)"
-                chase_fallback_take["実行優先度"] = pd.to_numeric(chase_fallback_take.get("実行優先度", np.nan), errors="coerce").fillna(34).clip(lower=34)
-                now_frames.append(chase_fallback_take)
-                used_idx.update(chase_fallback_take.index.tolist())
+        fallback = _sort_candidates(work.loc[band_code.eq(35) & (~work.index.isin(list(used_idx)))].copy())
+        if len(fallback):
+            take = fallback.head(1 if remaining_slots is None else min(1, remaining_slots)).copy()
+            if len(take):
+                take["実行優先帯"] = "S株発注圏候補(最終補完)"
+                take["実行優先度"] = 35
+                now_frames.append(take)
+                used_idx.update(take.index.tolist())
                 if remaining_slots is not None:
-                    remaining_slots = max(remaining_slots - len(chase_fallback_take), 0)
-                has_any_core = sum(len(x) for x in now_frames) > 0
+                    remaining_slots = max(remaining_slots - len(take), 0)
+                has_any_core = True
+
+    if (not has_any_core) and (remaining_slots is None or remaining_slots > 0):
+        chase_fallback = _sort_candidates(work.loc[band_code.eq(34) & (~work.index.isin(list(used_idx)))].copy())
+        if len(chase_fallback):
+            take = chase_fallback.head(1 if remaining_slots is None else min(1, remaining_slots)).copy()
+            if len(take):
+                take["実行優先帯"] = "S株追随候補(最終補完)"
+                take["実行優先度"] = 34
+                now_frames.append(take)
+                used_idx.update(take.index.tolist())
+                if remaining_slots is not None:
+                    remaining_slots = max(remaining_slots - len(take), 0)
+                has_any_core = True
 
     now_df = pd.concat(now_frames, axis=0, ignore_index=False, sort=False) if now_frames else work.iloc[0:0].copy()
 
-    trend_text = work.get("トレンド監査", pd.Series([""] * len(work), index=work.index)).astype(str)
-    trend_headwind = trend_text.str.contains("下降継続|下向き圧力", regex=True, na=False)
-    reversal_label = work.get("短期反転確認", pd.Series(["未確認"] * len(work), index=work.index)).astype(str).replace("", "未確認")
-    reversal_score = pd.to_numeric(work.get("短期反転スコア", pd.Series([0.0] * len(work), index=work.index)), errors="coerce").fillna(0.0)
-    strategy_bucket = work.get("推奨方式", pd.Series([""] * len(work), index=work.index)).astype(str).map(_strategy_bucket)
-
-    core_watch_mask = status.isin(["発注圏", "追随可"])
-    pullback_watch_mask = (
-        status.eq("押し目待ち")
-        & (
-            reversal_label.isin(["確認", "準確認"])
-            | ((reversal_score >= 0.36) & (~trend_headwind) & strategy_bucket.isin(["押し目", "順張り", "逆張り"]))
-        )
-    )
-    tentative_watch_mask = (
-        status.eq("様子見")
-        & unit.eq("単元株")
-        & unit_budget_ok
-        & unit_reco_ok
-        & (reversal_label.eq("確認") | ((reversal_score >= 0.48) & (~trend_headwind) & strategy_bucket.isin(["順張り", "逆張り"])))
-    )
-    watchable_status = core_watch_mask | pullback_watch_mask | tentative_watch_mask
-
-    wait_mask = (
-        actionable
-        & (~work.index.isin(list(used_idx)))
-        & watchable_status
-        & (rr >= wait_floor)
-        & (band != "見送り")
-        & (~status.str.startswith("見送り"))
-    )
-    wait_mask = wait_mask & (~(unit.eq("S株") & status.eq("様子見")))
-    wait_mask = wait_mask & (~(unit.eq("S株") & (reversal_score < 0.38) & (~reversal_label.eq("確認"))))
+    wait_band_codes = {80, 70, 40, 30}
+    wait_mask = (~work.index.isin(list(used_idx))) & band_code.isin(list(wait_band_codes))
     wait_df = work.loc[wait_mask].copy()
 
-    # symbol重複を排除（同一run内で同銘柄が now/wait に重ならないようにする）
     if len(now_df) and "銘柄" in now_df.columns:
         now_df = now_df.drop_duplicates(subset=["銘柄"], keep="first").copy()
     if len(wait_df) and "銘柄" in wait_df.columns:
@@ -3005,7 +2867,7 @@ def _split_live_rankings_core(
 
     if len(now_df):
         def _norm01(s: pd.Series) -> pd.Series:
-            s = pd.to_numeric(s, errors='coerce')
+            s = pd.to_numeric(s, errors="coerce")
             lo = s.min(skipna=True)
             hi = s.max(skipna=True)
             if pd.isna(lo) or pd.isna(hi) or hi <= lo:
@@ -3039,41 +2901,16 @@ def _split_live_rankings_core(
         now_df = now_df.sort_values(
             ["実行優先度", "今すぐ発注スコア", "実質RR", "総合スコア"],
             ascending=[False, False, False, False],
-            na_position='last'
+            na_position="last",
         ).copy()
         if now_top is not None:
             now_df = now_df.head(int(now_top)).copy()
 
     if len(wait_df):
-        def _norm01_wait(s: pd.Series) -> pd.Series:
-            s = pd.to_numeric(s, errors='coerce')
-            lo = s.min(skipna=True)
-            hi = s.max(skipna=True)
-            if pd.isna(lo) or pd.isna(hi) or hi <= lo:
-                return pd.Series(np.zeros(len(s)), index=s.index)
-            return (s - lo) / (hi - lo)
-
-        wait_rr_norm = _norm01_wait(wait_df["実質RR"].fillna(0.0))
-        wait_exec_norm = _norm01_wait(wait_df["実行優先スコア"].fillna(0.0))
-        wait_rev = pd.to_numeric(wait_df.get("短期反転スコア", pd.Series([0.0] * len(wait_df), index=wait_df.index)), errors='coerce').fillna(0.0)
-        wait_rev_norm = _norm01_wait(wait_rev)
-        wait_status_bonus = wait_df["Entry状態"].astype(str).map({"発注圏": 0.32, "追随可": 0.22, "押し目待ち": 0.10, "様子見": -0.05}).fillna(0.0)
-        wait_unit_bonus = wait_df["発注単位"].astype(str).map({"単元株": 0.12, "S株": -0.03}).fillna(0.0)
-        wait_strategy_bonus = wait_df.get("推奨方式", pd.Series([""] * len(wait_df), index=wait_df.index)).astype(str).map(_strategy_bucket).map({"順張り": 0.06, "逆張り": 0.05, "押し目": 0.00, "レンジ": -0.02}).fillna(0.0)
-        wait_headwind_penalty = wait_df.get("トレンド監査", pd.Series([""] * len(wait_df), index=wait_df.index)).astype(str).map(lambda x: 0.08 if ("下降継続" in x or "下向き圧力" in x) else 0.0)
-        wait_df["監視優先スコア"] = (
-            0.55 * wait_exec_norm
-            + 0.18 * wait_rr_norm
-            + 0.14 * wait_rev_norm
-            + wait_status_bonus
-            + wait_unit_bonus
-            + wait_strategy_bonus
-            - wait_headwind_penalty
-        )
         wait_df = wait_df.sort_values(
-            ["監視優先スコア", "実行優先度", "実行優先スコア", "実質RR", "総合スコア"],
-            ascending=[False, False, False, False, False],
-            na_position='last'
+            ["実行優先度", "実行優先スコア", "実質RR", "総合スコア"],
+            ascending=[False, False, False, False],
+            na_position="last",
         ).copy()
         if wait_top is not None:
             wait_df = wait_df.head(int(wait_top)).copy()
@@ -3094,6 +2931,7 @@ def _format_now_empty_reason_summary(work: pd.DataFrame) -> str:
         return "selected_now候補なし"
     parts = [f"{idx}:{int(val)}件" for idx, val in counts.head(5).items()]
     return "selected_nowが空の理由集計 / " + " / ".join(parts)
+
 
 
 def _annotate_execution_membership(
@@ -3119,34 +2957,19 @@ def _annotate_execution_membership(
     if "__row_id__" not in out.columns:
         out["__row_id__"] = np.arange(len(out), dtype=int)
 
-    now_id_set = set([int(x) for x in now_ids])
-    wait_id_set = set([int(x) for x in wait_ids])
-
-    status = out.get("Entry状態", pd.Series([""] * len(out), index=out.index)).astype(str).fillna("")
-    unit = out.get("発注単位", pd.Series([""] * len(out), index=out.index)).astype(str).fillna("")
-    band = out.get("実行優先帯", pd.Series([""] * len(out), index=out.index)).astype(str).fillna("")
-    reason = out.get("発注不可理由", pd.Series([""] * len(out), index=out.index)).astype(str).fillna("")
-    rr = pd.to_numeric(out.get("実質RR", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
-    reversal_label = out.get("短期反転確認", pd.Series([""] * len(out), index=out.index)).astype(str).replace("", "未確認")
-    unit_budget_ok = out.get("単元予算可否", pd.Series([""] * len(out), index=out.index)).astype(str).eq("可")
-    unit_reco_ok = out.get("単元推奨可否", out.get("単元株可否", pd.Series([""] * len(out), index=out.index))).astype(str).eq("可")
-    recalc_ok = pd.to_numeric(out.get("再計算失敗フラグ", pd.Series([0] * len(out), index=out.index)), errors="coerce").fillna(0).le(0)
-    shares_ok = pd.to_numeric(out.get("推奨株数", pd.Series([0] * len(out), index=out.index)), errors="coerce").fillna(0).gt(0)
-
-    unit_core_available = bool(((status == "発注圏") & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & rr.ge(float(now_rr_min)) & recalc_ok & shares_ok & band.ne("見送り") & reason.eq("") & reversal_label.isin(["確認", "準確認"])).any())
+    band_code = pd.to_numeric(out.get("実行優先度", pd.Series([0] * len(out), index=out.index)), errors="coerce").fillna(0).astype(int)
+    now_id_set = set(int(x) for x in now_ids)
+    wait_id_set = set(int(x) for x in wait_ids)
+    unit_core_available = bool(band_code.eq(90).any())
 
     for idx, row in out.iterrows():
         row_id = int(pd.to_numeric(row.get("__row_id__"), errors="coerce"))
-        stt = str(row.get("Entry状態", "") or "")
-        unt = str(row.get("発注単位", "") or "")
-        bnd = str(row.get("実行優先帯", "") or "")
-        rsn = str(row.get("発注不可理由", "") or "").strip()
-        rrv = pd.to_numeric(pd.Series([row.get("実質RR")]), errors="coerce").iloc[0]
-        budget_ok = str(row.get("単元予算可否", "") or "") == "可"
-        reco_ok = str(row.get("単元推奨可否", row.get("単元株可否", "")) or "") == "可"
+        stt = _clean_exec_text(row.get("Entry状態", ""))
+        unt = _clean_exec_text(row.get("発注単位", ""))
+        rsn = _clean_exec_text(row.get("発注不可理由", ""))
         fail_flag = pd.to_numeric(pd.Series([row.get("再計算失敗フラグ")]), errors="coerce").fillna(0).iloc[0]
-        reversal_tag = str(row.get("短期反転確認", "") or "未確認")
         shares = pd.to_numeric(pd.Series([row.get("推奨株数")]), errors="coerce").fillna(0).iloc[0]
+        code = int(pd.to_numeric(pd.Series([row.get("実行優先度", 0)]), errors="coerce").fillna(0).iloc[0])
 
         if row_id in now_id_set:
             out.at[idx, "選定区分"] = "selected_now"
@@ -3156,6 +2979,7 @@ def _annotate_execution_membership(
         if row_id in wait_id_set:
             out.at[idx, "選定区分"] = "selected_wait"
             out.at[idx, "selected_now判定"] = "監視候補"
+
         if fail_flag > 0:
             out.at[idx, "selected_now除外理由"] = "再計算失敗/価格未更新"
             continue
@@ -3165,55 +2989,27 @@ def _annotate_execution_membership(
         if rsn:
             out.at[idx, "selected_now除外理由"] = rsn
             continue
-        if stt.startswith("見送り") or bnd == "見送り":
+
+        if code in (80, 70, 40, 30):
+            out.at[idx, "selected_now除外理由"] = f"監視候補（{stt or '様子見'}）"
+        elif code == 90:
+            out.at[idx, "selected_now除外理由"] = "発注圏だが上位枠外"
+        elif code == 60:
+            out.at[idx, "selected_now除外理由"] = "単元株発注圏優先のため追随可抑制" if unit_core_available else "追随可上限超過"
+        elif code == 50:
+            out.at[idx, "selected_now除外理由"] = "単元株発注圏優先のためS株例外不採用" if unit_core_available else "S株例外/最終補完上限超過"
+        elif code == 35:
+            out.at[idx, "selected_now除外理由"] = "単元株発注圏優先のためS株例外不採用" if unit_core_available else "S株発注圏候補（最終補完未採用）"
+        elif code == 34:
+            out.at[idx, "selected_now除外理由"] = "単元株発注圏優先のためS株追随候補不採用" if unit_core_available else "S株追随候補（最終補完未採用）"
+        elif stt.startswith("見送り"):
             out.at[idx, "selected_now除外理由"] = stt or "見送り"
-            continue
-        if unt == "単元株":
-            if not budget_ok:
-                out.at[idx, "selected_now除外理由"] = "単元予算不可"
-            elif not reco_ok:
-                out.at[idx, "selected_now除外理由"] = "単元推奨不可"
-            elif stt in ["発注圏", "追随可"] and reversal_tag not in ["確認", "準確認"]:
-                out.at[idx, "selected_now除外理由"] = "短期反転未確認"
-            elif stt == "発注圏" and (not pd.isna(rrv)) and rrv < float(now_rr_min):
-                out.at[idx, "selected_now除外理由"] = f"発注圏RR不足<{float(now_rr_min):.2f}"
-            elif stt == "追随可" and (pd.isna(rrv) or rrv < float(chase_rr_min)):
-                out.at[idx, "selected_now除外理由"] = f"追随可RR不足<{float(chase_rr_min):.2f}"
-            elif stt == "追随可" and unit_core_available:
-                out.at[idx, "selected_now除外理由"] = "単元株発注圏優先のため追随可抑制"
-            elif stt == "追随可":
-                out.at[idx, "selected_now除外理由"] = "追随可上限超過"
-            elif stt in ["押し目待ち", "様子見"]:
-                out.at[idx, "selected_now除外理由"] = f"監視候補（{stt}）"
-            elif stt == "発注圏":
-                out.at[idx, "selected_now除外理由"] = "発注圏だが上位枠外"
-            else:
-                out.at[idx, "selected_now除外理由"] = "対象外"
-        elif unt == "S株":
-            soft_s_now_rr_min = min(float(s_now_rr_min), max(1.20, float(s_now_rr_min) - 0.20))
-            soft_s_chase_rr_min = max(1.30, min(float(chase_rr_min), float(s_now_rr_min) - 0.05))
-            if stt == "発注圏" and unit_core_available:
-                out.at[idx, "selected_now除外理由"] = "単元株発注圏優先のためS株例外不採用"
-            elif stt in ["発注圏", "追随可"] and reversal_tag not in ["確認", "準確認"]:
-                out.at[idx, "selected_now除外理由"] = "短期反転未確認"
-            elif stt == "発注圏" and (pd.isna(rrv) or rrv < float(soft_s_now_rr_min)):
-                out.at[idx, "selected_now除外理由"] = f"S株発注圏候補RR不足<{float(soft_s_now_rr_min):.2f}"
-            elif stt == "発注圏" and (not pd.isna(rrv)) and rrv < float(s_now_rr_min):
-                out.at[idx, "selected_now除外理由"] = f"S株発注圏候補（最終補完未採用）<{float(s_now_rr_min):.2f}"
-            elif stt == "発注圏":
-                out.at[idx, "selected_now除外理由"] = "S株例外/最終補完上限超過"
-            elif stt == "追随可" and unit_core_available:
-                out.at[idx, "selected_now除外理由"] = "単元株発注圏優先のためS株追随候補不採用"
-            elif stt == "追随可" and (pd.isna(rrv) or rrv < float(soft_s_chase_rr_min)):
-                out.at[idx, "selected_now除外理由"] = f"S株追随候補RR不足<{float(soft_s_chase_rr_min):.2f}"
-            elif stt == "追随可":
-                out.at[idx, "selected_now除外理由"] = "S株追随候補（最終補完未採用）"
-            elif stt in ["押し目待ち", "様子見"]:
-                out.at[idx, "selected_now除外理由"] = f"監視候補（{stt}）"
-            else:
-                out.at[idx, "selected_now除外理由"] = "対象外"
+        elif code == 10:
+            out.at[idx, "selected_now除外理由"] = "発注保留"
+        elif stt in ["発注圏", "追随可", "押し目待ち", "様子見"]:
+            out.at[idx, "selected_now除外理由"] = f"優先帯未付与（{stt}/{unt}）"
         else:
-            out.at[idx, "selected_now除外理由"] = "発注単位不明"
+            out.at[idx, "selected_now除外理由"] = "対象外"
 
     if len(now_id_set) == 0:
         summary = _format_now_empty_reason_summary(out)
@@ -3546,7 +3342,6 @@ def refresh_topn_prices_and_recalc(
         ascending=[False, False, False, False, False, True],
         na_position="last"
     ).reset_index(drop=True)
-    work = _rebalance_live_top_order(work, int(top_n))
     work["順位"] = np.arange(1, len(work) + 1)
 
     tail = out.iloc[int(top_n):].copy() if len(out) > int(top_n) else out.iloc[0:0].copy()
@@ -3631,6 +3426,19 @@ def build_live_execution_views(
     now_ids = _row_ids(now_raw)
     wait_raw = wait_raw.loc[~wait_raw["__row_id__"].isin(now_ids)].copy() if isinstance(wait_raw, pd.DataFrame) and len(wait_raw) and "__row_id__" in wait_raw.columns else wait_raw
     wait_ids = _row_ids(wait_raw)
+
+    if len(now_ids) == 0 and int(now_top or 0) > 0:
+        rescue = work.copy()
+        rescue_codes = pd.to_numeric(rescue.get("実行優先度", pd.Series([0] * len(rescue), index=rescue.index)), errors="coerce").fillna(0).astype(int)
+        rescue = rescue.loc[rescue_codes.isin([90, 60, 50, 35, 34])].copy()
+        if len(rescue):
+            rescue = rescue.sort_values(["実行優先度", "実行優先スコア", "実質RR", "短期反転スコア", "総合スコア"], ascending=[False, False, False, False, False], na_position="last")
+            rescue_ids = pd.to_numeric(rescue["__row_id__"], errors="coerce").dropna().astype(int).tolist()[: max(1, int(now_top))]
+            if rescue_ids:
+                now_ids = rescue_ids
+                if isinstance(wait_raw, pd.DataFrame) and len(wait_raw) and "__row_id__" in wait_raw.columns:
+                    wait_raw = wait_raw.loc[~wait_raw["__row_id__"].isin(now_ids)].copy()
+                wait_ids = _row_ids(wait_raw)
 
     annotated = _annotate_execution_membership(
         work,
