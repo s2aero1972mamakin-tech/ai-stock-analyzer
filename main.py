@@ -204,7 +204,7 @@ h1 {font-size: 1.6rem !important; margin-bottom: 0.25rem !important;}
 )
 
 st.markdown("# JPX Swing AI")
-st.markdown('<div class="small-note">固定条件：最大保有10営業日 / 利確=+1.5ATR(14) / 損切=-1.0ATR(14) — DB: Neon(Postgres)</div>', unsafe_allow_html=True)
+st.markdown('<div class="small-note">固定条件：最大保有10営業日 / 利確=+1.5ATR(14) / 損切=-1.0ATR(14) / 単元株優先・S株は補完 — DB: Neon(Postgres)</div>', unsafe_allow_html=True)
 
 
 # --- Streamlit secrets -> env bridge ---
