@@ -978,25 +978,286 @@ def evaluate_swing_fixed(df: pd.DataFrame, max_hold_days: int = 10, tp_atr: floa
 
     return {"ok": True, "trials": int(n), "tp_hit_rate": float(p_win), "ev_r": float(ev_r), "avg_tp_days": float(avg_tp_days), "avg_dd_r": float(avg_dd_r), "swing_score": float(score)}
 
+def _safe_ret(series: pd.Series, lookback: int) -> float:
+    try:
+        s = pd.to_numeric(series, errors="coerce")
+        if len(s) <= int(lookback):
+            return np.nan
+        prev = float(s.iloc[-(int(lookback) + 1)])
+        cur = float(s.iloc[-1])
+        if (not np.isfinite(prev)) or abs(prev) < 1e-12 or (not np.isfinite(cur)):
+            return np.nan
+        return float(cur / prev - 1.0)
+    except Exception:
+        return np.nan
+
+
+def _safe_slope(series: pd.Series, lookback: int) -> float:
+    try:
+        s = pd.to_numeric(series, errors="coerce")
+        if len(s) <= int(lookback):
+            return np.nan
+        prev = float(s.iloc[-(int(lookback) + 1)])
+        cur = float(s.iloc[-1])
+        if (not np.isfinite(prev)) or abs(prev) < 1e-12 or (not np.isfinite(cur)):
+            return np.nan
+        return float((cur - prev) / (abs(prev) + 1e-12))
+    except Exception:
+        return np.nan
+
+
+def _clip01(x: float, default: float = 0.0) -> float:
+    try:
+        if not np.isfinite(x):
+            return float(default)
+        return float(max(0.0, min(1.0, x)))
+    except Exception:
+        return float(default)
+
+
+def _short_reversal_label(features: Dict[str, float]) -> str:
+    score = pd.to_numeric(pd.Series([features.get("reversal_score", np.nan)]), errors="coerce").iloc[0]
+    confirmed = bool(features.get("reversal_confirmed", False))
+    if confirmed:
+        return "確認"
+    if np.isfinite(score) and float(score) >= 0.46:
+        return "準確認"
+    return "未確認"
+
+
+def _build_trend_audit(features: Dict[str, float]) -> str:
+    if not isinstance(features, dict) or not features:
+        return ""
+    parts = []
+    if bool(features.get("strong_uptrend", False)):
+        parts.append("上昇基調")
+    elif bool(features.get("uptrend_bias", False)):
+        parts.append("中期上向き")
+    elif bool(features.get("strong_downtrend", False)):
+        parts.append("下降継続警戒")
+    elif bool(features.get("trend_headwind", False)):
+        parts.append("下向き圧力あり")
+    else:
+        parts.append("方向感中立")
+
+    parts.append(f"短期反転:{_short_reversal_label(features)}")
+
+    pullback = pd.to_numeric(pd.Series([features.get("pullback_from_high20", np.nan)]), errors="coerce").iloc[0]
+    if np.isfinite(pullback):
+        parts.append(f"20日高値比{float(pullback)*100:.1f}%")
+
+    pos20 = pd.to_numeric(pd.Series([features.get("pos_vs_ma20", np.nan)]), errors="coerce").iloc[0]
+    if np.isfinite(pos20):
+        parts.append(f"20日線比{float(pos20)*100:.1f}%")
+
+    if bool(features.get("breakout_3", False)):
+        parts.append("3日高値更新")
+    return " / ".join(parts)
+
+
+def _build_strategy_audit(features: Dict[str, float], strategy_name: str = "") -> str:
+    if not isinstance(features, dict) or not features:
+        return strategy_name or ""
+    tags = []
+    if bool(features.get("strong_uptrend", False)):
+        tags.append("5/20/60日線が上向き")
+    elif bool(features.get("uptrend_bias", False)):
+        tags.append("20日線が60日線を上回る")
+    elif bool(features.get("trend_headwind", False)):
+        tags.append("20日線が弱く下降圧力あり")
+
+    if bool(features.get("pullback_candidate", False)):
+        tags.append("上昇基調内の押し目")
+    if bool(features.get("reversal_confirmed", False)):
+        tags.append("短期反転を確認")
+    elif _short_reversal_label(features) == "準確認":
+        tags.append("短期反転は準確認")
+    else:
+        tags.append("短期反転は未確認")
+
+    pullback = pd.to_numeric(pd.Series([features.get("pullback_from_high20", np.nan)]), errors="coerce").iloc[0]
+    if np.isfinite(pullback):
+        tags.append(f"20日高値比{float(pullback)*100:.1f}%")
+    return " / ".join(tags[:5])
+
+
 def _trend_features(df: pd.DataFrame) -> Dict[str, float]:
-    c = df["Close"].astype(float)
+    d = df.copy()
+    if "Date" in d.columns:
+        d = d.sort_values("Date")
+    c = pd.to_numeric(d["Close"], errors="coerce")
+    h = pd.to_numeric(d["High"], errors="coerce") if "High" in d.columns else c.copy()
+    l = pd.to_numeric(d["Low"], errors="coerce") if "Low" in d.columns else c.copy()
+    if "Volume" in d.columns:
+        v = pd.to_numeric(d["Volume"], errors="coerce")
+    else:
+        v = pd.Series(np.nan, index=d.index, dtype=float)
+
+    ma5 = c.rolling(5).mean()
     ma20 = c.rolling(20).mean()
     ma60 = c.rolling(60).mean()
-    ret_20 = (c.iloc[-1]/c.iloc[-21]-1.0) if len(c) > 21 else np.nan
-    ret_60 = (c.iloc[-1]/c.iloc[-61]-1.0) if len(c) > 61 else np.nan
-    slope20 = (ma20.iloc[-1]-ma20.iloc[-6])/(abs(ma20.iloc[-6])+1e-12) if len(ma20) > 6 else np.nan
-    return {"ret_20": float(ret_20) if np.isfinite(ret_20) else np.nan, "ret_60": float(ret_60) if np.isfinite(ret_60) else np.nan, "slope20": float(slope20) if np.isfinite(slope20) else np.nan}
+
+    ret_3 = _safe_ret(c, 3)
+    ret_5 = _safe_ret(c, 5)
+    ret_10 = _safe_ret(c, 10)
+    ret_20 = _safe_ret(c, 20)
+    ret_60 = _safe_ret(c, 60)
+    slope5 = _safe_slope(ma5, 3)
+    slope20 = _safe_slope(ma20, 5)
+    slope60 = _safe_slope(ma60, 10)
+
+    close_last = float(c.iloc[-1]) if len(c) else np.nan
+    ma5_last = float(ma5.iloc[-1]) if len(ma5) else np.nan
+    ma20_last = float(ma20.iloc[-1]) if len(ma20) else np.nan
+    ma60_last = float(ma60.iloc[-1]) if len(ma60) else np.nan
+
+    hh3_prev = float(h.shift(1).rolling(3).max().iloc[-1]) if len(h) >= 4 else np.nan
+    hh10_prev = float(h.shift(1).rolling(10).max().iloc[-1]) if len(h) >= 11 else np.nan
+    hh20 = float(h.rolling(20).max().iloc[-1]) if len(h) >= 20 else np.nan
+    ll10 = float(l.rolling(10).min().iloc[-1]) if len(l) >= 10 else np.nan
+    ll20 = float(l.rolling(20).min().iloc[-1]) if len(l) >= 20 else np.nan
+
+    vol_ratio_5 = np.nan
+    try:
+        vol5 = float(v.rolling(5).mean().iloc[-1]) if len(v) >= 5 else np.nan
+        vol_last = float(v.iloc[-1]) if len(v) else np.nan
+        if np.isfinite(vol5) and vol5 > 0 and np.isfinite(vol_last):
+            vol_ratio_5 = float(vol_last / vol5)
+    except Exception:
+        vol_ratio_5 = np.nan
+
+    pos_vs_ma5 = (close_last / ma5_last - 1.0) if np.isfinite(close_last) and np.isfinite(ma5_last) and abs(ma5_last) > 1e-12 else np.nan
+    pos_vs_ma20 = (close_last / ma20_last - 1.0) if np.isfinite(close_last) and np.isfinite(ma20_last) and abs(ma20_last) > 1e-12 else np.nan
+    pos_vs_ma60 = (close_last / ma60_last - 1.0) if np.isfinite(close_last) and np.isfinite(ma60_last) and abs(ma60_last) > 1e-12 else np.nan
+    pullback_from_high20 = (close_last / hh20 - 1.0) if np.isfinite(close_last) and np.isfinite(hh20) and abs(hh20) > 1e-12 else np.nan
+    rebound_from_low10 = (close_last / ll10 - 1.0) if np.isfinite(close_last) and np.isfinite(ll10) and abs(ll10) > 1e-12 else np.nan
+    rebound_from_low20 = (close_last / ll20 - 1.0) if np.isfinite(close_last) and np.isfinite(ll20) and abs(ll20) > 1e-12 else np.nan
+
+    breakout_3 = bool(np.isfinite(close_last) and np.isfinite(hh3_prev) and close_last > hh3_prev * 1.001)
+    breakout_10 = bool(np.isfinite(close_last) and np.isfinite(hh10_prev) and close_last > hh10_prev * 1.002)
+    above_ma5 = bool(np.isfinite(pos_vs_ma5) and pos_vs_ma5 >= 0.0)
+    above_ma20 = bool(np.isfinite(pos_vs_ma20) and pos_vs_ma20 >= 0.0)
+    above_ma60 = bool(np.isfinite(pos_vs_ma60) and pos_vs_ma60 >= 0.0)
+
+    ma_stack_up = bool(np.isfinite(ma5_last) and np.isfinite(ma20_last) and np.isfinite(ma60_last) and ma5_last >= ma20_last >= ma60_last)
+    ma_stack_down = bool(np.isfinite(ma5_last) and np.isfinite(ma20_last) and np.isfinite(ma60_last) and ma5_last <= ma20_last <= ma60_last)
+
+    uptrend_bias = bool(
+        np.isfinite(ma20_last) and np.isfinite(ma60_last)
+        and ma20_last >= ma60_last
+        and (not np.isfinite(slope20) or slope20 > -0.004)
+        and (not np.isfinite(ret_60) or ret_60 > 0.02)
+    )
+    strong_uptrend = bool(
+        uptrend_bias
+        and ma_stack_up
+        and np.isfinite(ret_20) and ret_20 > 0.05
+        and np.isfinite(slope20) and slope20 > 0.0
+    )
+    trend_headwind = bool(
+        np.isfinite(ma20_last) and np.isfinite(ma60_last)
+        and ma20_last < ma60_last
+        and np.isfinite(slope20) and slope20 < 0.0
+        and np.isfinite(ret_20) and ret_20 < 0.0
+    )
+    strong_downtrend = bool(
+        trend_headwind
+        and ma_stack_down
+        and np.isfinite(ret_60) and ret_60 < -0.04
+    )
+    pullback_candidate = bool(
+        uptrend_bias
+        and np.isfinite(pullback_from_high20) and (-0.18 <= pullback_from_high20 <= -0.01)
+        and (not np.isfinite(pos_vs_ma60) or pos_vs_ma60 > -0.035)
+    )
+
+    reversal_raw = 0.0
+    reversal_raw += 1.00 if above_ma5 else 0.0
+    reversal_raw += 0.85 if (np.isfinite(ret_3) and ret_3 > 0.0) else 0.0
+    reversal_raw += 0.75 if (np.isfinite(slope5) and slope5 > 0.0) else 0.0
+    reversal_raw += 0.85 if breakout_3 else 0.0
+    reversal_raw += 0.45 if (np.isfinite(vol_ratio_5) and vol_ratio_5 >= 1.05) else 0.0
+    reversal_raw += 0.35 if (np.isfinite(pos_vs_ma20) and pos_vs_ma20 >= -0.015) else 0.0
+    reversal_score = _clip01(reversal_raw / 4.25, default=0.0)
+
+    reversal_confirmed = bool(
+        reversal_score >= 0.62
+        and (above_ma5 or breakout_3)
+        and (not np.isfinite(slope5) or slope5 > -0.002)
+    )
+
+    return {
+        "ret_3": float(ret_3) if np.isfinite(ret_3) else np.nan,
+        "ret_5": float(ret_5) if np.isfinite(ret_5) else np.nan,
+        "ret_10": float(ret_10) if np.isfinite(ret_10) else np.nan,
+        "ret_20": float(ret_20) if np.isfinite(ret_20) else np.nan,
+        "ret_60": float(ret_60) if np.isfinite(ret_60) else np.nan,
+        "slope5": float(slope5) if np.isfinite(slope5) else np.nan,
+        "slope20": float(slope20) if np.isfinite(slope20) else np.nan,
+        "slope60": float(slope60) if np.isfinite(slope60) else np.nan,
+        "ma5": float(ma5_last) if np.isfinite(ma5_last) else np.nan,
+        "ma20": float(ma20_last) if np.isfinite(ma20_last) else np.nan,
+        "ma60": float(ma60_last) if np.isfinite(ma60_last) else np.nan,
+        "pos_vs_ma5": float(pos_vs_ma5) if np.isfinite(pos_vs_ma5) else np.nan,
+        "pos_vs_ma20": float(pos_vs_ma20) if np.isfinite(pos_vs_ma20) else np.nan,
+        "pos_vs_ma60": float(pos_vs_ma60) if np.isfinite(pos_vs_ma60) else np.nan,
+        "pullback_from_high20": float(pullback_from_high20) if np.isfinite(pullback_from_high20) else np.nan,
+        "rebound_from_low10": float(rebound_from_low10) if np.isfinite(rebound_from_low10) else np.nan,
+        "rebound_from_low20": float(rebound_from_low20) if np.isfinite(rebound_from_low20) else np.nan,
+        "vol_ratio_5": float(vol_ratio_5) if np.isfinite(vol_ratio_5) else np.nan,
+        "breakout_3": breakout_3,
+        "breakout_10": breakout_10,
+        "above_ma5": above_ma5,
+        "above_ma20": above_ma20,
+        "above_ma60": above_ma60,
+        "ma_stack_up": ma_stack_up,
+        "ma_stack_down": ma_stack_down,
+        "uptrend_bias": uptrend_bias,
+        "strong_uptrend": strong_uptrend,
+        "trend_headwind": trend_headwind,
+        "strong_downtrend": strong_downtrend,
+        "pullback_candidate": pullback_candidate,
+        "reversal_score": float(reversal_score),
+        "reversal_confirmed": reversal_confirmed,
+    }
+
 
 def _pick_strategy(features: Dict[str, float], atr_pct: float) -> str:
-    r20 = features.get("ret_20", np.nan)
-    s20 = features.get("slope20", np.nan)
-    if np.isfinite(r20) and r20 > 0.08 and np.isfinite(s20) and s20 > 0:
+    r20 = pd.to_numeric(pd.Series([features.get("ret_20", np.nan)]), errors="coerce").iloc[0]
+    r60 = pd.to_numeric(pd.Series([features.get("ret_60", np.nan)]), errors="coerce").iloc[0]
+    reversal_score = pd.to_numeric(pd.Series([features.get("reversal_score", np.nan)]), errors="coerce").iloc[0]
+    pullback = pd.to_numeric(pd.Series([features.get("pullback_from_high20", np.nan)]), errors="coerce").iloc[0]
+
+    strong_uptrend = bool(features.get("strong_uptrend", False))
+    uptrend_bias = bool(features.get("uptrend_bias", False))
+    pullback_candidate = bool(features.get("pullback_candidate", False))
+    reversal_confirmed = bool(features.get("reversal_confirmed", False))
+    breakout_10 = bool(features.get("breakout_10", False))
+    trend_headwind = bool(features.get("trend_headwind", False))
+    strong_downtrend = bool(features.get("strong_downtrend", False))
+
+    if strong_uptrend and breakout_10 and (not np.isfinite(r20) or r20 > 0.03):
         return "順張り（ブレイク/上昇トレンド）"
-    if np.isfinite(r20) and r20 < -0.06:
+
+    if pullback_candidate and (reversal_confirmed or (np.isfinite(reversal_score) and reversal_score >= 0.46)):
+        return "押し目買い（回復狙い）"
+
+    if (np.isfinite(r20) and r20 < -0.06) and (reversal_confirmed or (np.isfinite(reversal_score) and reversal_score >= 0.58)) and not strong_downtrend:
         return "逆張り（リバウンド狙い）"
-    if np.isfinite(atr_pct) and atr_pct < 1.5:
+
+    if np.isfinite(atr_pct) and atr_pct < 1.5 and not strong_uptrend and not trend_headwind:
         return "レンジ（小動き）"
-    return "押し目買い（回復狙い）"
+
+    if uptrend_bias and np.isfinite(pullback) and pullback <= -0.01:
+        return "押し目買い（回復狙い）"
+
+    if reversal_confirmed and not strong_downtrend and (not np.isfinite(r60) or r60 > -0.05):
+        return "逆張り（リバウンド狙い）"
+
+    if strong_uptrend:
+        return "順張り（ブレイク/上昇トレンド）"
+
+    return "レンジ（小動き）"
 
 def _read_latest_dates(conn) -> Tuple[Optional[str], Optional[str]]:
     with conn.cursor() as cur:
@@ -1554,12 +1815,18 @@ def stage2_rank(stage1_df: pd.DataFrame, keep: int, stage2_days: int = 180, min_
             tp = close_last + 1.5*atr_last
             sl = close_last - 1.0*atr_last
             atr_pct = float(stage1_df.loc[stage1_df["銘柄"]==sym, "ATR%"].iloc[0]) if len(stage1_df.loc[stage1_df["銘柄"]==sym]) else np.nan
-            strat = _pick_strategy(_trend_features(g), atr_pct)
+            feats = _trend_features(g)
+            strat = _pick_strategy(feats, atr_pct)
+            reversal_score = pd.to_numeric(pd.Series([feats.get("reversal_score", np.nan)]), errors="coerce").iloc[0]
+            reversal_label = _short_reversal_label(feats)
+            trend_audit = _build_trend_audit(feats)
+            strategy_audit = _build_strategy_audit(feats, strat)
 
             rows.append({"銘柄": sym, "企業名": (stage1_df.loc[stage1_df["銘柄"]==sym, "企業名"].iloc[0] if ("企業名" in stage1_df.columns and len(stage1_df.loc[stage1_df["銘柄"]==sym])) else ""), "セクター": (stage1_df.loc[stage1_df["銘柄"]==sym, "セクター"].iloc[0] if ("セクター" in stage1_df.columns and len(stage1_df.loc[stage1_df["銘柄"]==sym])) else "不明"), "推奨方式": strat, "現在値（終値）": round(close_last,2), "TP目安": round(tp,2), "SL目安": round(sl,2),
                          "TP到達率": res["tp_hit_rate"], "期待値EV(R)": res["ev_r"], "平均利確日数": res["avg_tp_days"],
-                         "平均逆行(R)": res["avg_dd_r"], "検証回数": res.get("trials",0), "利確スコア": res.get("swing_score", float("nan")), "備考": res.get("note","")})
-            guides.append({"銘柄": sym, "企業名": (stage1_df.loc[stage1_df["銘柄"]==sym, "企業名"].iloc[0] if ("企業名" in stage1_df.columns and len(stage1_df.loc[stage1_df["銘柄"]==sym])) else ""), "セクター": (stage1_df.loc[stage1_df["銘柄"]==sym, "セクター"].iloc[0] if ("セクター" in stage1_df.columns and len(stage1_df.loc[stage1_df["銘柄"]==sym])) else "不明"), "推奨方式": strat, "Entry目安": round(close_last,2), "SL目安": round(sl,2), "TP目安": round(tp,2), "最大保有": "10営業日"})
+                         "平均逆行(R)": res["avg_dd_r"], "検証回数": res.get("trials",0), "利確スコア": res.get("swing_score", float("nan")), "短期反転スコア": float(round(reversal_score, 4)) if np.isfinite(reversal_score) else np.nan,
+                         "短期反転確認": reversal_label, "戦略判定根拠": strategy_audit, "トレンド監査": trend_audit, "備考": res.get("note","")})
+            guides.append({"銘柄": sym, "企業名": (stage1_df.loc[stage1_df["銘柄"]==sym, "企業名"].iloc[0] if ("企業名" in stage1_df.columns and len(stage1_df.loc[stage1_df["銘柄"]==sym])) else ""), "セクター": (stage1_df.loc[stage1_df["銘柄"]==sym, "セクター"].iloc[0] if ("セクター" in stage1_df.columns and len(stage1_df.loc[stage1_df["銘柄"]==sym])) else "不明"), "推奨方式": strat, "Entry目安": round(close_last,2), "SL目安": round(sl,2), "TP目安": round(tp,2), "最大保有": "10営業日", "短期反転確認": reversal_label, "トレンド監査": trend_audit})
         except Exception:
             errors += 1
             if len(sample_fail) < 20:
@@ -2249,11 +2516,11 @@ def _compute_live_execution_priority(df: pd.DataFrame, strict_chase_rr: float = 
         return df
 
     out = df.copy()
-    for c in ["Entry状態", "発注単位", "発注不可理由", "売買優先区分", "単元予算可否", "単元推奨可否", "単元株可否"]:
+    for c in ["Entry状態", "発注単位", "発注不可理由", "売買優先区分", "単元予算可否", "単元推奨可否", "単元株可否", "短期反転確認", "トレンド監査"]:
         if c not in out.columns:
             out[c] = ""
         out[c] = out[c].astype(str).replace(["nan", "None"], "")
-    for c in ["実質RR", "総合スコア", "再計算失敗フラグ"]:
+    for c in ["実質RR", "総合スコア", "再計算失敗フラグ", "短期反転スコア"]:
         if c not in out.columns:
             out[c] = np.nan
         out[c] = pd.to_numeric(out[c], errors="coerce")
@@ -2263,27 +2530,31 @@ def _compute_live_execution_priority(df: pd.DataFrame, strict_chase_rr: float = 
     reason = out["発注不可理由"].fillna("").astype(str)
     rr = out["実質RR"].fillna(0.0)
     base = out["総合スコア"].fillna(0.0)
+    reversal_score = out["短期反転スコア"].fillna(0.0).clip(lower=0.0, upper=1.0)
+    reversal_label = out["短期反転確認"].replace("", "未確認")
     refresh_ok = out["再計算失敗フラグ"].fillna(0) <= 0
     unit_budget_ok = out.get("単元予算可否", pd.Series([""] * len(out), index=out.index)).astype(str).eq("可")
     unit_reco_ok = out.get("単元推奨可否", out.get("単元株可否", pd.Series([""] * len(out), index=out.index))).astype(str).eq("可")
     reason_blank = reason.str.strip().eq("")
+    trend_headwind = out.get("トレンド監査", pd.Series([""] * len(out), index=out.index)).astype(str).str.contains("下降継続|下向き圧力", regex=True, na=False)
+    reversal_ok = reversal_label.isin(["確認", "準確認"])
+    reversal_strict = reversal_label.eq("確認")
     actionable = refresh_ok & reason_blank & (~status.str.startswith("見送り"))
 
-    # S株の発注圏は、厳格閾値に届かなくても「最終補完候補」として見える化する
     soft_s_rr = min(float(strict_s_rr), max(1.20, float(strict_s_rr) - 0.20))
+    soft_s_chase_rr = max(1.30, min(float(strict_chase_rr), float(strict_s_rr) - 0.05))
 
     band = pd.Series(0, index=out.index, dtype="int64")
-    band = pd.Series(np.where(actionable & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & status.eq("発注圏") & (rr >= 1.00), 90, band), index=out.index)
+    band = pd.Series(np.where(actionable & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & status.eq("発注圏") & reversal_ok & (~trend_headwind | reversal_strict) & (rr >= 1.00), 90, band), index=out.index)
     band = pd.Series(np.where(actionable & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & status.eq("押し目待ち") & (rr >= 0.90), 80, band), index=out.index)
     band = pd.Series(np.where(actionable & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & status.eq("様子見") & (rr >= 0.90), 70, band), index=out.index)
-    band = pd.Series(np.where(actionable & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & status.eq("追随可") & (rr >= strict_chase_rr), 60, band), index=out.index)
-    soft_s_chase_rr = max(1.30, min(float(strict_chase_rr), float(strict_s_rr) - 0.05))
-    band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("発注圏") & (rr >= strict_s_rr), 50, band), index=out.index)
-    band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("発注圏") & (rr >= soft_s_rr) & (rr < strict_s_rr) & (band < 50), 35, band), index=out.index)
-    band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("追随可") & (rr >= soft_s_chase_rr) & (band < 35), 34, band), index=out.index)
+    band = pd.Series(np.where(actionable & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & status.eq("追随可") & reversal_strict & (~trend_headwind) & (rr >= strict_chase_rr), 60, band), index=out.index)
+    band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("発注圏") & reversal_strict & (~trend_headwind) & (rr >= strict_s_rr), 50, band), index=out.index)
+    band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("発注圏") & reversal_ok & (rr >= soft_s_rr) & (rr < strict_s_rr) & (band < 50), 35, band), index=out.index)
+    band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("追随可") & reversal_strict & (rr >= soft_s_chase_rr) & (band < 35), 34, band), index=out.index)
     band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("押し目待ち") & (rr >= 0.95), 40, band), index=out.index)
     band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("様子見") & (rr >= 0.95) & (band < 34), 30, band), index=out.index)
-    band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("追随可") & (rr >= 0.95) & (band < 34), 30, band), index=out.index)
+    band = pd.Series(np.where(actionable & unit.eq("S株") & status.eq("追随可") & reversal_ok & (rr >= 0.95) & (band < 34), 30, band), index=out.index)
     band = pd.Series(np.where(refresh_ok & (~reason_blank) & (band == 0), 10, band), index=out.index)
 
     label_map = {
@@ -2309,11 +2580,17 @@ def _compute_live_execution_priority(df: pd.DataFrame, strict_chase_rr: float = 
     else:
         base_norm = pd.Series(0.5, index=out.index, dtype=float)
 
+    reversal_bonus = reversal_label.map({"確認": 0.22, "準確認": 0.08, "未確認": -0.10}).fillna(0.0)
+    headwind_penalty = trend_headwind.astype(float) * 0.12
+
     out["実行優先スコア"] = (
         out["実行優先度"].astype(float)
-        + 0.55 * rr_norm.fillna(0.0)
-        + 0.25 * base_norm.fillna(0.0)
+        + 0.50 * rr_norm.fillna(0.0)
+        + 0.22 * base_norm.fillna(0.0)
+        + 0.18 * reversal_score.fillna(0.0)
+        + reversal_bonus
         + 0.05 * unit_budget_ok.astype(float)
+        - headwind_penalty
     )
     return out
 
@@ -2345,7 +2622,7 @@ LIVE_OUTPUT_SCHEMA = [
     "順位","銘柄","企業名","セクター","推奨方式","売買優先区分","実行優先帯","実行優先度","実行優先スコア","今すぐ発注スコア",
     "発注単位","単元予算可否","単元推奨可否","単元株可否","単元必要資金(円)","単元想定損失(円)","単元予算判定理由","単元推奨判定理由",
     "現在値（終値）","Entry目安","SL目安","TP目安","利確利幅(円/株)","想定利益(円)","期待純益(円)","RR","実質RR","価格更新状態","価格更新メモ","再計算失敗フラグ",
-    "最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","Entry状態","発注不可理由",
+    "最大保有","推奨株数","推奨投資額(円)","想定損失(円)","総合スコア","Entry状態","発注不可理由","短期反転スコア","短期反転確認","戦略判定根拠","トレンド監査","Entry監査メモ",
     "選定区分","selected_now判定","selected_now除外理由","selected_now空理由集計",
     "元Entry目安","元SL目安","元TP目安","元RR","元総合スコア",
 ]
@@ -2371,14 +2648,14 @@ def _standardize_live_output_schema(df: pd.DataFrame) -> pd.DataFrame:
     text_defaults = {
         "銘柄":"", "企業名":"不明", "セクター":"不明", "推奨方式":"", "売買優先区分":"", "実行優先帯":"",
         "発注単位":"", "単元予算可否":"", "単元推奨可否":"", "単元株可否":"", "単元予算判定理由":"", "単元推奨判定理由":"",
-        "価格更新状態":"", "価格更新メモ":"", "最大保有":"10営業日", "Entry状態":"", "発注不可理由":"",
+        "価格更新状態":"", "価格更新メモ":"", "最大保有":"10営業日", "Entry状態":"", "発注不可理由":"", "短期反転確認":"", "戦略判定根拠":"", "トレンド監査":"", "Entry監査メモ":"",
         "選定区分":"", "selected_now判定":"", "selected_now除外理由":"", "selected_now空理由集計":"",
     }
     numeric_defaults = {
         "実行優先度":np.nan, "実行優先スコア":np.nan, "今すぐ発注スコア":np.nan,
         "単元必要資金(円)":np.nan, "単元想定損失(円)":np.nan,
         "現在値（終値）":np.nan, "Entry目安":np.nan, "SL目安":np.nan, "TP目安":np.nan, "利確利幅(円/株)":np.nan, "想定利益(円)":np.nan, "期待純益(円)":np.nan, "RR":np.nan, "実質RR":np.nan,
-        "再計算失敗フラグ":np.nan, "推奨株数":np.nan, "推奨投資額(円)":np.nan, "想定損失(円)":np.nan, "総合スコア":np.nan,
+        "再計算失敗フラグ":np.nan, "推奨株数":np.nan, "推奨投資額(円)":np.nan, "想定損失(円)":np.nan, "総合スコア":np.nan, "短期反転スコア":np.nan,
         "元Entry目安":np.nan, "元SL目安":np.nan, "元TP目安":np.nan, "元RR":np.nan, "元総合スコア":np.nan,
     }
 
@@ -2593,17 +2870,25 @@ def _split_live_rankings_core(
         base_norm = _norm01(now_df["総合スコア"])
         rr_norm = _norm01(now_df["実質RR"].fillna(0.0))
         exec_norm = _norm01(now_df["実行優先スコア"].fillna(0.0))
-        status_bonus = now_df["Entry状態"].astype(str).map({"発注圏": 1.20, "追随可": -0.40}).fillna(0.0)
+        rev_series = pd.to_numeric(now_df.get("短期反転スコア", pd.Series([0.0] * len(now_df), index=now_df.index)), errors="coerce").fillna(0.0)
+        reversal_norm = _norm01(rev_series)
+        reversal_label = now_df.get("短期反転確認", pd.Series(["未確認"] * len(now_df), index=now_df.index)).astype(str).replace("", "未確認")
+        status_bonus = now_df["Entry状態"].astype(str).map({"発注圏": 1.20, "追随可": -0.35}).fillna(0.0)
+        reversal_bonus = reversal_label.map({"確認": 0.38, "準確認": 0.12, "未確認": -0.25}).fillna(0.0)
         unit_bonus = now_df["発注単位"].astype(str).map({"単元株": 0.42, "S株": -0.12}).fillna(0.0)
         priority_bonus = now_df["売買優先区分"].astype(str).map({"単元株主力候補": 0.28, "S株補助候補": -0.10}).fillna(0.0)
+        trend_bonus = now_df.get("トレンド監査", pd.Series([""] * len(now_df), index=now_df.index)).astype(str).map(lambda x: 0.12 if ("上昇基調" in x or "中期上向き" in x) else (-0.18 if "下降継続" in x else 0.0))
 
         now_df["今すぐ発注スコア"] = (
-            0.48 * exec_norm
-            + 0.24 * rr_norm
+            0.40 * exec_norm
+            + 0.20 * rr_norm
             + 0.08 * base_norm
-            + 0.20 * status_bonus
+            + 0.10 * reversal_norm
+            + 0.16 * status_bonus
+            + reversal_bonus
             + unit_bonus
             + priority_bonus
+            + trend_bonus
         )
 
         now_df = now_df.sort_values(
@@ -2672,12 +2957,13 @@ def _annotate_execution_membership(
     band = out.get("実行優先帯", pd.Series([""] * len(out), index=out.index)).astype(str).fillna("")
     reason = out.get("発注不可理由", pd.Series([""] * len(out), index=out.index)).astype(str).fillna("")
     rr = pd.to_numeric(out.get("実質RR", pd.Series([np.nan] * len(out), index=out.index)), errors="coerce")
+    reversal_label = out.get("短期反転確認", pd.Series([""] * len(out), index=out.index)).astype(str).replace("", "未確認")
     unit_budget_ok = out.get("単元予算可否", pd.Series([""] * len(out), index=out.index)).astype(str).eq("可")
     unit_reco_ok = out.get("単元推奨可否", out.get("単元株可否", pd.Series([""] * len(out), index=out.index))).astype(str).eq("可")
     recalc_ok = pd.to_numeric(out.get("再計算失敗フラグ", pd.Series([0] * len(out), index=out.index)), errors="coerce").fillna(0).le(0)
     shares_ok = pd.to_numeric(out.get("推奨株数", pd.Series([0] * len(out), index=out.index)), errors="coerce").fillna(0).gt(0)
 
-    unit_core_available = bool(((status == "発注圏") & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & rr.ge(float(now_rr_min)) & recalc_ok & shares_ok & band.ne("見送り") & reason.eq("")).any())
+    unit_core_available = bool(((status == "発注圏") & unit.eq("単元株") & unit_budget_ok & unit_reco_ok & rr.ge(float(now_rr_min)) & recalc_ok & shares_ok & band.ne("見送り") & reason.eq("") & reversal_label.isin(["確認", "準確認"])).any())
 
     for idx, row in out.iterrows():
         row_id = int(pd.to_numeric(row.get("__row_id__"), errors="coerce"))
@@ -2689,6 +2975,7 @@ def _annotate_execution_membership(
         budget_ok = str(row.get("単元予算可否", "") or "") == "可"
         reco_ok = str(row.get("単元推奨可否", row.get("単元株可否", "")) or "") == "可"
         fail_flag = pd.to_numeric(pd.Series([row.get("再計算失敗フラグ")]), errors="coerce").fillna(0).iloc[0]
+        reversal_tag = str(row.get("短期反転確認", "") or "未確認")
         shares = pd.to_numeric(pd.Series([row.get("推奨株数")]), errors="coerce").fillna(0).iloc[0]
 
         if row_id in now_id_set:
@@ -2716,6 +3003,8 @@ def _annotate_execution_membership(
                 out.at[idx, "selected_now除外理由"] = "単元予算不可"
             elif not reco_ok:
                 out.at[idx, "selected_now除外理由"] = "単元推奨不可"
+            elif stt in ["発注圏", "追随可"] and reversal_tag not in ["確認", "準確認"]:
+                out.at[idx, "selected_now除外理由"] = "短期反転未確認"
             elif stt == "発注圏" and (not pd.isna(rrv)) and rrv < float(now_rr_min):
                 out.at[idx, "selected_now除外理由"] = f"発注圏RR不足<{float(now_rr_min):.2f}"
             elif stt == "追随可" and (pd.isna(rrv) or rrv < float(chase_rr_min)):
@@ -2735,6 +3024,8 @@ def _annotate_execution_membership(
             soft_s_chase_rr_min = max(1.30, min(float(chase_rr_min), float(s_now_rr_min) - 0.05))
             if stt == "発注圏" and unit_core_available:
                 out.at[idx, "selected_now除外理由"] = "単元株発注圏優先のためS株例外不採用"
+            elif stt in ["発注圏", "追随可"] and reversal_tag not in ["確認", "準確認"]:
+                out.at[idx, "selected_now除外理由"] = "短期反転未確認"
             elif stt == "発注圏" and (pd.isna(rrv) or rrv < float(soft_s_now_rr_min)):
                 out.at[idx, "selected_now除外理由"] = f"S株発注圏候補RR不足<{float(soft_s_now_rr_min):.2f}"
             elif stt == "発注圏" and (not pd.isna(rrv)) and rrv < float(s_now_rr_min):
@@ -2763,10 +3054,11 @@ def _annotate_execution_membership(
 def build_live_linked_guide(df_selected: pd.DataFrame, max_rows: Optional[int] = None) -> pd.DataFrame:
     """selected から live 再計算後の guide を作る。"""
     import pandas as pd
+    guide_cols = ["銘柄","企業名","セクター","推奨方式","売買優先区分","実行優先帯","発注単位","単元予算可否","単元推奨可否","推奨株数","推奨投資額(円)","想定利益(円)","期待純益(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態","短期反転確認","トレンド監査","Entry監査メモ"]
     if df_selected is None or len(df_selected) == 0:
-        return pd.DataFrame(columns=["銘柄","企業名","セクター","推奨方式","売買優先区分","実行優先帯","発注単位","単元予算可否","単元推奨可否","推奨株数","推奨投資額(円)","想定利益(円)","期待純益(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"])
+        return pd.DataFrame(columns=guide_cols)
 
-    cols = [c for c in ["銘柄","企業名","セクター","推奨方式","売買優先区分","実行優先帯","発注単位","単元予算可否","単元推奨可否","単元株可否","推奨株数","推奨投資額(円)","想定利益(円)","期待純益(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"] if c in df_selected.columns]
+    cols = [c for c in ["銘柄","企業名","セクター","推奨方式","売買優先区分","実行優先帯","発注単位","単元予算可否","単元推奨可否","単元株可否","推奨株数","推奨投資額(円)","想定利益(円)","期待純益(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態","短期反転確認","トレンド監査","Entry監査メモ"] if c in df_selected.columns]
     guide = df_selected[cols].copy()
     if max_rows is not None:
         guide = guide.head(int(max_rows)).copy()
@@ -2814,10 +3106,12 @@ def refresh_topn_prices_and_recalc(
     ]:
         if c not in work.columns:
             work[c] = np.nan
-    for c in ["発注不可理由", "Entry状態"]:
+    for c in ["発注不可理由", "Entry状態", "短期反転確認", "戦略判定根拠", "トレンド監査", "Entry監査メモ"]:
         if c not in work.columns:
             work[c] = ""
         work[c] = work[c].astype(object)
+    if "短期反転スコア" not in work.columns:
+        work["短期反転スコア"] = np.nan
 
     if "元Entry目安" not in work.columns:
         work["元Entry目安"] = pd.to_numeric(work["Entry目安"], errors="coerce")
@@ -2836,20 +3130,36 @@ def refresh_topn_prices_and_recalc(
         if not s:
             symbols.append("")
             continue
-        if not s.endswith('.T') and s.isdigit():
-            s = s + '.T'
+        if not s.endswith(".T") and s.isdigit():
+            s = s + ".T"
         symbols.append(s)
+
+    valid_symbols = [s for s in symbols if s]
+
+    trend_feature_map = {}
+    try:
+        hist_recent = fetch_last_n_days(valid_symbols, n_days=90)
+        if isinstance(hist_recent, pd.DataFrame) and len(hist_recent):
+            for sym_hist, g_hist in hist_recent.groupby("Symbol"):
+                try:
+                    sym_key = str(sym_hist).strip()
+                    if sym_key and sym_key.isdigit():
+                        sym_key = sym_key + ".T"
+                    trend_feature_map[sym_key] = _trend_features(g_hist.sort_values("Date"))
+                except Exception:
+                    continue
+    except Exception:
+        trend_feature_map = {}
 
     price_map = {}
     fetch_error_map = {}
-    valid_symbols = [s for s in symbols if s]
     try:
         data = yf.download(
-            ' '.join(valid_symbols),
-            period='1d',
-            interval='1m',
+            " ".join(valid_symbols),
+            period="1d",
+            interval="1m",
             progress=False,
-            group_by='ticker',
+            group_by="ticker",
             threads=True,
             auto_adjust=False,
         )
@@ -2877,58 +3187,105 @@ def refresh_topn_prices_and_recalc(
     rr_floor = float(effective_rr_floor) if np.isfinite(effective_rr_floor) else 1.0
     chase_floor = max(rr_floor, float(chase_rr_floor) if np.isfinite(chase_rr_floor) else rr_floor)
 
-    def _status_from_live(current, old_entry, old_tp, effective_rr, live_price_ok):
+    def _status_from_live(current, old_entry, old_tp, effective_rr, live_price_ok, features):
+        label = _short_reversal_label(features)
+        reversal_score = pd.to_numeric(pd.Series([features.get("reversal_score", np.nan)]), errors="coerce").iloc[0]
+        trend_headwind = bool(features.get("trend_headwind", False))
+        strong_downtrend = bool(features.get("strong_downtrend", False))
+        pullback_candidate = bool(features.get("pullback_candidate", False))
+        reversal_confirmed = bool(features.get("reversal_confirmed", False))
+        pos_vs_ma20 = pd.to_numeric(pd.Series([features.get("pos_vs_ma20", np.nan)]), errors="coerce").iloc[0]
+
         if not live_price_ok:
-            return "見送り（価格未更新）"
+            return "見送り（価格未更新）", "ライブ価格を取得できませんでした"
+
         if not np.isfinite(current) or current <= 0:
-            return "不明"
+            return "不明", "ライブ価格が不明です"
+
         if np.isfinite(old_tp) and current >= old_tp * 0.995:
-            return "見送り（利確圏）"
+            return "見送り（利確圏）", "元TPに近く、新規エントリー妙味が薄い状態です"
+
+        dev = np.nan
         if np.isfinite(old_entry) and old_entry > 0:
             dev = (current / old_entry) - 1.0
-            if abs(dev) <= 0.003 and (not np.isfinite(effective_rr) or effective_rr >= rr_floor):
-                return "発注圏"
-            if dev < -0.003 and (not np.isfinite(effective_rr) or effective_rr >= min(rr_floor, 0.90)):
-                return "押し目待ち"
-            if 0.003 < dev <= 0.02 and (not np.isfinite(effective_rr) or effective_rr >= chase_floor):
-                return "追随可"
-            if np.isfinite(effective_rr) and effective_rr < min(rr_floor, 0.90):
-                return "見送り（利幅薄い）"
-        if np.isfinite(effective_rr) and effective_rr < rr_floor:
-            return "様子見"
-        return "様子見"
 
-    def _status_bonus(s):
-        return {
+        if np.isfinite(effective_rr) and effective_rr < min(rr_floor, 0.90):
+            return "見送り（利幅薄い）", f"実質RRが不足しています ({float(effective_rr):.2f})"
+
+        if strong_downtrend and not reversal_confirmed:
+            return "様子見", "下降継続が強く、短期反転が未確認です"
+
+        if trend_headwind and not reversal_confirmed:
+            if np.isfinite(dev) and dev <= -0.01:
+                return "押し目待ち", "まだ下降圧力が残るため反転確認待ちです"
+            return "様子見", "下降圧力が残り、短期反転が未確認です"
+
+        if pullback_candidate and label in ["確認", "準確認"]:
+            if np.isfinite(dev) and abs(dev) <= 0.012 and (not np.isfinite(effective_rr) or effective_rr >= rr_floor):
+                return "発注圏", "上昇基調内の押し目で、短期反転も確認できています"
+            if np.isfinite(dev) and dev < -0.012 and (not np.isfinite(effective_rr) or effective_rr >= min(rr_floor, 0.90)):
+                return "押し目待ち", "上昇基調内の押し目だが、まだ引き付け余地があります"
+            if np.isfinite(dev) and 0.012 < dev <= 0.025 and (not np.isfinite(effective_rr) or effective_rr >= chase_floor) and label == "確認":
+                return "追随可", "反転確認後の上放れで、厳格な追随条件を満たしています"
+
+        if reversal_confirmed:
+            if np.isfinite(dev) and abs(dev) <= 0.010 and (not np.isfinite(effective_rr) or effective_rr >= rr_floor):
+                return "発注圏", "短期反転を確認し、旧Entry近辺で再評価しても妙味があります"
+            if np.isfinite(dev) and 0.010 < dev <= 0.022 and (not np.isfinite(effective_rr) or effective_rr >= chase_floor):
+                return "追随可", "短期反転確認後で、追随エントリー許容帯です"
+            if np.isfinite(dev) and dev < -0.010 and (not np.isfinite(effective_rr) or effective_rr >= min(rr_floor, 0.90)):
+                return "押し目待ち", "反転兆候はあるが、もう一段の押しを待ちたい位置です"
+
+        if np.isfinite(reversal_score) and reversal_score >= 0.46:
+            if np.isfinite(dev) and dev < -0.005:
+                return "押し目待ち", "反転は準確認で、エントリーは引き付け優先です"
+            if np.isfinite(pos_vs_ma20) and pos_vs_ma20 >= -0.01:
+                return "様子見", "反転は準確認だが、終値での裏付けがもう一段ほしい状態です"
+
+        return "様子見", "短期反転の確度が十分ではなく、監視優先です"
+
+    def _status_bonus(s, reversal_label):
+        base = {
             "発注圏": 0.18,
-            "追随可": 0.01,
-            "押し目待ち": 0.05,
-            "様子見": -0.01,
-            "見送り（利幅薄い）": -0.16,
-            "見送り（利確圏）": -0.18,
+            "追随可": 0.02,
+            "押し目待ち": 0.06,
+            "様子見": -0.03,
+            "見送り（利幅薄い）": -0.18,
+            "見送り（利確圏）": -0.20,
             "見送り（価格未更新）": -0.60,
             "不明": -0.10,
         }.get(str(s), 0.0)
+        extra = {"確認": 0.08, "準確認": 0.02, "未確認": -0.08}.get(str(reversal_label), 0.0)
+        return base + extra
 
     live_scores = []
     eff_rrs = []
     statuses = []
+    entry_audits = []
+    reversal_scores = []
+    reversal_labels = []
+    trend_audits = []
+    strategy_audits = []
     live_price_flags = []
     live_price_states = []
     live_price_notes = []
 
     for i, row in work.iterrows():
         sym = str(row.get("銘柄", "")).strip()
-        sym_yf = sym if sym.endswith('.T') else (sym + '.T' if sym.isdigit() else sym)
+        sym_yf = sym if sym.endswith(".T") else (sym + ".T" if sym.isdigit() else sym)
         current_live = price_map.get(sym_yf, np.nan)
         live_price_ok = bool(np.isfinite(current_live) and current_live > 0)
-        current_display = current_live if live_price_ok else pd.to_numeric(pd.Series([row.get("現在値（終値）")]), errors='coerce').fillna(0).iloc[0]
+        current_display = current_live if live_price_ok else pd.to_numeric(pd.Series([row.get("現在値（終値）")]), errors="coerce").fillna(0).iloc[0]
 
-        old_entry = pd.to_numeric(pd.Series([row.get("元Entry目安", row.get("Entry目安"))]), errors='coerce').iloc[0]
-        old_sl = pd.to_numeric(pd.Series([row.get("元SL目安", row.get("SL目安"))]), errors='coerce').iloc[0]
-        old_tp = pd.to_numeric(pd.Series([row.get("元TP目安", row.get("TP目安"))]), errors='coerce').iloc[0]
-        old_score = pd.to_numeric(pd.Series([row.get("元総合スコア", row.get("総合スコア"))]), errors='coerce').iloc[0]
-        shares = pd.to_numeric(pd.Series([row.get("推奨株数", 0)]), errors='coerce').fillna(0).iloc[0]
+        old_entry = pd.to_numeric(pd.Series([row.get("元Entry目安", row.get("Entry目安"))]), errors="coerce").iloc[0]
+        old_sl = pd.to_numeric(pd.Series([row.get("元SL目安", row.get("SL目安"))]), errors="coerce").iloc[0]
+        old_tp = pd.to_numeric(pd.Series([row.get("元TP目安", row.get("TP目安"))]), errors="coerce").iloc[0]
+        old_score = pd.to_numeric(pd.Series([row.get("元総合スコア", row.get("総合スコア"))]), errors="coerce").iloc[0]
+        shares = pd.to_numeric(pd.Series([row.get("推奨株数", 0)]), errors="coerce").fillna(0).iloc[0]
+
+        trend_info = trend_feature_map.get(sym_yf, {}) or {}
+        if not trend_info and sym in trend_feature_map:
+            trend_info = trend_feature_map.get(sym, {}) or {}
 
         atr = np.nan
         if np.isfinite(old_entry) and np.isfinite(old_sl) and old_entry > old_sl:
@@ -2959,8 +3316,18 @@ def refresh_topn_prices_and_recalc(
                 effective_rr = reward_now / risk_now
         eff_rrs.append(effective_rr)
 
-        status = _status_from_live(current_live, old_entry, old_tp, effective_rr, live_price_ok)
+        reversal_label = _short_reversal_label(trend_info) if trend_info else str(row.get("短期反転確認", "") or "")
+        trend_audit = _build_trend_audit(trend_info) if trend_info else str(row.get("トレンド監査", "") or "")
+        strategy_audit = _build_strategy_audit(trend_info, str(row.get("推奨方式", "") or "")) if trend_info else str(row.get("戦略判定根拠", "") or "")
+        reversal_score = pd.to_numeric(pd.Series([trend_info.get("reversal_score", row.get("短期反転スコア", np.nan)) if trend_info else row.get("短期反転スコア", np.nan)]), errors="coerce").iloc[0]
+
+        status, entry_audit = _status_from_live(current_live, old_entry, old_tp, effective_rr, live_price_ok, trend_info)
         statuses.append(status)
+        entry_audits.append(entry_audit)
+        reversal_scores.append(float(round(reversal_score, 4)) if np.isfinite(reversal_score) else np.nan)
+        reversal_labels.append(reversal_label)
+        trend_audits.append(trend_audit)
+        strategy_audits.append(strategy_audit)
 
         note = ""
         if live_price_ok:
@@ -2982,13 +3349,21 @@ def refresh_topn_prices_and_recalc(
         if live_price_ok and np.isfinite(current_live) and np.isfinite(old_entry) and old_entry > 0:
             ext = max((float(current_live) / float(old_entry)) - 1.0, 0.0)
             ext_penalty = min(ext, 0.08) * 1.6
-        live_score = 0.58 * base + 0.26 * rr_component + _status_bonus(status) - ext_penalty
+        reversal_component = min(max(float(reversal_score) if np.isfinite(reversal_score) else 0.0, 0.0), 1.0)
+        live_score = 0.52 * base + 0.22 * rr_component + 0.10 * reversal_component + _status_bonus(status, reversal_label) - ext_penalty
+        if trend_info and bool(trend_info.get("strong_downtrend", False)) and reversal_label != "確認":
+            live_score -= 0.12
         if not live_price_ok:
             live_score -= 0.50
         live_scores.append(float(live_score))
 
     work["実質RR"] = np.round(eff_rrs, 3)
     work["Entry状態"] = statuses
+    work["Entry監査メモ"] = entry_audits
+    work["短期反転スコア"] = reversal_scores
+    work["短期反転確認"] = reversal_labels
+    work["トレンド監査"] = trend_audits
+    work["戦略判定根拠"] = strategy_audits
     work["総合スコア"] = np.round(live_scores, 6)
     work["再計算失敗フラグ"] = live_price_flags
     work["価格更新状態"] = live_price_states
@@ -2997,9 +3372,9 @@ def refresh_topn_prices_and_recalc(
     work = _recalc_live_execution_plan(work, capital_total=float(capital_total), max_positions=int(max_positions))
     work = _compute_live_execution_priority(work, strict_chase_rr=max(chase_floor, 1.30), strict_s_rr=max(rr_floor, 1.35))
     work = work.sort_values(
-        ["実行優先度", "実行優先スコア", "実質RR", "総合スコア", "再計算失敗フラグ"],
-        ascending=[False, False, False, False, True],
-        na_position='last'
+        ["実行優先度", "実行優先スコア", "実質RR", "短期反転スコア", "総合スコア", "再計算失敗フラグ"],
+        ascending=[False, False, False, False, False, True],
+        na_position="last"
     ).reset_index(drop=True)
     work["順位"] = np.arange(1, len(work) + 1)
 
@@ -3115,7 +3490,7 @@ def build_live_execution_views(
     # _split_live_rankings_core 側で付与した「今すぐ発注スコア」や
     # 最終補完時の「実行優先帯/実行優先度」を失わないように、
     # now_raw / wait_raw で確定した列を親DataFrameへ上書き反映する。
-    preserve_cols = ["実行優先帯", "実行優先度", "実行優先スコア", "今すぐ発注スコア"]
+    preserve_cols = ["実行優先帯", "実行優先度", "実行優先スコア", "今すぐ発注スコア", "短期反転スコア", "短期反転確認", "戦略判定根拠", "トレンド監査", "Entry監査メモ"]
     for df_part in [now_raw, wait_raw]:
         if not isinstance(df_part, pd.DataFrame) or len(df_part) == 0 or "__row_id__" not in df_part.columns:
             continue
@@ -3147,7 +3522,7 @@ def build_live_execution_views(
     for name, df_part in [("live", live_df), ("now", now_df), ("wait", wait_df)]:
         for c in common_cols:
             if c not in df_part.columns:
-                df_part[c] = "" if c in ["選定区分", "selected_now判定", "selected_now除外理由", "selected_now空理由集計", "企業名", "セクター", "推奨方式", "売買優先区分", "実行優先帯", "発注単位", "単元予算可否", "単元推奨可否", "単元株可否", "単元予算判定理由", "単元推奨判定理由", "価格更新状態", "価格更新メモ", "Entry状態", "発注不可理由", "最大保有"] else np.nan
+                df_part[c] = "" if c in ["選定区分", "selected_now判定", "selected_now除外理由", "selected_now空理由集計", "企業名", "セクター", "推奨方式", "売買優先区分", "実行優先帯", "発注単位", "単元予算可否", "単元推奨可否", "単元株可否", "単元予算判定理由", "単元推奨判定理由", "価格更新状態", "価格更新メモ", "Entry状態", "発注不可理由", "最大保有", "短期反転確認", "戦略判定根拠", "トレンド監査", "Entry監査メモ"] else np.nan
             df_part = df_part[common_cols]
         if name == "live":
             live_df = df_part
