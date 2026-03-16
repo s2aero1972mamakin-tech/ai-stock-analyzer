@@ -18,7 +18,7 @@ def render_cards_selected(df: pd.DataFrame):
         strat = r.get("推奨方式","")
         title = f"{sym} / {strat}"
         items = []
-        for k in ["現在値（終値）","Entry目安","SL目安","TP目安","TP根拠","SL根拠","RR","実質RR","短期反転確認","短期反転スコア","戦略判定根拠","トレンド監査","Entry監査メモ","価格更新状態","価格更新メモ","再計算失敗フラグ","売買優先区分","実行優先帯","実行優先スコア","今すぐ発注スコア","単元予算可否","単元推奨可否","単元必要資金(円)","単元想定損失(円)","推奨株数","推奨投資額(円)","想定損失(円)","発注不可理由","selected_now判定","selected_now除外理由","selected_now空理由集計","総合スコア"]:
+        for k in ["現在値（終値）","Entry目安","SL目安","TP目安","RR","実質RR","価格更新状態","価格更新メモ","再計算失敗フラグ","売買優先区分","実行優先帯","実行優先スコア","今すぐ発注スコア","単元予算可否","単元推奨可否","単元必要資金(円)","単元想定損失(円)","推奨株数","推奨投資額(円)","想定損失(円)","発注不可理由","selected_now判定","selected_now除外理由","selected_now空理由集計","総合スコア"]:
             if k in df.columns:
                 v = r.get(k)
                 items.append(f"{k}:{v}")
@@ -44,7 +44,7 @@ def render_cards_guide(df: pd.DataFrame):
         strat = r.get("推奨方式","")
         title = f"{sym} / {name} / {strat}"
         items = []
-        for k in ["セクター","売買優先区分","実行優先帯","発注単位","単元予算可否","単元推奨可否","短期反転確認","トレンド監査","Entry監査メモ","推奨株数","推奨投資額(円)","想定利益(円)","期待純益(円)","想定損失(円)","Entry目安","SL目安","TP目安","TP根拠","SL根拠","最大保有","Entry状態"]:
+        for k in ["セクター","売買優先区分","実行優先帯","発注単位","単元予算可否","単元推奨可否","推奨株数","推奨投資額(円)","想定利益(円)","期待純益(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]:
             if k in df.columns:
                 items.append(f"{k}:{r.get(k)}")
         st.markdown(
@@ -78,10 +78,10 @@ def prepare_selected_view(df: pd.DataFrame) -> pd.DataFrame:
             df[v] = None
     df = df[schema]
     try:
-        for c in ["企業名","セクター","推奨方式","売買優先区分","実行優先帯","発注単位","単元予算可否","単元推奨可否","単元予算判定理由","単元推奨判定理由","Entry状態","発注不可理由","価格更新状態","価格更新メモ","短期反転確認","戦略判定根拠","トレンド監査","Entry監査メモ","選定区分","selected_now判定","selected_now除外理由","selected_now空理由集計"]:
+        for c in ["企業名","セクター","推奨方式","売買優先区分","実行優先帯","発注単位","単元予算可否","単元推奨可否","単元予算判定理由","単元推奨判定理由","Entry状態","発注不可理由","価格更新状態","価格更新メモ","選定区分","selected_now判定","selected_now除外理由","selected_now空理由集計"]:
             if c in df.columns:
                 df[c] = (df[c].astype(str).replace(["None","none","nan","NaN",""], "不明" if c in ["企業名","セクター"] else "").str.strip())
-        for c in ["現在値（終値）","Entry目安","SL目安","TP目安","利確利幅(円/株)","RR","実質RR","短期反転スコア","再計算失敗フラグ","単元必要資金(円)","単元想定損失(円)","推奨投資額(円)","想定利益(円)","期待純益(円)","想定損失(円)","総合スコア","実行優先度","実行優先スコア","今すぐ発注スコア","推奨株数","元Entry目安","元SL目安","元TP目安","元RR","元総合スコア"]:
+        for c in ["現在値（終値）","Entry目安","SL目安","TP目安","利確利幅(円/株)","RR","実質RR","再計算失敗フラグ","単元必要資金(円)","単元想定損失(円)","推奨投資額(円)","想定利益(円)","期待純益(円)","想定損失(円)","総合スコア","実行優先度","実行優先スコア","今すぐ発注スコア","推奨株数","元Entry目安","元SL目安","元TP目安","元RR","元総合スコア"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce").round(4)
     except Exception:
@@ -143,11 +143,11 @@ def prepare_guide_view(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
     guide = logic.build_live_linked_guide(df, max_rows=max_rows) if isinstance(df, pd.DataFrame) and len(df) else pd.DataFrame()
     if isinstance(guide, pd.DataFrame) and len(guide):
         try:
-            for c in ["銘柄","企業名","セクター","推奨方式","売買優先区分","実行優先帯","発注単位","単元予算可否","単元推奨可否","短期反転確認","トレンド監査","Entry監査メモ","推奨株数","推奨投資額(円)","想定利益(円)","期待純益(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]:
+            for c in ["銘柄","企業名","セクター","推奨方式","売買優先区分","実行優先帯","発注単位","単元予算可否","単元推奨可否","推奨株数","推奨投資額(円)","想定利益(円)","期待純益(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]:
                 if c not in guide.columns:
                     guide[c] = None
-            guide = guide[["銘柄","企業名","セクター","推奨方式","売買優先区分","実行優先帯","発注単位","単元予算可否","単元推奨可否","短期反転確認","トレンド監査","Entry監査メモ","推奨株数","推奨投資額(円)","想定利益(円)","期待純益(円)","想定損失(円)","Entry目安","SL目安","TP目安","TP根拠","SL根拠","最大保有","Entry状態"]]
-            for c in ["企業名","セクター","推奨方式","売買優先区分","実行優先帯","発注単位","単元予算可否","単元推奨可否","短期反転確認","トレンド監査","Entry監査メモ","TP根拠","SL根拠","Entry状態"]:
+            guide = guide[["銘柄","企業名","セクター","推奨方式","売買優先区分","実行優先帯","発注単位","単元予算可否","単元推奨可否","推奨株数","推奨投資額(円)","想定利益(円)","期待純益(円)","想定損失(円)","Entry目安","SL目安","TP目安","最大保有","Entry状態"]]
+            for c in ["企業名","セクター","推奨方式","売買優先区分","実行優先帯","発注単位","単元予算可否","単元推奨可否","Entry状態"]:
                 guide[c] = (guide[c].astype(str).replace(["None","none","nan","NaN",""], "不明" if c in ["企業名","セクター"] else "").str.strip())
             guide = guide.head(int(max_rows)).reset_index(drop=True)
             guide.insert(0, "順位", range(1, len(guide)+1))
@@ -204,7 +204,7 @@ h1 {font-size: 1.6rem !important; margin-bottom: 0.25rem !important;}
 )
 
 st.markdown("# JPX Swing AI")
-st.markdown('<div class="small-note">固定条件：最大保有10営業日 / TP・SLはATR補助 + 直近高安・52週高値・ラウンドナンバーを反映 / 単元株優先・S株は補完 / 候補は戦略分散・短期反転重視 — DB: Neon(Postgres)</div>', unsafe_allow_html=True)
+st.markdown('<div class="small-note">固定条件：最大保有10営業日 / 利確=+1.5ATR(14) / 損切=-1.0ATR(14) — DB: Neon(Postgres)</div>', unsafe_allow_html=True)
 
 
 # --- Streamlit secrets -> env bridge ---
@@ -478,7 +478,7 @@ if st.session_state.get("scan_results_ready", False):
 
     render_selected_section(
         "🟢 今すぐ発注ランキング",
-        "単元株の発注圏を最優先にした即時発注候補です。旧Entry距離だけでなく、短期反転確認・中期トレンド監査も通った銘柄を優先します。追随可は、単元株の発注圏候補が0件のときに限り厳格条件で最大1件だけ補完します。S株は厳格条件の例外候補を優先し、それも無い場合のみ最終補完を最大1件だけ許可します。空の場合は除外理由集計を上に表示します。",
+        "単元株の発注圏を最優先にした即時発注候補です。追随可は、単元株の発注圏候補が0件のときに限り実質RR>=1.45を最大1件だけ補完します。S株は厳格条件の例外候補を優先し、それも無い場合のみ発注圏候補から最終補完を最大1件だけ許可します。空の場合は除外理由集計を上に表示します。",
         now_view,
         mobile_mode,
         show_top_n,
